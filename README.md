@@ -73,6 +73,22 @@ pytest
 
 ## Run
 
+Fastest option for local use:
+
+```powershell
+python screenlens.py
+```
+
+On Windows, you can also double-click `screenlens.pyw` to open the GUI without typing a command.
+
+If the package is installed with `pip install -e .`, a shorter command is also available:
+
+```powershell
+screenlens
+```
+
+The original command still works:
+
 ```powershell
 screenlens-detection
 ```

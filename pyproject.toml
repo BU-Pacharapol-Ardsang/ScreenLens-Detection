@@ -21,6 +21,7 @@ dependencies = [
 dev = ["pytest>=8.3.0"]
 
 [project.scripts]
+screenlens = "screenlens_detection.main:main"
 screenlens-detection = "screenlens_detection.main:main"
 
 [tool.setuptools]
@@ -28,4 +29,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
