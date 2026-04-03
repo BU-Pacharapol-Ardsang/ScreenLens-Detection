@@ -1,20 +1,34 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from time import perf_counter
 
 import cv2
 import numpy as np
 
+from .languages import (
+    detect_language_code,
+    get_source_language_option,
+    get_target_language_option,
+    language_label,
+)
 from .models import DetectionBox, FrameAnalysis, PipelineSettings
 from .ocr import OCRBackend
+from .translation import TranslationBackend
 
 
 class TextDetectionPipeline:
     """Realtime screen-text pipeline using traditional CV and optional OCR."""
 
-    def __init__(self, settings: PipelineSettings, ocr_backend: OCRBackend) -> None:
+    def __init__(
+        self,
+        settings: PipelineSettings,
+        ocr_backend: OCRBackend,
+        translation_backend: TranslationBackend,
+    ) -> None:
         self.settings = settings
         self.ocr_backend = ocr_backend
+        self.translation_backend = translation_backend
 
     def process(self, frame: np.ndarray, *, monitor_label: str = "") -> FrameAnalysis:
         started = perf_counter()
@@ -22,11 +36,13 @@ class TextDetectionPipeline:
         scaled_frame, scale = self._scale_frame(frame)
         enhanced_gray = self._enhance_grayscale(scaled_frame)
         mask = self._build_text_mask(enhanced_gray)
-        working_boxes = self._extract_text_boxes(mask, scaled_frame.shape)
+        line_mask = self._build_line_mask(mask)
+        working_boxes = self._extract_text_boxes(line_mask, mask, enhanced_gray, scaled_frame.shape)
         boxes = self._annotate_with_ocr(working_boxes, enhanced_gray, frame.shape, scale)
+        boxes = self._apply_translations(boxes)
 
         annotated = self._draw_annotations(frame.copy(), boxes)
-        processed_preview = self._draw_mask_preview(mask, working_boxes)
+        processed_preview = self._draw_mask_preview(line_mask, working_boxes)
 
         elapsed = max(perf_counter() - started, 1e-6)
         return FrameAnalysis(
@@ -79,48 +95,103 @@ class TextDetectionPipeline:
             block_size,
             threshold_c,
         )
-        combined = cv2.bitwise_or(dark_text_mask, light_text_mask)
+        polarity_mask = cv2.bitwise_or(dark_text_mask, light_text_mask)
 
-        close_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (max(self.settings.morphology_width, 3), max(self.settings.morphology_height, 3)),
+        gradient = cv2.morphologyEx(
+            gray,
+            cv2.MORPH_GRADIENT,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
         )
-        open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        _, gradient_mask = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        gradient_mask = cv2.dilate(
+            gradient_mask,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
 
-        segmented = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_kernel)
-        segmented = cv2.morphologyEx(segmented, cv2.MORPH_OPEN, open_kernel)
-        return segmented
+        combined = cv2.bitwise_and(polarity_mask, gradient_mask)
+        if cv2.countNonZero(combined) < max(250, cv2.countNonZero(polarity_mask) // 10):
+            combined = polarity_mask
+
+        return cv2.morphologyEx(
+            combined,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        )
+
+    def _build_line_mask(self, mask: np.ndarray) -> np.ndarray:
+        dense_mask = cv2.dilate(
+            mask,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
+        horizontal_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (max(self.settings.morphology_width * 2 + 1, 17), max(self.settings.morphology_height, 3)),
+        )
+        vertical_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (3, max(self.settings.morphology_height, 3)),
+        )
+
+        line_mask = cv2.morphologyEx(dense_mask, cv2.MORPH_CLOSE, horizontal_kernel)
+        line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, vertical_kernel)
+        return cv2.morphologyEx(
+            line_mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        )
 
     def _extract_text_boxes(
         self,
-        mask: np.ndarray,
+        line_mask: np.ndarray,
+        text_mask: np.ndarray,
+        enhanced_gray: np.ndarray,
         frame_shape: tuple[int, int, int],
     ) -> list[tuple[int, int, int, int]]:
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(line_mask, connectivity=8)
         max_box_height = int(frame_shape[0] * self.settings.max_box_height_ratio)
         frame_area = frame_shape[0] * frame_shape[1]
 
         candidates: list[tuple[int, int, int, int]] = []
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
+        for component_index in range(1, component_count):
+            x, y, w, h, _component_area = stats[component_index]
             area = w * h
             aspect_ratio = w / max(h, 1)
 
             if area < self.settings.min_contour_area:
                 continue
-            if area > int(frame_area * 0.65):
+            if area > int(frame_area * 0.18):
                 continue
             if w < self.settings.min_box_width or h < self.settings.min_box_height:
                 continue
             if h > max_box_height:
                 continue
-            if not 0.6 <= aspect_ratio <= 25.0:
+            if not 1.1 <= aspect_ratio <= 45.0:
+                continue
+
+            text_roi = text_mask[y : y + h, x : x + w]
+            if text_roi.size == 0:
+                continue
+
+            foreground_ratio = cv2.countNonZero(text_roi) / max(area, 1)
+            if not 0.03 <= foreground_ratio <= 0.60:
+                continue
+
+            gray_roi = enhanced_gray[y : y + h, x : x + w]
+            edge_density = cv2.countNonZero(cv2.Canny(gray_roi, 50, 150)) / max(area, 1)
+            if edge_density < 0.025:
+                continue
+
+            sub_component_count = cv2.connectedComponents(text_roi, connectivity=8)[0] - 1
+            if sub_component_count < 3 and aspect_ratio > 3.5:
                 continue
 
             candidates.append((x, y, w, h))
 
-        candidates.sort(key=lambda box: (box[1], box[0]))
-        return candidates[: self.settings.max_boxes]
+        merged = self._merge_text_boxes(candidates)
+        merged.sort(key=lambda box: (box[1], box[0]))
+        return merged[: self.settings.max_boxes]
 
     def _annotate_with_ocr(
         self,
@@ -132,15 +203,29 @@ class TextDetectionPipeline:
         detected_boxes: list[DetectionBox] = []
 
         for x, y, w, h in working_boxes:
-            crop = enhanced_gray[y : y + h, x : x + w]
+            pad_x = max(int(w * 0.04), 4)
+            pad_y = max(int(h * 0.25), 4)
+            crop_x1 = max(x - pad_x, 0)
+            crop_y1 = max(y - pad_y, 0)
+            crop_x2 = min(x + w + pad_x, enhanced_gray.shape[1])
+            crop_y2 = min(y + h + pad_y, enhanced_gray.shape[0])
+
+            crop = enhanced_gray[crop_y1:crop_y2, crop_x1:crop_x2]
             text = ""
+            confidence = None
             if self.settings.ocr_enabled and self.ocr_backend.is_available():
+                ocr_crop = self._prepare_crop_for_ocr(crop)
                 ocr_result = self.ocr_backend.recognize(
-                    crop,
+                    ocr_crop,
                     language=self.settings.ocr_language,
-                    psm=self.settings.ocr_psm,
+                    psm=self._resolve_psm(w, h),
                 )
                 text = ocr_result.text
+                confidence = ocr_result.confidence
+
+            text = self._normalize_recognized_text(text)
+            if self.settings.ocr_enabled and not self._is_usable_text(text, confidence):
+                continue
 
             mapped_x = int(x / scale)
             mapped_y = int(y / scale)
@@ -149,6 +234,8 @@ class TextDetectionPipeline:
 
             mapped_w = min(mapped_w, original_shape[1] - mapped_x)
             mapped_h = min(mapped_h, original_shape[0] - mapped_y)
+            source_language_code, source_language_label = self._resolve_source_language(text)
+            target_language = get_target_language_option(self.settings.target_language_code)
 
             detected_boxes.append(
                 DetectionBox(
@@ -157,10 +244,183 @@ class TextDetectionPipeline:
                     w=max(mapped_w, 1),
                     h=max(mapped_h, 1),
                     text=text,
+                    source_language_code=source_language_code,
+                    source_language_label=source_language_label,
+                    target_language_code=target_language.code,
+                    target_language_label=target_language.label,
+                    confidence=confidence,
                 )
             )
 
         return detected_boxes
+
+    def _apply_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
+        if not boxes:
+            return boxes
+
+        grouped_indices: dict[tuple[str, str], list[int]] = {}
+        for index, box in enumerate(boxes):
+            if not box.text:
+                continue
+            grouped_indices.setdefault((box.source_language_code, box.target_language_code), []).append(index)
+
+        translated_boxes = list(boxes)
+        for (source_language_code, target_language_code), indices in grouped_indices.items():
+            texts = [boxes[index].text for index in indices]
+            translated_batch = self.translation_backend.translate_batch(
+                texts,
+                source_language_code=source_language_code,
+                target_language_code=target_language_code,
+            )
+            for index, translated_text in zip(indices, translated_batch, strict=False):
+                translated_boxes[index] = replace(boxes[index], translated_text=translated_text)
+
+        return translated_boxes
+
+    def _merge_text_boxes(
+        self,
+        candidates: list[tuple[int, int, int, int]],
+    ) -> list[tuple[int, int, int, int]]:
+        merged = sorted(candidates, key=lambda box: (box[1], box[0]))
+        changed = True
+
+        while changed:
+            changed = False
+            next_pass: list[tuple[int, int, int, int]] = []
+
+            while merged:
+                current = merged.pop(0)
+                scan_index = 0
+
+                while scan_index < len(merged):
+                    candidate = merged[scan_index]
+                    if self._should_merge_boxes(current, candidate):
+                        current = self._merge_box_pair(current, candidate)
+                        merged.pop(scan_index)
+                        changed = True
+                        continue
+                    scan_index += 1
+
+                next_pass.append(current)
+
+            merged = sorted(next_pass, key=lambda box: (box[1], box[0]))
+
+        return self._suppress_nested_boxes(merged)
+
+    def _should_merge_boxes(
+        self,
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> bool:
+        x1, y1, w1, h1 = first
+        x2, y2, w2, h2 = second
+
+        horizontal_gap = max(max(x1, x2) - min(x1 + w1, x2 + w2), 0)
+        vertical_overlap = max(min(y1 + h1, y2 + h2) - max(y1, y2), 0)
+        min_height = max(min(h1, h2), 1)
+        height_ratio = max(h1, h2) / min_height
+        same_line = vertical_overlap / min_height >= 0.55
+        merge_gap = max(h1, h2) * 2.4
+
+        return same_line and height_ratio <= 1.8 and horizontal_gap <= merge_gap
+
+    @staticmethod
+    def _merge_box_pair(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        x1, y1, w1, h1 = first
+        x2, y2, w2, h2 = second
+        left = min(x1, x2)
+        top = min(y1, y2)
+        right = max(x1 + w1, x2 + w2)
+        bottom = max(y1 + h1, y2 + h2)
+        return left, top, right - left, bottom - top
+
+    @staticmethod
+    def _suppress_nested_boxes(
+        boxes: list[tuple[int, int, int, int]],
+    ) -> list[tuple[int, int, int, int]]:
+        kept: list[tuple[int, int, int, int]] = []
+
+        for box in sorted(boxes, key=lambda item: item[2] * item[3], reverse=True):
+            x, y, w, h = box
+            area = max(w * h, 1)
+            is_nested = False
+
+            for kept_box in kept:
+                overlap_area = TextDetectionPipeline._intersection_area(box, kept_box)
+                if overlap_area / area >= 0.85:
+                    is_nested = True
+                    break
+
+            if not is_nested:
+                kept.append(box)
+
+        kept.sort(key=lambda item: (item[1], item[0]))
+        return kept
+
+    @staticmethod
+    def _intersection_area(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> int:
+        left = max(first[0], second[0])
+        top = max(first[1], second[1])
+        right = min(first[0] + first[2], second[0] + second[2])
+        bottom = min(first[1] + first[3], second[1] + second[3])
+        return max(right - left, 0) * max(bottom - top, 0)
+
+    @staticmethod
+    def _prepare_crop_for_ocr(crop: np.ndarray) -> np.ndarray:
+        blurred = cv2.GaussianBlur(crop, (3, 3), 0)
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        if cv2.countNonZero(binary) < (binary.size // 2):
+            binary = cv2.bitwise_not(binary)
+
+        return cv2.copyMakeBorder(
+            binary,
+            6,
+            6,
+            10,
+            10,
+            cv2.BORDER_CONSTANT,
+            value=255,
+        )
+
+    def _resolve_psm(self, width: int, height: int) -> int:
+        if width / max(height, 1) >= 6.0:
+            return 7
+        return self.settings.ocr_psm
+
+    def _normalize_recognized_text(self, text: str) -> str:
+        normalized = " ".join(text.split())
+        normalized = normalized.strip(" |:;.,_-`~[]{}<>")
+        return normalized
+
+    def _is_usable_text(self, text: str, confidence: float | None) -> bool:
+        if not text:
+            return False
+
+        alpha_numeric_count = sum(character.isalnum() for character in text)
+        thai_count = sum("\u0E00" <= character <= "\u0E7F" for character in text)
+        meaningful_count = alpha_numeric_count + thai_count
+
+        if meaningful_count < 2 and len(text) <= 3:
+            return False
+        if len(text) == 1:
+            return False
+
+        punctuation_ratio = sum(not character.isalnum() and not character.isspace() for character in text) / max(
+            len(text),
+            1,
+        )
+        if punctuation_ratio > 0.55 and meaningful_count < 5:
+            return False
+        if confidence is not None and confidence < 25.0 and meaningful_count < 6:
+            return False
+        return True
 
     def _draw_annotations(self, frame: np.ndarray, boxes: list[DetectionBox]) -> np.ndarray:
         for index, box in enumerate(boxes, start=1):
@@ -188,13 +448,24 @@ class TextDetectionPipeline:
         return preview
 
     def _status_message(self) -> str:
+        source_language = get_source_language_option(self.settings.source_language_code)
+        target_language = get_target_language_option(self.settings.target_language_code)
+        route = f"{source_language.label} -> {target_language.label}"
+        translation_status = self.translation_backend.describe()
         if self.settings.ocr_enabled and self.ocr_backend.is_available():
-            return f"OCR enabled via {self.ocr_backend.describe()}"
+            return f"{route} | OCR enabled | {translation_status}"
         if self.settings.ocr_enabled:
-            return self.ocr_backend.describe()
-        return "OCR disabled in app settings"
+            return f"{route} | {self.ocr_backend.describe()} | {translation_status}"
+        return f"{route} | OCR disabled | {translation_status}"
+
+    def _resolve_source_language(self, text: str) -> tuple[str, str]:
+        if self.settings.source_language_code != "auto":
+            source_language = get_source_language_option(self.settings.source_language_code)
+            return source_language.code, source_language.label
+
+        detected_code = detect_language_code(text)
+        return detected_code, language_label(detected_code)
 
     @staticmethod
     def _ensure_odd(value: int) -> int:
         return value if value % 2 == 1 else value + 1
-

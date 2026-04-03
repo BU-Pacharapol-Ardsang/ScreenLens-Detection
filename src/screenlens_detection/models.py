@@ -31,16 +31,18 @@ class PipelineSettings:
     gaussian_kernel_size: int = 3
     threshold_block_size: int = 31
     threshold_c: int = 12
-    morphology_width: int = 17
-    morphology_height: int = 5
+    morphology_width: int = 11
+    morphology_height: int = 3
     min_contour_area: int = 250
-    min_box_width: int = 40
-    min_box_height: int = 18
-    max_box_height_ratio: float = 0.35
-    max_boxes: int = 15
+    min_box_width: int = 24
+    min_box_height: int = 14
+    max_box_height_ratio: float = 0.22
+    max_boxes: int = 60
+    source_language_code: str = "auto"
+    target_language_code: str = "tha"
     ocr_enabled: bool = True
-    ocr_language: str = "eng"
-    ocr_psm: int = 6
+    ocr_language: str = "tha+eng"
+    ocr_psm: int = 7
 
 
 @dataclass(slots=True, frozen=True)
@@ -50,6 +52,11 @@ class DetectionBox:
     w: int
     h: int
     text: str = ""
+    translated_text: str = ""
+    source_language_code: str = "unknown"
+    source_language_label: str = "Unknown"
+    target_language_code: str = "tha"
+    target_language_label: str = "Thai"
     confidence: float | None = None
 
     @property
@@ -59,6 +66,28 @@ class DetectionBox:
     @property
     def bottom(self) -> int:
         return self.y + self.h
+
+    def summary(self, index: int) -> str:
+        before = self.text or "<region detected>"
+        after = self._translated_display_text(before)
+        return "\n".join(
+            (
+                f"[{index}] x={self.x}, y={self.y}, w={self.w}, h={self.h}",
+                f"source: {self.source_language_label}",
+                f"target: {self.target_language_label}",
+                f"before: {before}",
+                f"after: {after}",
+            )
+        )
+
+    def _translated_display_text(self, before: str) -> str:
+        if self.translated_text:
+            return self.translated_text
+        if before != "<region detected>" and self.source_language_code == self.target_language_code:
+            return before
+        if before == "<region detected>":
+            return "<translation unavailable>"
+        return "<translation pending>"
 
 
 @dataclass(slots=True)
@@ -74,4 +103,3 @@ class FrameAnalysis:
     @property
     def detected_text(self) -> list[str]:
         return [box.text for box in self.boxes if box.text]
-

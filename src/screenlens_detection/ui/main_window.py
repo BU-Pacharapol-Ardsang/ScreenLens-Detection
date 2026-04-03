@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -24,6 +23,7 @@ import cv2
 import numpy as np
 
 from ..capture import ScreenCapturer
+from ..languages import resolve_ocr_language, source_language_options, target_language_options
 from ..models import FrameAnalysis, MonitorSpec, PipelineSettings
 from ..worker import ProcessingWorker
 
@@ -57,7 +57,8 @@ class MainWindow(QMainWindow):
         self.area_spin.setRange(50, 10000)
         self.area_spin.setValue(250)
 
-        self.language_edit = QLineEdit("eng")
+        self.source_language_combo = QComboBox()
+        self.target_language_combo = QComboBox()
         self.ocr_checkbox = QCheckBox("Enable OCR")
         self.ocr_checkbox.setChecked(True)
 
@@ -72,6 +73,7 @@ class MainWindow(QMainWindow):
         self.text_output.setReadOnly(True)
 
         self._build_ui()
+        self._populate_language_controls()
         self._connect_signals()
         self._refresh_monitors()
 
@@ -94,7 +96,8 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Capture interval", self.interval_spin)
         settings_layout.addRow("Upscale factor", self.scale_spin)
         settings_layout.addRow("Min contour area", self.area_spin)
-        settings_layout.addRow("OCR language", self.language_edit)
+        settings_layout.addRow("Source language", self.source_language_combo)
+        settings_layout.addRow("Target language", self.target_language_combo)
         settings_layout.addRow("", self.ocr_checkbox)
 
         stats_box = QGroupBox("Runtime Stats")
@@ -128,6 +131,27 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self._start_worker)
         self.stop_button.clicked.connect(self._stop_worker)
 
+    def _set_runtime_controls_locked(self, locked: bool) -> None:
+        self.monitor_combo.setEnabled(not locked)
+        self.refresh_button.setEnabled(not locked)
+        self.interval_spin.setEnabled(not locked)
+        self.scale_spin.setEnabled(not locked)
+        self.area_spin.setEnabled(not locked)
+        self.source_language_combo.setEnabled(not locked)
+        self.target_language_combo.setEnabled(not locked)
+        self.ocr_checkbox.setEnabled(not locked)
+
+    def _populate_language_controls(self) -> None:
+        for option in source_language_options():
+            self.source_language_combo.addItem(option.label, userData=option.code)
+        for option in target_language_options():
+            self.target_language_combo.addItem(option.label, userData=option.code)
+
+        self.source_language_combo.setCurrentIndex(0)
+        target_index = self.target_language_combo.findData("tha")
+        if target_index >= 0:
+            self.target_language_combo.setCurrentIndex(target_index)
+
     def _refresh_monitors(self) -> None:
         with ScreenCapturer() as capturer:
             self.monitors = capturer.list_monitors()
@@ -157,19 +181,21 @@ class MainWindow(QMainWindow):
             capture_interval_ms=self.interval_spin.value(),
             upscale_factor=self.scale_spin.value(),
             min_contour_area=self.area_spin.value(),
+            source_language_code=self.source_language_combo.currentData(),
+            target_language_code=self.target_language_combo.currentData(),
             ocr_enabled=self.ocr_checkbox.isChecked(),
-            ocr_language=self.language_edit.text().strip() or "eng",
+            ocr_language=resolve_ocr_language(self.source_language_combo.currentData()),
         )
 
         self.worker = ProcessingWorker(monitor=monitor, settings=settings)
         self.worker.frame_ready.connect(self._handle_frame)
         self.worker.worker_error.connect(self._handle_error)
         self.worker.finished.connect(self._on_worker_finished)
-        self.worker.start()
-
-        self.status_label.setText("Running")
+        self.status_label.setText("Starting OCR/translation...")
+        self._set_runtime_controls_locked(True)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.worker.start()
 
     def _stop_worker(self) -> None:
         if self.worker is None:
@@ -178,6 +204,7 @@ class MainWindow(QMainWindow):
 
     def _on_worker_finished(self) -> None:
         self.worker = None
+        self._set_runtime_controls_locked(False)
         self.start_button.setEnabled(bool(self.monitors))
         self.stop_button.setEnabled(False)
         if self.status_label.text() == "Running":
@@ -192,7 +219,10 @@ class MainWindow(QMainWindow):
         self.preview_label.setPixmap(self._frame_to_pixmap(analysis.annotated_frame, self.preview_label))
         self.mask_label.setPixmap(self._frame_to_pixmap(analysis.processed_preview, self.mask_label))
 
-        self.fps_label.setText(f"{analysis.fps:.1f}")
+        if analysis.fps < 1.0:
+            self.fps_label.setText(f"{analysis.fps:.2f}")
+        else:
+            self.fps_label.setText(f"{analysis.fps:.1f}")
         self.detected_label.setText(str(len(analysis.boxes)))
         self.monitor_label.setText(analysis.monitor_label or "-")
         self.status_label.setText(analysis.status)
@@ -200,9 +230,8 @@ class MainWindow(QMainWindow):
         if analysis.boxes:
             lines = []
             for index, box in enumerate(analysis.boxes, start=1):
-                text = box.text if box.text else "<region detected>"
-                lines.append(f"[{index}] x={box.x}, y={box.y}, w={box.w}, h={box.h} :: {text}")
-            self.text_output.setPlainText("\n".join(lines))
+                lines.append(box.summary(index))
+            self.text_output.setPlainText("\n\n".join(lines))
         else:
             self.text_output.setPlainText("No text regions detected in the current frame.")
 
@@ -231,4 +260,3 @@ class MainWindow(QMainWindow):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-
