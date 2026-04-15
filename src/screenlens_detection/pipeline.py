@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from dataclasses import replace
 from time import perf_counter
 
@@ -30,6 +31,7 @@ class TextDetectionPipeline:
         self.settings = settings
         self.ocr_backend = ocr_backend
         self.translation_backend = translation_backend
+        self._recent_translations: list[DetectionBox] = []
 
     def process(self, frame: np.ndarray, *, monitor_label: str = "") -> FrameAnalysis:
         started = perf_counter()
@@ -274,26 +276,112 @@ class TextDetectionPipeline:
 
     def _apply_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
         if not boxes:
+            self._recent_translations = []
             return boxes
 
+        translated_boxes = self._reuse_recent_translations(boxes)
         grouped_indices: dict[tuple[str, str], list[int]] = {}
-        for index, box in enumerate(boxes):
-            if not box.text:
+        for index, box in enumerate(translated_boxes):
+            if not box.text or box.translated_text:
                 continue
             grouped_indices.setdefault((box.source_language_code, box.target_language_code), []).append(index)
 
-        translated_boxes = list(boxes)
         for (source_language_code, target_language_code), indices in grouped_indices.items():
-            texts = [boxes[index].text for index in indices]
+            prioritized_indices = self._prioritize_translation_indices(translated_boxes, indices)
+            texts = [translated_boxes[index].text for index in prioritized_indices]
             translated_batch = self.translation_backend.translate_batch(
                 texts,
                 source_language_code=source_language_code,
                 target_language_code=target_language_code,
             )
-            for index, translated_text in zip(indices, translated_batch, strict=False):
-                translated_boxes[index] = replace(boxes[index], translated_text=translated_text)
+            for index, translated_text in zip(prioritized_indices, translated_batch, strict=False):
+                translated_boxes[index] = replace(translated_boxes[index], translated_text=translated_text)
 
+        self._remember_translations(translated_boxes)
         return translated_boxes
+
+    def _reuse_recent_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
+        if not self._recent_translations:
+            return list(boxes)
+
+        reused_boxes: list[DetectionBox] = []
+        for box in boxes:
+            translated_text = self._find_recent_translation(box)
+            if translated_text:
+                reused_boxes.append(replace(box, translated_text=translated_text))
+                continue
+            reused_boxes.append(box)
+        return reused_boxes
+
+    def _find_recent_translation(self, box: DetectionBox) -> str:
+        if not box.text:
+            return ""
+
+        current_rect = (box.x, box.y, box.w, box.h)
+        current_area = max(box.w * box.h, 1)
+        current_text = self._normalize_text_for_matching(box.text)
+        if not current_text:
+            return ""
+
+        best_score = 0.0
+        best_translation = ""
+        for recent in self._recent_translations:
+            if not recent.translated_text:
+                continue
+            if recent.source_language_code != box.source_language_code:
+                continue
+            if recent.target_language_code != box.target_language_code:
+                continue
+
+            overlap = self._intersection_area(current_rect, (recent.x, recent.y, recent.w, recent.h)) / current_area
+            if overlap < 0.35:
+                continue
+
+            recent_text = self._normalize_text_for_matching(recent.text)
+            if not recent_text:
+                continue
+
+            similarity = SequenceMatcher(None, current_text, recent_text).ratio()
+            score = (overlap * 0.55) + (similarity * 0.45)
+            if similarity >= 0.45 and score > best_score:
+                best_score = score
+                best_translation = recent.translated_text
+
+        return best_translation
+
+    def _prioritize_translation_indices(
+        self,
+        boxes: list[DetectionBox],
+        indices: list[int],
+    ) -> list[int]:
+        return sorted(indices, key=lambda index: self._translation_priority(boxes[index]), reverse=True)
+
+    def _translation_priority(self, box: DetectionBox) -> float:
+        text = box.text.strip()
+        if not text:
+            return -1.0
+
+        alpha_count = sum(character.isalpha() for character in text)
+        digit_count = sum(character.isdigit() for character in text)
+        word_count = len(text.split())
+        area_bonus = min((box.w * box.h) / 5000.0, 30.0)
+        score = len(text) + (word_count * 8.0) + area_bonus + (alpha_count * 0.25)
+
+        if self._looks_like_url(text):
+            score -= 120.0
+        if digit_count and digit_count >= alpha_count:
+            score -= 80.0
+        if word_count <= 2 and len(text) < 18:
+            score -= 35.0
+        if len(text) <= 4:
+            score -= 45.0
+
+        return score
+
+    def _remember_translations(self, boxes: list[DetectionBox]) -> None:
+        remembered = [box for box in boxes if box.translated_text]
+        remembered.sort(key=self._translation_priority, reverse=True)
+        self._recent_translations = remembered[: max(self.settings.max_ocr_boxes_per_frame * 3, 24)]
 
     def _merge_text_boxes(
         self,
@@ -400,6 +488,25 @@ class TextDetectionPipeline:
         normalized = re.sub(r"\s+([,.;:!?])", r"\1", normalized)
         normalized = normalized.strip(" |:;.,_-`~[]{}<>")
         return normalized
+
+    @staticmethod
+    def _normalize_text_for_matching(text: str) -> str:
+        normalized = text.casefold()
+        normalized = re.sub(r"[^0-9a-z\u0E00-\u0E7F]+", " ", normalized)
+        return " ".join(normalized.split())
+
+    @staticmethod
+    def _looks_like_url(text: str) -> bool:
+        normalized = text.casefold().replace(" ", "")
+        return (
+            "http://" in normalized
+            or "https://" in normalized
+            or normalized.startswith("www.")
+            or ".com/" in normalized
+            or ".com" in normalized
+            or ".org" in normalized
+            or ".net" in normalized
+        )
 
     @staticmethod
     def _strip_minor_script_noise(text: str) -> str:
