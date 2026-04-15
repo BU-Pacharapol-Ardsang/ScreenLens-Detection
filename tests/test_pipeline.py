@@ -1,10 +1,10 @@
 import cv2
 import numpy as np
 
-from screenlens_detection.models import PipelineSettings
-from screenlens_detection.ocr import NoOpOCRBackend
+from screenlens_detection.models import DetectionBox, PipelineSettings
+from screenlens_detection.ocr import NoOpOCRBackend, OCRBackend, OCRResult
 from screenlens_detection.pipeline import TextDetectionPipeline
-from screenlens_detection.translation import NoOpTranslationBackend
+from screenlens_detection.translation import NoOpTranslationBackend, TranslationBackend
 
 
 def test_pipeline_detects_text_like_regions() -> None:
@@ -89,3 +89,184 @@ def test_pipeline_detects_document_lines_without_merging_whole_paragraph() -> No
 
     assert len(article_boxes) >= 5
     assert max(box.h for box in article_boxes) < 60
+
+
+class RecordingOCRBackend(OCRBackend):
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def is_available(self) -> bool:
+        return True
+
+    def recognize(self, image: object, *, language: str, psm: int) -> OCRResult:
+        self.calls.append((language, psm))
+        return OCRResult(text="demo", confidence=95.0)
+
+
+def test_pipeline_limits_ocr_boxes_per_frame() -> None:
+    backend = RecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=2,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+
+    working_boxes = [
+        (0, 0, 40, 20),
+        (20, 60, 120, 28),
+        (40, 120, 220, 36),
+        (60, 180, 320, 44),
+    ]
+    gray = np.full((280, 420), 255, dtype=np.uint8)
+
+    detected = pipeline._annotate_with_ocr(working_boxes, gray, (280, 420, 3), 1.0)
+
+    assert len(detected) == 2
+    assert len(backend.calls) == 2
+
+
+def test_pipeline_detects_actual_source_language_in_mixed_ocr_mode() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(source_language_code="tha+eng"),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    assert pipeline._resolve_source_language("Breaking news from BBC") == ("eng", "English")
+    assert pipeline._resolve_source_language("ทดสอบภาษาไทย") == ("tha", "Thai")
+    assert pipeline._resolve_source_language("BBC ภาษาไทย") == ("mixed", "Mixed (Thai + English)")
+
+
+def test_pipeline_normalizes_stray_thai_noise_from_english_ocr() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    normalized = pipeline._normalize_recognized_text(
+        "according to senior บ ร officials . It does not have nuclear weapons"
+    )
+
+    assert normalized == "according to senior officials. It does not have nuclear weapons"
+
+
+class FirstOnlyTranslationBackend(TranslationBackend):
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def translate_batch(
+        self,
+        texts: list[str],
+        *,
+        source_language_code: str,
+        target_language_code: str,
+    ) -> list[str]:
+        self.calls.append(list(texts))
+        return [f"translated:{texts[0]}"] + ([""] * (len(texts) - 1))
+
+
+class OneShotTranslationBackend(TranslationBackend):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def translate_batch(
+        self,
+        texts: list[str],
+        *,
+        source_language_code: str,
+        target_language_code: str,
+    ) -> list[str]:
+        self.calls += 1
+        if self.calls == 1:
+            return [f"translated:{text}" for text in texts]
+        return [""] * len(texts)
+
+
+def test_pipeline_prioritizes_content_lines_for_translation_budget() -> None:
+    backend = FirstOnlyTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    boxes = [
+        DetectionBox(
+            x=10,
+            y=10,
+            w=180,
+            h=32,
+            text="https://www.bbc.com/news/articles/c4g66p2q0750",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+        DetectionBox(
+            x=20,
+            y=80,
+            w=1200,
+            h=56,
+            text="US Treasury Secretary Scott Bessent has told the BBC a small bit of economic pain is worthwhile",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+        DetectionBox(
+            x=30,
+            y=150,
+            w=120,
+            h=24,
+            text="Chat",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+    ]
+
+    translated = pipeline._apply_translations(boxes)
+
+    assert backend.calls
+    assert backend.calls[0][0].startswith("US Treasury Secretary Scott Bessent")
+    assert translated[1].translated_text.startswith("translated:")
+    assert translated[0].translated_text == ""
+
+
+def test_pipeline_reuses_recent_translation_for_similar_box_in_next_frame() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=200,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    first_result = pipeline._apply_translations(first_frame)
+
+    second_frame = [
+        DetectionBox(
+            x=102,
+            y=202,
+            w=905,
+            h=50,
+            text="US Treasury Secretary Scott Bessent told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    second_result = pipeline._apply_translations(second_frame)
+
+    assert first_result[0].translated_text.startswith("translated:")
+    assert second_result[0].translated_text == first_result[0].translated_text

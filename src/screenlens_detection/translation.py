@@ -1,13 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 
 from .languages import resolve_translation_language
 
 try:
     from deep_translator import GoogleTranslator
+    from deep_translator.google import (
+        BeautifulSoup,
+        RequestError,
+        TooManyRequests,
+        TranslationNotFound,
+        is_empty,
+        is_input_valid,
+        request_failed,
+        requests,
+    )
 except ImportError:  # pragma: no cover - optional runtime dependency
     GoogleTranslator = None
+    BeautifulSoup = None
+    RequestError = TooManyRequests = TranslationNotFound = None
+    is_empty = is_input_valid = request_failed = requests = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -57,19 +71,89 @@ class NoOpTranslationBackend(TranslationBackend):
         return "Translation unavailable"
 
 
+if GoogleTranslator is not None:
+    class TimedGoogleTranslator(GoogleTranslator):
+        def __init__(
+            self,
+            *,
+            source: str,
+            target: str,
+            request_timeout_s: float,
+        ) -> None:
+            super().__init__(source=source, target=target)
+            self.request_timeout_s = request_timeout_s
+
+        def translate(self, text: str, **kwargs) -> str:
+            timeout_s = max(float(kwargs.pop("timeout_s", self.request_timeout_s)), 0.05)
+            if is_input_valid(text, max_chars=5000):
+                text = text.strip()
+                if self._same_source_target() or is_empty(text):
+                    return text
+                self._url_params["tl"] = self._target
+                self._url_params["sl"] = self._source
+
+                if self.payload_key:
+                    self._url_params[self.payload_key] = text
+
+                response = requests.get(
+                    self._base_url,
+                    params=self._url_params,
+                    proxies=self.proxies,
+                    timeout=timeout_s,
+                )
+                if response.status_code == 429:
+                    raise TooManyRequests()
+
+                if request_failed(status_code=response.status_code):
+                    raise RequestError()
+
+                soup = BeautifulSoup(response.text, "html.parser")
+
+                element = soup.find(self._element_tag, self._element_query)
+                response.close()
+
+                if not element:
+                    element = soup.find(self._element_tag, self._alt_element_query)
+                    if not element:
+                        raise TranslationNotFound(text)
+                if element.get_text(strip=True) == text.strip():
+                    to_translate_alpha = "".join(ch for ch in text.strip() if ch.isalnum())
+                    translated_alpha = "".join(ch for ch in element.get_text(strip=True) if ch.isalnum())
+                    if to_translate_alpha and translated_alpha and to_translate_alpha == translated_alpha:
+                        self._url_params["tl"] = self._target
+                        if "hl" not in self._url_params:
+                            return text.strip()
+                        del self._url_params["hl"]
+                        return self.translate(text, timeout_s=timeout_s)
+
+                return element.get_text(strip=True)
+
+
 class GoogleTranslateBackend(TranslationBackend):
     name = "google-translate"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        request_timeout_s: float = 0.75,
+        batch_timeout_s: float = 2.0,
+        max_requests_per_batch: int = 4,
+        retry_cooldown_seconds: float = 8.0,
+    ) -> None:
         self._cache: dict[tuple[str, str, str], str] = {}
-        self._translators: dict[tuple[str, str], GoogleTranslator] = {}
+        self._retry_after: dict[tuple[str, str, str], float] = {}
+        self._translators: dict[tuple[str, str], TimedGoogleTranslator] = {}
+        self._request_timeout_s = request_timeout_s
+        self._batch_timeout_s = batch_timeout_s
+        self._max_requests_per_batch = max_requests_per_batch
+        self._retry_cooldown_seconds = retry_cooldown_seconds
 
     def is_available(self) -> bool:
         return GoogleTranslator is not None
 
     def describe(self) -> str:
         if self.is_available():
-            return "Google Translate"
+            return "Google Translate (budgeted)"
         return "Install deep-translator to enable translation"
 
     def translate(
@@ -107,8 +191,9 @@ class GoogleTranslateBackend(TranslationBackend):
             return [""] * len(texts)
 
         results = [""] * len(texts)
-        missing_indices: list[int] = []
-        missing_texts: list[str] = []
+        translator = self._get_translator(source_language, target_language)
+        deadline = perf_counter() + self._batch_timeout_s
+        attempted_requests = 0
 
         for index, normalized in enumerate(normalized_texts):
             if not normalized:
@@ -120,46 +205,47 @@ class GoogleTranslateBackend(TranslationBackend):
                 results[index] = cached
                 continue
 
-            missing_indices.append(index)
-            missing_texts.append(normalized)
+            retry_after = self._retry_after.get(cache_key, 0.0)
+            if retry_after > perf_counter():
+                continue
 
-        if not missing_texts:
-            return results
+            if attempted_requests >= self._max_requests_per_batch:
+                continue
 
-        translator = self._get_translator(source_language, target_language)
-        try:
-            translated_batch = translator.translate_batch(missing_texts)
-        except Exception:
-            translated_batch = self._translate_batch_fallback(
-                translator,
-                missing_texts,
-            )
+            remaining_budget = deadline - perf_counter()
+            if remaining_budget <= 0:
+                continue
 
-        for index, translated in zip(missing_indices, translated_batch, strict=False):
-            normalized_source = normalized_texts[index]
+            attempted_requests += 1
+            timeout_s = min(self._request_timeout_s, remaining_budget)
+            try:
+                translated = translator.translate(normalized, timeout_s=timeout_s)
+            except Exception:
+                self._retry_after[cache_key] = perf_counter() + self._retry_cooldown_seconds
+                continue
+
             normalized_translated = " ".join((translated or "").split())
-            self._cache[(normalized_source, source_language, target_language)] = normalized_translated
+            if not normalized_translated:
+                self._retry_after[cache_key] = perf_counter() + self._retry_cooldown_seconds
+                continue
+
+            self._cache[cache_key] = normalized_translated
+            self._retry_after.pop(cache_key, None)
             results[index] = normalized_translated
 
         return results
 
-    def _get_translator(self, source_language: str, target_language: str) -> GoogleTranslator:
+    def _get_translator(self, source_language: str, target_language: str) -> TimedGoogleTranslator:
         cache_key = (source_language, target_language)
         translator = self._translators.get(cache_key)
         if translator is None:
-            translator = GoogleTranslator(source=source_language, target=target_language)
+            translator = TimedGoogleTranslator(
+                source=source_language,
+                target=target_language,
+                request_timeout_s=self._request_timeout_s,
+            )
             self._translators[cache_key] = translator
         return translator
-
-    @staticmethod
-    def _translate_batch_fallback(translator: GoogleTranslator, texts: list[str]) -> list[str]:
-        results: list[str] = []
-        for text in texts:
-            try:
-                results.append(translator.translate(text))
-            except Exception:
-                results.append("")
-        return results
 
 
 def create_default_translation_backend() -> TranslationBackend:
