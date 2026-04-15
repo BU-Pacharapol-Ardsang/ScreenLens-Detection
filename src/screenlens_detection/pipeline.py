@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from time import perf_counter
 
@@ -201,8 +202,9 @@ class TextDetectionPipeline:
         scale: float,
     ) -> list[DetectionBox]:
         detected_boxes: list[DetectionBox] = []
+        ocr_boxes = self._select_ocr_boxes(working_boxes)
 
-        for x, y, w, h in working_boxes:
+        for x, y, w, h in ocr_boxes:
             pad_x = max(int(w * 0.04), 4)
             pad_y = max(int(h * 0.25), 4)
             crop_x1 = max(x - pad_x, 0)
@@ -214,7 +216,7 @@ class TextDetectionPipeline:
             text = ""
             confidence = None
             if self.settings.ocr_enabled and self.ocr_backend.is_available():
-                ocr_crop = self._prepare_crop_for_ocr(crop)
+                ocr_crop = self.ocr_backend.prepare_image(crop)
                 ocr_result = self.ocr_backend.recognize(
                     ocr_crop,
                     language=self.settings.ocr_language,
@@ -253,6 +255,22 @@ class TextDetectionPipeline:
             )
 
         return detected_boxes
+
+    def _select_ocr_boxes(
+        self,
+        working_boxes: list[tuple[int, int, int, int]],
+    ) -> list[tuple[int, int, int, int]]:
+        if not self.settings.ocr_enabled or not self.ocr_backend.is_available():
+            return working_boxes
+
+        limit = max(self.settings.max_ocr_boxes_per_frame, 1)
+        if len(working_boxes) <= limit:
+            return working_boxes
+
+        prioritized = sorted(working_boxes, key=lambda box: box[2] * box[3], reverse=True)
+        selected = prioritized[:limit]
+        selected.sort(key=lambda box: (box[1], box[0]))
+        return selected
 
     def _apply_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
         if not boxes:
@@ -371,24 +389,6 @@ class TextDetectionPipeline:
         bottom = min(first[1] + first[3], second[1] + second[3])
         return max(right - left, 0) * max(bottom - top, 0)
 
-    @staticmethod
-    def _prepare_crop_for_ocr(crop: np.ndarray) -> np.ndarray:
-        blurred = cv2.GaussianBlur(crop, (3, 3), 0)
-        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-
-        if cv2.countNonZero(binary) < (binary.size // 2):
-            binary = cv2.bitwise_not(binary)
-
-        return cv2.copyMakeBorder(
-            binary,
-            6,
-            6,
-            10,
-            10,
-            cv2.BORDER_CONSTANT,
-            value=255,
-        )
-
     def _resolve_psm(self, width: int, height: int) -> int:
         if width / max(height, 1) >= 6.0:
             return 7
@@ -396,8 +396,24 @@ class TextDetectionPipeline:
 
     def _normalize_recognized_text(self, text: str) -> str:
         normalized = " ".join(text.split())
+        normalized = self._strip_minor_script_noise(normalized)
+        normalized = re.sub(r"\s+([,.;:!?])", r"\1", normalized)
         normalized = normalized.strip(" |:;.,_-`~[]{}<>")
         return normalized
+
+    @staticmethod
+    def _strip_minor_script_noise(text: str) -> str:
+        thai_count = sum("\u0E00" <= character <= "\u0E7F" for character in text)
+        latin_count = sum(character.isascii() and character.isalpha() for character in text)
+
+        # Tesseract often injects a couple of Thai glyphs into otherwise English lines
+        # when running in mixed-language mode. Dropping only the tiny minority script
+        # improves the text that reaches translation without hurting genuinely mixed lines.
+        if latin_count >= 8 and 0 < thai_count <= max(2, latin_count // 8):
+            text = "".join(character for character in text if not ("\u0E00" <= character <= "\u0E7F"))
+            text = " ".join(text.split())
+
+        return text
 
     def _is_usable_text(self, text: str, confidence: float | None) -> bool:
         if not text:
@@ -453,17 +469,21 @@ class TextDetectionPipeline:
         route = f"{source_language.label} -> {target_language.label}"
         translation_status = self.translation_backend.describe()
         if self.settings.ocr_enabled and self.ocr_backend.is_available():
-            return f"{route} | OCR enabled | {translation_status}"
+            ocr_status = f"OCR enabled ({self.settings.max_ocr_boxes_per_frame} boxes/frame)"
+            return f"{route} | {ocr_status} | {translation_status}"
         if self.settings.ocr_enabled:
             return f"{route} | {self.ocr_backend.describe()} | {translation_status}"
         return f"{route} | OCR disabled | {translation_status}"
 
     def _resolve_source_language(self, text: str) -> tuple[str, str]:
-        if self.settings.source_language_code != "auto":
+        if self.settings.source_language_code not in {"auto", "tha+eng"}:
             source_language = get_source_language_option(self.settings.source_language_code)
             return source_language.code, source_language.label
 
         detected_code = detect_language_code(text)
+        if detected_code == "unknown" and self.settings.source_language_code != "auto":
+            source_language = get_source_language_option(self.settings.source_language_code)
+            return source_language.code, source_language.label
         return detected_code, language_label(detected_code)
 
     @staticmethod

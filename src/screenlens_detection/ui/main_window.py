@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCloseEvent, QImage, QPixmap
 from PySide6.QtWidgets import (
@@ -15,6 +17,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -25,6 +28,9 @@ import numpy as np
 from ..capture import ScreenCapturer
 from ..languages import resolve_ocr_language, source_language_options, target_language_options
 from ..models import FrameAnalysis, MonitorSpec, PipelineSettings
+from ..overlay import TranslationOverlay
+from ..windows_capture_exclusion import set_window_capture_exclusion
+from ..windows_hotkeys import extract_hotkey_id, hotkey_labels, register_window_hotkeys, unregister_window_hotkeys
 from ..worker import ProcessingWorker
 
 
@@ -36,12 +42,19 @@ class MainWindow(QMainWindow):
 
         self.monitors: list[MonitorSpec] = []
         self.worker: ProcessingWorker | None = None
+        self.overlay_window = TranslationOverlay()
+        self.overlay_active = False
+        self._overlay_started_worker = False
+        self._hotkeys_registered = False
+        self._capture_exclusion_applied = False
+        self._base_status = "Idle"
 
         self.monitor_combo = QComboBox()
         self.refresh_button = QPushButton("Refresh Monitors")
         self.start_button = QPushButton("Start")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
+        self.hotkey_label = QLabel(f"Global hotkeys: {hotkey_labels()} toggle live screen overlay")
 
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(80, 3000)
@@ -56,6 +69,20 @@ class MainWindow(QMainWindow):
         self.area_spin = QSpinBox()
         self.area_spin.setRange(50, 10000)
         self.area_spin.setValue(250)
+
+        self.ocr_boxes_slider = QSlider(Qt.Orientation.Horizontal)
+        self.ocr_boxes_slider.setRange(1, 60)
+        self.ocr_boxes_slider.setPageStep(4)
+        self.ocr_boxes_slider.setTickInterval(1)
+        self.ocr_boxes_slider.setValue(8)
+        self.ocr_boxes_value_label = QLabel(str(self.ocr_boxes_slider.value()))
+        self.ocr_boxes_value_label.setMinimumWidth(28)
+        self.ocr_boxes_control = QWidget()
+        ocr_boxes_layout = QHBoxLayout(self.ocr_boxes_control)
+        ocr_boxes_layout.setContentsMargins(0, 0, 0, 0)
+        ocr_boxes_layout.setSpacing(8)
+        ocr_boxes_layout.addWidget(self.ocr_boxes_slider, 1)
+        ocr_boxes_layout.addWidget(self.ocr_boxes_value_label)
 
         self.source_language_combo = QComboBox()
         self.target_language_combo = QComboBox()
@@ -90,12 +117,14 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.refresh_button, 0, 2)
         controls_layout.addWidget(self.start_button, 0, 3)
         controls_layout.addWidget(self.stop_button, 0, 4)
+        controls_layout.addWidget(self.hotkey_label, 1, 0, 1, 5)
 
         settings_box = QGroupBox("Pipeline Settings")
         settings_layout = QFormLayout(settings_box)
         settings_layout.addRow("Capture interval", self.interval_spin)
         settings_layout.addRow("Upscale factor", self.scale_spin)
         settings_layout.addRow("Min contour area", self.area_spin)
+        settings_layout.addRow("OCR boxes/frame", self.ocr_boxes_control)
         settings_layout.addRow("Source language", self.source_language_combo)
         settings_layout.addRow("Target language", self.target_language_combo)
         settings_layout.addRow("", self.ocr_checkbox)
@@ -130,6 +159,7 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(self._refresh_monitors)
         self.start_button.clicked.connect(self._start_worker)
         self.stop_button.clicked.connect(self._stop_worker)
+        self.ocr_boxes_slider.valueChanged.connect(self._update_ocr_boxes_label)
 
     def _set_runtime_controls_locked(self, locked: bool) -> None:
         self.monitor_combo.setEnabled(not locked)
@@ -137,6 +167,7 @@ class MainWindow(QMainWindow):
         self.interval_spin.setEnabled(not locked)
         self.scale_spin.setEnabled(not locked)
         self.area_spin.setEnabled(not locked)
+        self.ocr_boxes_slider.setEnabled(not locked)
         self.source_language_combo.setEnabled(not locked)
         self.target_language_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
@@ -161,11 +192,11 @@ class MainWindow(QMainWindow):
             self.monitor_combo.addItem(monitor.label, userData=monitor)
 
         if not self.monitors:
-            self.status_label.setText("No monitors detected")
+            self._set_base_status("No monitors detected")
             self.start_button.setEnabled(False)
             return
 
-        self.status_label.setText("Ready")
+        self._set_base_status("Ready")
         self.start_button.setEnabled(True)
 
     def _start_worker(self) -> None:
@@ -181,6 +212,7 @@ class MainWindow(QMainWindow):
             capture_interval_ms=self.interval_spin.value(),
             upscale_factor=self.scale_spin.value(),
             min_contour_area=self.area_spin.value(),
+            max_ocr_boxes_per_frame=self.ocr_boxes_slider.value(),
             source_language_code=self.source_language_combo.currentData(),
             target_language_code=self.target_language_combo.currentData(),
             ocr_enabled=self.ocr_checkbox.isChecked(),
@@ -191,13 +223,16 @@ class MainWindow(QMainWindow):
         self.worker.frame_ready.connect(self._handle_frame)
         self.worker.worker_error.connect(self._handle_error)
         self.worker.finished.connect(self._on_worker_finished)
-        self.status_label.setText("Starting OCR/translation...")
+        self._set_base_status("Starting OCR/translation...")
         self._set_runtime_controls_locked(True)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.worker.start()
 
     def _stop_worker(self) -> None:
+        self._overlay_started_worker = False
+        if self.overlay_active:
+            self._hide_overlay()
         if self.worker is None:
             return
         self.worker.stop()
@@ -207,11 +242,12 @@ class MainWindow(QMainWindow):
         self._set_runtime_controls_locked(False)
         self.start_button.setEnabled(bool(self.monitors))
         self.stop_button.setEnabled(False)
-        if self.status_label.text() == "Running":
-            self.status_label.setText("Stopped")
+        self._overlay_started_worker = False
+        if self._base_status != "Error":
+            self._set_base_status("Stopped")
 
     def _handle_error(self, message: str) -> None:
-        self.status_label.setText("Error")
+        self._set_base_status("Error")
         QMessageBox.critical(self, "ScreenLens-Detection", message)
         self._stop_worker()
 
@@ -225,7 +261,10 @@ class MainWindow(QMainWindow):
             self.fps_label.setText(f"{analysis.fps:.1f}")
         self.detected_label.setText(str(len(analysis.boxes)))
         self.monitor_label.setText(analysis.monitor_label or "-")
-        self.status_label.setText(analysis.status)
+        self._set_base_status(analysis.status)
+
+        if self.overlay_active:
+            self.overlay_window.update_analysis(analysis)
 
         if analysis.boxes:
             lines = []
@@ -235,9 +274,108 @@ class MainWindow(QMainWindow):
         else:
             self.text_output.setPlainText("No text regions detected in the current frame.")
 
+    def showEvent(self, event: object) -> None:
+        super().showEvent(event)
+        self._ensure_capture_exclusion()
+        self._ensure_hotkeys_registered()
+
     def closeEvent(self, event: QCloseEvent) -> None:
         self._stop_worker()
+        self._unregister_hotkeys()
+        self.overlay_window.close()
         super().closeEvent(event)
+
+    def nativeEvent(self, event_type: object, message: int) -> tuple[bool, int]:
+        if sys.platform == "win32":
+            hotkey_id = extract_hotkey_id(message)
+            if hotkey_id is not None:
+                self._handle_hotkey(hotkey_id)
+                return True, 0
+
+        return super().nativeEvent(event_type, message)
+
+    def _handle_hotkey(self, hotkey_id: int) -> None:
+        if hotkey_id in {1, 2}:
+            self._toggle_overlay_mode()
+
+    def _toggle_overlay_mode(self) -> None:
+        if self.overlay_active:
+            self._disable_overlay_mode()
+            return
+        self._enable_overlay_mode()
+
+    def _enable_overlay_mode(self) -> None:
+        monitor = self.monitor_combo.currentData()
+        if monitor is None:
+            QMessageBox.warning(self, "ScreenLens-Detection", "No monitor selected.")
+            return
+
+        self.overlay_window.show_for_monitor(monitor)
+        self.overlay_window.clear_analysis()
+        self.overlay_active = True
+
+        if self.worker is None:
+            self._overlay_started_worker = True
+            self._start_worker()
+            return
+
+        self._overlay_started_worker = False
+        self._refresh_status_label()
+
+    def _disable_overlay_mode(self) -> None:
+        owned_worker = self._overlay_started_worker
+        self._overlay_started_worker = False
+        self._hide_overlay()
+
+        if owned_worker and self.worker is not None:
+            self.worker.stop()
+
+    def _hide_overlay(self) -> None:
+        self.overlay_active = False
+        self.overlay_window.clear_analysis()
+        self.overlay_window.hide()
+        self._refresh_status_label()
+
+    def _set_base_status(self, text: str) -> None:
+        self._base_status = text
+        self._refresh_status_label()
+
+    def _refresh_status_label(self) -> None:
+        status = self._base_status
+        if self.overlay_active:
+            status = f"{status} | Overlay ON"
+        self.status_label.setText(status)
+
+    def _ensure_hotkeys_registered(self) -> None:
+        if self._hotkeys_registered or sys.platform != "win32":
+            return
+
+        failures = register_window_hotkeys(int(self.winId()))
+        self._hotkeys_registered = True
+        if failures:
+            self.hotkey_label.setText(
+                f"Some global hotkeys unavailable: {', '.join(failures)}"
+            )
+        else:
+            self.hotkey_label.setText(
+                f"Global hotkeys active: {hotkey_labels()} toggle live screen overlay"
+            )
+
+    def _ensure_capture_exclusion(self) -> None:
+        if self._capture_exclusion_applied:
+            return
+
+        self._capture_exclusion_applied = set_window_capture_exclusion(int(self.winId()))
+
+    def _unregister_hotkeys(self) -> None:
+        if not self._hotkeys_registered or sys.platform != "win32":
+            return
+
+        unregister_window_hotkeys(int(self.winId()))
+        self._hotkeys_registered = False
+
+    def _update_ocr_boxes_label(self, value: int) -> None:
+        self.ocr_boxes_value_label.setText(str(value))
 
     @staticmethod
     def _create_image_label(placeholder: str) -> QLabel:

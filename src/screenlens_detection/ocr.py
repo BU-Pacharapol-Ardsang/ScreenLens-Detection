@@ -13,6 +13,11 @@ from PIL import Image
 from .runtime import application_roots
 
 try:
+    from easyocr import Reader as EasyOCRReader
+except ImportError:  # pragma: no cover - optional runtime dependency
+    EasyOCRReader = None
+
+try:
     import pytesseract
 except ImportError:  # pragma: no cover - dependency is declared in pyproject
     pytesseract = None
@@ -33,6 +38,9 @@ class OCRBackend:
     def describe(self) -> str:
         return "OCR unavailable"
 
+    def prepare_image(self, image: np.ndarray) -> np.ndarray:
+        return np.asarray(image)
+
     def recognize(self, image: object, *, language: str, psm: int) -> OCRResult:
         return OCRResult()
 
@@ -42,6 +50,109 @@ class NoOpOCRBackend(OCRBackend):
 
     def describe(self) -> str:
         return "Detection-only mode"
+
+
+class EasyOCRBackend(OCRBackend):
+    name = "easyocr"
+
+    def __init__(self, *, gpu: bool | None = None) -> None:
+        self._gpu = bool(gpu) if gpu is not None else False
+        self._readers: dict[tuple[str, ...], object] = {}
+
+    def is_available(self) -> bool:
+        return EasyOCRReader is not None
+
+    def describe(self) -> str:
+        if self.is_available():
+            device = "GPU" if self._gpu else "CPU"
+            return f"EasyOCR ({device})"
+        return "Install easyocr (and PyTorch) to enable the upgraded OCR backend"
+
+    def prepare_image(self, image: np.ndarray) -> np.ndarray:
+        normalized = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        height, width = normalized.shape[:2]
+
+        scale = 1.0
+        if height < 36:
+            scale = max(scale, 2.0)
+        if width < 160:
+            scale = max(scale, 1.5)
+
+        if scale > 1.0:
+            normalized = cv2.resize(normalized, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        return cv2.copyMakeBorder(
+            normalized,
+            10,
+            10,
+            14,
+            14,
+            cv2.BORDER_CONSTANT,
+            value=255,
+        )
+
+    def recognize(self, image: object, *, language: str, psm: int) -> OCRResult:
+        if not self.is_available():
+            return OCRResult()
+
+        try:
+            reader = self._get_reader(language)
+            results = reader.readtext(np.asarray(image), detail=1, paragraph=False)
+        except Exception:
+            return OCRResult()
+
+        tokens: list[str] = []
+        confidences: list[float] = []
+
+        ordered_results = sorted(results, key=self._result_sort_key)
+        for _bbox, token, confidence in ordered_results:
+            normalized_token = re.sub(r"\s+", " ", str(token)).strip()
+            if not normalized_token:
+                continue
+
+            tokens.append(normalized_token)
+            try:
+                confidences.append(float(confidence) * 100.0)
+            except (TypeError, ValueError):
+                continue
+
+        normalized = " ".join(tokens)
+        average_confidence = sum(confidences) / len(confidences) if confidences else None
+        return OCRResult(text=normalized, confidence=average_confidence)
+
+    def _get_reader(self, language: str) -> object:
+        lang_list = self._resolve_language_list(language)
+        reader = self._readers.get(lang_list)
+        if reader is None:
+            reader = EasyOCRReader(list(lang_list), gpu=self._gpu, verbose=False)
+            self._readers[lang_list] = reader
+        return reader
+
+    @staticmethod
+    def _resolve_language_list(language: str) -> tuple[str, ...]:
+        tokens = {token.strip() for token in language.split("+") if token.strip()}
+        lang_list: list[str] = []
+
+        if "tha" in tokens:
+            lang_list.append("th")
+        if "eng" in tokens or not lang_list:
+            lang_list.append("en")
+        elif "th" in lang_list and "en" not in lang_list:
+            lang_list.append("en")
+
+        return tuple(lang_list)
+
+    @staticmethod
+    def _result_sort_key(result: tuple[object, object, object]) -> tuple[float, float]:
+        bbox = result[0]
+        if not isinstance(bbox, list) or not bbox:
+            return (0.0, 0.0)
+
+        xs = [float(point[0]) for point in bbox if isinstance(point, (list, tuple)) and len(point) >= 2]
+        ys = [float(point[1]) for point in bbox if isinstance(point, (list, tuple)) and len(point) >= 2]
+        if not xs or not ys:
+            return (0.0, 0.0)
+        return (min(ys), min(xs))
 
 
 class TesseractOCRBackend(OCRBackend):
@@ -114,6 +225,24 @@ class TesseractOCRBackend(OCRBackend):
         if self.is_available():
             return f"Tesseract OCR ({self._binary})"
         return "Install or bundle Tesseract, or set TESSERACT_CMD to enable OCR"
+
+    def prepare_image(self, image: np.ndarray) -> np.ndarray:
+        normalized = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(normalized, (3, 3), 0)
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        if cv2.countNonZero(binary) < (binary.size // 2):
+            binary = cv2.bitwise_not(binary)
+
+        return cv2.copyMakeBorder(
+            binary,
+            6,
+            6,
+            10,
+            10,
+            cv2.BORDER_CONSTANT,
+            value=255,
+        )
 
     def recognize(self, image: object, *, language: str, psm: int) -> OCRResult:
         if not self.is_available():
@@ -190,9 +319,26 @@ class TesseractOCRBackend(OCRBackend):
 
 
 def create_default_ocr_backend() -> OCRBackend:
-    backend = TesseractOCRBackend()
-    if backend.is_available():
-        return backend
+    preference = os.getenv("SCREENLENS_OCR_BACKEND", "auto").strip().lower()
+    if preference in {"disabled", "none", "off"}:
+        return NoOpOCRBackend()
+
+    if preference == "tesseract":
+        backend = TesseractOCRBackend()
+        if backend.is_available():
+            return backend
+        return NoOpOCRBackend()
+
+    if preference == "easyocr":
+        backend = EasyOCRBackend()
+        if backend.is_available():
+            return backend
+        return NoOpOCRBackend()
+
+    for backend_cls in (EasyOCRBackend, TesseractOCRBackend):
+        backend = backend_cls()
+        if backend.is_available():
+            return backend
     return NoOpOCRBackend()
 
 

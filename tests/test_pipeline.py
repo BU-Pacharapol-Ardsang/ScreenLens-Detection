@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 from screenlens_detection.models import PipelineSettings
-from screenlens_detection.ocr import NoOpOCRBackend
+from screenlens_detection.ocr import NoOpOCRBackend, OCRBackend, OCRResult
 from screenlens_detection.pipeline import TextDetectionPipeline
 from screenlens_detection.translation import NoOpTranslationBackend
 
@@ -89,3 +89,68 @@ def test_pipeline_detects_document_lines_without_merging_whole_paragraph() -> No
 
     assert len(article_boxes) >= 5
     assert max(box.h for box in article_boxes) < 60
+
+
+class RecordingOCRBackend(OCRBackend):
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def is_available(self) -> bool:
+        return True
+
+    def recognize(self, image: object, *, language: str, psm: int) -> OCRResult:
+        self.calls.append((language, psm))
+        return OCRResult(text="demo", confidence=95.0)
+
+
+def test_pipeline_limits_ocr_boxes_per_frame() -> None:
+    backend = RecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=2,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+
+    working_boxes = [
+        (0, 0, 40, 20),
+        (20, 60, 120, 28),
+        (40, 120, 220, 36),
+        (60, 180, 320, 44),
+    ]
+    gray = np.full((280, 420), 255, dtype=np.uint8)
+
+    detected = pipeline._annotate_with_ocr(working_boxes, gray, (280, 420, 3), 1.0)
+
+    assert len(detected) == 2
+    assert len(backend.calls) == 2
+
+
+def test_pipeline_detects_actual_source_language_in_mixed_ocr_mode() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(source_language_code="tha+eng"),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    assert pipeline._resolve_source_language("Breaking news from BBC") == ("eng", "English")
+    assert pipeline._resolve_source_language("ทดสอบภาษาไทย") == ("tha", "Thai")
+    assert pipeline._resolve_source_language("BBC ภาษาไทย") == ("mixed", "Mixed (Thai + English)")
+
+
+def test_pipeline_normalizes_stray_thai_noise_from_english_ocr() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    normalized = pipeline._normalize_recognized_text(
+        "according to senior บ ร officials . It does not have nuclear weapons"
+    )
+
+    assert normalized == "according to senior officials. It does not have nuclear weapons"

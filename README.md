@@ -1,6 +1,6 @@
 # ScreenLens-Detection
 
-`ScreenLens-Detection` is a Python + Qt desktop application for realtime screen-text detection. The current scaffold captures a monitor, runs preprocessing and text-region segmentation with OpenCV, optionally performs OCR with Tesseract, and visualizes the results in a desktop UI.
+`ScreenLens-Detection` is a Python + Qt desktop application for realtime screen-text detection. The current scaffold captures a monitor, runs preprocessing and text-region segmentation with OpenCV, optionally performs OCR with EasyOCR or Tesseract, and visualizes the results in a desktop UI.
 
 ## Why this fits the project brief
 
@@ -24,7 +24,7 @@ The current implementation uses this flow:
 2. Convert the frame to grayscale and enhance local contrast with `CLAHE`
 3. Build a dual-polarity mask to detect both dark text on light backgrounds and light text on dark backgrounds
 4. Segment likely text regions with morphology + contour filtering
-5. Run OCR on each detected region when Tesseract is available
+5. Run OCR on each detected region when an OCR backend is available
 6. Draw detection boxes and stream the results to the Qt UI
 
 ## Features
@@ -32,7 +32,7 @@ The current implementation uses this flow:
 - Realtime monitor capture
 - Segmentation preview for demonstrations
 - Bounding-box detection for on-screen text regions
-- Optional OCR with `pytesseract`
+- Optional OCR with `EasyOCR` or `pytesseract`
 - Adjustable capture interval, scale factor, contour area, and OCR language
 - Clean Python package structure for future translation/overlay features
 
@@ -40,10 +40,17 @@ The current implementation uses this flow:
 
 - Python `3.11+`
 - Windows, Linux, or macOS with desktop screen-capture support
-- Optional: Tesseract OCR installed and available on `PATH`
+- Optional: an OCR backend installed locally
 
-If `tesseract` is not available, the app still runs in detection-only mode.
-The OCR runtime can be discovered from any of these locations:
+If no OCR backend is available, the app still runs in detection-only mode.
+By default the app prefers `EasyOCR` when it is installed, then falls back to `Tesseract`.
+You can override that order with:
+
+```powershell
+$env:SCREENLENS_OCR_BACKEND="easyocr"   # or: tesseract / off
+```
+
+The Tesseract runtime can be discovered from any of these locations:
 
 - `TESSERACT_CMD` / `TESSDATA_PREFIX`
 - A bundled `tesseract` folder beside the built app
@@ -62,6 +69,16 @@ $env:TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 To recognize Thai text, install Thai language data and set the app language field to `tha+eng`.
 
+### EasyOCR on Windows
+
+For better mixed Thai/English OCR quality than Tesseract, install the optional EasyOCR backend:
+
+```powershell
+pip install -e ".[ocr_easy]"
+```
+
+EasyOCR is heavier because it pulls in PyTorch, but the app will automatically prefer it once installed.
+
 ## Setup
 
 ```powershell
@@ -75,6 +92,12 @@ For tests:
 ```powershell
 pip install -e ".[dev]"
 pytest
+```
+
+If you want the upgraded OCR backend in the same environment:
+
+```powershell
+pip install -e ".[dev,ocr_easy]"
 ```
 
 For Windows packaging:

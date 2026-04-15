@@ -43,6 +43,7 @@ class PipelineSettings:
     ocr_enabled: bool = True
     ocr_language: str = "tha+eng"
     ocr_psm: int = 7
+    max_ocr_boxes_per_frame: int = 8
 
 
 @dataclass(slots=True, frozen=True)
