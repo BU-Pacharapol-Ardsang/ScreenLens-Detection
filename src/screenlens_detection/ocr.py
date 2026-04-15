@@ -10,6 +10,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from .runtime import application_roots
+
 try:
     import pytesseract
 except ImportError:  # pragma: no cover - dependency is declared in pyproject
@@ -47,7 +49,7 @@ class TesseractOCRBackend(OCRBackend):
 
     def __init__(self) -> None:
         self._binary = self._resolve_binary()
-        self._tessdata_dir = self._resolve_tessdata_dir()
+        self._tessdata_dir = self._resolve_tessdata_dir(self._binary)
         if self._binary and pytesseract is not None:
             pytesseract.pytesseract.tesseract_cmd = self._binary
         if self._tessdata_dir:
@@ -58,6 +60,11 @@ class TesseractOCRBackend(OCRBackend):
         env_binary = os.getenv("TESSERACT_CMD")
         if env_binary and Path(env_binary).is_file():
             return env_binary
+
+        for candidate in _runtime_tesseract_binary_candidates():
+            if candidate.is_file():
+                return str(candidate)
+
         resolved = shutil.which("tesseract")
         if resolved:
             return resolved
@@ -72,13 +79,19 @@ class TesseractOCRBackend(OCRBackend):
         return None
 
     @staticmethod
-    def _resolve_tessdata_dir() -> str | None:
+    def _resolve_tessdata_dir(binary: str | None) -> str | None:
         env_prefix = os.getenv("TESSDATA_PREFIX")
         candidates: list[Path] = []
 
         if env_prefix:
             prefix_path = Path(env_prefix)
             candidates.extend((prefix_path, prefix_path / "tessdata"))
+
+        if binary:
+            binary_dir = Path(binary).resolve().parent
+            candidates.extend((binary_dir / "tessdata", binary_dir))
+
+        candidates.extend(_runtime_tessdata_candidates())
 
         candidates.extend(
             (
@@ -100,7 +113,7 @@ class TesseractOCRBackend(OCRBackend):
     def describe(self) -> str:
         if self.is_available():
             return f"Tesseract OCR ({self._binary})"
-        return "Install Tesseract or set TESSERACT_CMD to enable OCR"
+        return "Install or bundle Tesseract, or set TESSERACT_CMD to enable OCR"
 
     def recognize(self, image: object, *, language: str, psm: int) -> OCRResult:
         if not self.is_available():
@@ -181,3 +194,49 @@ def create_default_ocr_backend() -> OCRBackend:
     if backend.is_available():
         return backend
     return NoOpOCRBackend()
+
+
+def _runtime_tesseract_binary_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    relative_locations = (
+        Path("tesseract.exe"),
+        Path("tesseract") / "tesseract.exe",
+        Path("Tesseract-OCR") / "tesseract.exe",
+        Path("vendor") / "tesseract" / "tesseract.exe",
+    )
+
+    for root in application_roots():
+        for relative_path in relative_locations:
+            candidates.append(root / relative_path)
+
+    return _unique_paths(candidates)
+
+
+def _runtime_tessdata_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    relative_locations = (
+        Path("tessdata"),
+        Path("tesseract") / "tessdata",
+        Path("Tesseract-OCR") / "tessdata",
+        Path("vendor") / "tesseract" / "tessdata",
+    )
+
+    for root in application_roots():
+        for relative_path in relative_locations:
+            candidates.append(root / relative_path)
+
+    return _unique_paths(candidates)
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        unique.append(resolved)
+        seen.add(resolved)
+
+    return unique

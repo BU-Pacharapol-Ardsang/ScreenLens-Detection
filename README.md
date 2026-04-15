@@ -43,6 +43,12 @@ The current implementation uses this flow:
 - Optional: Tesseract OCR installed and available on `PATH`
 
 If `tesseract` is not available, the app still runs in detection-only mode.
+The OCR runtime can be discovered from any of these locations:
+
+- `TESSERACT_CMD` / `TESSDATA_PREFIX`
+- A bundled `tesseract` folder beside the built app
+- A bundled `Tesseract-OCR` folder beside the built app
+- System `PATH`
 
 ### Tesseract on Windows
 
@@ -69,6 +75,12 @@ For tests:
 ```powershell
 pip install -e ".[dev]"
 pytest
+```
+
+For Windows packaging:
+
+```powershell
+pip install -e ".[build]"
 ```
 
 ## Run
@@ -98,6 +110,55 @@ Or:
 ```powershell
 python -m screenlens_detection
 ```
+
+## Package For A Clean Windows VM
+
+Recommended deployment target: `PyInstaller` `onedir`
+
+This avoids relying on a system Python install, `.pyw` file association, or a pre-existing `.venv` on the VM.
+
+1. Prepare the build environment:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[build]"
+```
+
+2. Optional: bundle OCR for offline VMs by placing Tesseract files in:
+
+```text
+vendor/tesseract/
+  tesseract.exe
+  tessdata/
+    eng.traineddata
+    tha.traineddata
+```
+
+3. Build the app:
+
+```powershell
+.\scripts\build_windows.ps1 -Clean
+```
+
+One-click option from File Explorer or `cmd`:
+
+```bat
+build_screenlens_exe.bat
+```
+
+4. Copy the resulting folder to the VM and run:
+
+```text
+dist/ScreenLens/ScreenLens.exe
+```
+
+Notes:
+
+- If `vendor/tesseract/tesseract.exe` exists, the build bundles it and the app prefers that copy automatically.
+- If no bundled or installed Tesseract is found, the app still opens in detection-only mode.
+- `screenlens.py` and `screenlens.pyw` are still useful for local development, but the built `.exe` is the correct path for blank Windows VMs.
+- `build_screenlens_exe.bat` is the simplest build entrypoint. It creates `.venv` automatically when missing, installs build tools, and then produces `dist\ScreenLens\ScreenLens.exe`.
 
 ## Project structure
 
