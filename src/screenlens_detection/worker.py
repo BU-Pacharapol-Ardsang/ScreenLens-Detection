@@ -27,8 +27,8 @@ class ProcessingWorker(QThread):
         capturer = ScreenCapturer()
         pipeline = TextDetectionPipeline(
             self.settings,
-            create_default_ocr_backend(),
-            create_default_translation_backend(),
+            create_default_ocr_backend(device_preference=self.settings.ocr_device_preference),
+            create_default_translation_backend(mode=self.settings.translation_mode),
         )
 
         try:
@@ -45,6 +45,7 @@ class ProcessingWorker(QThread):
         except Exception as exc:  # pragma: no cover - UI thread handles emitted errors
             self.worker_error.emit(str(exc))
         finally:
+            pipeline.close()
             capturer.close()
 
     def stop(self) -> None:

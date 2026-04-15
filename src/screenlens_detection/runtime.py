@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,17 @@ def application_roots() -> list[Path]:
         )
     )
     return _unique_paths(roots)
+
+
+def application_data_dir() -> Path:
+    if os.name == "nt":
+        base_dir = Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base_dir = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+
+    data_dir = base_dir / "ScreenLens-Detection"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
 
 
 def _unique_paths(paths: list[Path]) -> list[Path]:
