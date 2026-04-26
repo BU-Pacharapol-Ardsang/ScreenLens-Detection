@@ -1,6 +1,6 @@
 # ScreenLens-Detection
 
-`ScreenLens-Detection` is a Python + Qt desktop application for realtime screen-text detection. The current scaffold captures a monitor, runs preprocessing and text-region segmentation with OpenCV, optionally performs OCR with EasyOCR or Tesseract, and visualizes the results in a desktop UI.
+`ScreenLens-Detection` is a Python + Qt desktop application for realtime screen-text detection. The current scaffold captures a monitor, detects text regions with a selectable OpenCV or optional deep detector, optionally performs OCR with EasyOCR or Tesseract, and visualizes the results in a desktop UI.
 
 ## Why this fits the project brief
 
@@ -23,7 +23,7 @@ The current implementation uses this flow:
 1. Capture a monitor in realtime with `mss`
 2. Convert the frame to grayscale and enhance local contrast with `CLAHE`
 3. Build a dual-polarity mask to detect both dark text on light backgrounds and light text on dark backgrounds
-4. Segment likely text regions with morphology + contour filtering
+4. Segment likely text regions with the selected text detector
 5. Run OCR on each detected region when an OCR backend is available
 6. Draw detection boxes and stream the results to the Qt UI
 
@@ -31,7 +31,7 @@ The current implementation uses this flow:
 
 - Realtime monitor capture
 - Segmentation preview for demonstrations
-- Bounding-box detection for on-screen text regions
+- Selectable text detector: classic OpenCV morphology, optional PaddleOCR DBNet, or optional EasyOCR CRAFT
 - Optional OCR with `EasyOCR` or `pytesseract`
 - Selectable translation backend: `Argos Translate (Offline)`, `Google Translate (Online)`, or disabled
 - Adjustable capture interval, scale factor, contour area, and OCR language
@@ -85,6 +85,22 @@ If you want NVIDIA CUDA acceleration, use the Windows setup script instead so Py
 .\scripts\setup_windows.ps1 -TorchRuntime gpu
 ```
 
+### Optional deep text detectors
+
+The UI includes a `Text detector` dropdown:
+
+- `Classic OpenCV (Morphology)` uses the original contour-based detector and remains the default.
+- `PaddleOCR DBNet (Optional)` uses PaddleOCR detection when `paddleocr` and `paddlepaddle` are installed.
+- `EasyOCR CRAFT (Optional)` reuses EasyOCR's CRAFT detector when `easyocr` is installed.
+
+Install the optional detector packages with:
+
+```powershell
+pip install -e ".[detectors]"
+```
+
+If a selected deep detector is not installed, the app keeps running and reports the detector as unavailable in the status line.
+
 ### Translation backends
 
 The app UI exposes three translation modes:
@@ -125,10 +141,10 @@ pip install -e ".[dev]"
 pytest
 ```
 
-If you want the upgraded OCR backend in the same environment:
+If you want the upgraded OCR backend and optional deep detector backends in the same environment:
 
 ```powershell
-pip install -e ".[dev,ocr_easy]"
+pip install -e ".[dev,ocr_easy,detectors]"
 ```
 
 For Windows packaging:
@@ -220,6 +236,7 @@ Notes:
 - If `vendor/tesseract/tesseract.exe` exists, the build bundles it and the app prefers that copy automatically.
 - If `vendor/argos/*.argosmodel` exists, the build bundles the offline translation models and installs them automatically at runtime.
 - If no bundled or installed Tesseract is found, the app still opens in detection-only mode.
+- Optional deep detector packages are not required for the classic OpenCV detector.
 - `scripts/setup_windows.ps1` installs EasyOCR and then pins `torch`/`torchvision` from the official PyTorch CPU or CUDA wheel index so the runtime matches your chosen device.
 - `screenlens.py` and `screenlens.pyw` are still useful for local development, but the built `.exe` is the correct path for blank Windows VMs.
 - `build_screenlens_exe.bat` is the simplest build entrypoint. It creates `.venv` automatically when missing, installs build tools, and then produces `dist\ScreenLens\ScreenLens.exe`.
@@ -233,6 +250,7 @@ src/screenlens_detection/
   models.py
   ocr.py
   pipeline.py
+  text_detectors.py
   worker.py
   ui/main_window.py
 tests/
@@ -243,6 +261,6 @@ tests/
 
 - Translation layer after OCR
 - Click-and-drag region selection instead of full-monitor capture
-- Better detector replacement with CRAFT / DBNet / EAST
+- OCR consensus across multiple stable frames
 - Overlay translated text directly over the source frame
 - Result export for documentation and presentation demos
