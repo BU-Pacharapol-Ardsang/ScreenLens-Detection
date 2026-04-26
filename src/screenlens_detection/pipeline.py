@@ -33,6 +33,9 @@ class TextDetectionPipeline:
         self.translation_backend = translation_backend
         self._recent_translations: list[DetectionBox] = []
 
+    def close(self) -> None:
+        self.translation_backend.close()
+
     def process(self, frame: np.ndarray, *, monitor_label: str = "") -> FrameAnalysis:
         started = perf_counter()
 
@@ -53,6 +56,7 @@ class TextDetectionPipeline:
             processed_preview=processed_preview,
             boxes=boxes,
             status=self._status_message(),
+            ocr_runtime=self.ocr_backend.runtime_diagnostics(),
             fps=1.0 / elapsed,
             ocr_available=self.ocr_backend.is_available(),
             monitor_label=monitor_label,
@@ -576,7 +580,7 @@ class TextDetectionPipeline:
         route = f"{source_language.label} -> {target_language.label}"
         translation_status = self.translation_backend.describe()
         if self.settings.ocr_enabled and self.ocr_backend.is_available():
-            ocr_status = f"OCR enabled ({self.settings.max_ocr_boxes_per_frame} boxes/frame)"
+            ocr_status = f"{self.ocr_backend.describe()} | {self.settings.max_ocr_boxes_per_frame} boxes/frame"
             return f"{route} | {ocr_status} | {translation_status}"
         if self.settings.ocr_enabled:
             return f"{route} | {self.ocr_backend.describe()} | {translation_status}"

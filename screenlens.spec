@@ -3,15 +3,18 @@
 from pathlib import Path
 
 from PyInstaller.building.build_main import Analysis, COLLECT, EXE, PYZ
-from PyInstaller.building.datastruct import Tree
 
 
 project_root = Path(SPECPATH).resolve()
 datas = []
 
-vendor_tesseract = project_root / "vendor" / "tesseract" / "tesseract.exe"
-if vendor_tesseract.is_file():
-    datas.extend(Tree(str(vendor_tesseract.parent), prefix="tesseract"))
+vendor_tesseract = project_root / "vendor" / "tesseract"
+if vendor_tesseract.is_dir():
+    datas.append((str(vendor_tesseract), "vendor/tesseract"))
+
+vendor_argos = project_root / "vendor" / "argos"
+if vendor_argos.is_dir():
+    datas.append((str(vendor_argos), "vendor/argos"))
 
 
 a = Analysis(

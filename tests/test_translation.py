@@ -1,4 +1,11 @@
-from screenlens_detection.translation import GoogleTranslateBackend
+from time import sleep
+
+from screenlens_detection.translation import (
+    GoogleTranslateBackend,
+    QueuedTranslationBackend,
+    TranslationBackend,
+    create_default_translation_backend,
+)
 
 
 class RecordingTranslator:
@@ -53,3 +60,87 @@ def test_translation_backend_cools_down_failed_requests() -> None:
     assert first_result == ["", "", ""]
     assert second_result == ["", "", ""]
     assert translator.calls == ["one", "two", "three"]
+
+
+class RecordingBatchTranslationBackend(TranslationBackend):
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def is_available(self) -> bool:
+        return True
+
+    def translate_batch(
+        self,
+        texts: list[str],
+        *,
+        source_language_code: str,
+        target_language_code: str,
+    ) -> list[str]:
+        self.calls.append(list(texts))
+        return [f"translated:{text}" for text in texts]
+
+
+def test_queued_translation_backend_returns_cached_results_after_background_batch() -> None:
+    backend = RecordingBatchTranslationBackend()
+    queued = QueuedTranslationBackend(backend, max_batch_size=8)
+
+    try:
+        first = queued.translate_batch(
+            ["one", "two"],
+            source_language_code="eng",
+            target_language_code="tha",
+        )
+
+        resolved = []
+        for _attempt in range(20):
+            resolved = queued.translate_batch(
+                ["one", "two"],
+                source_language_code="eng",
+                target_language_code="tha",
+            )
+            if all(resolved):
+                break
+            sleep(0.05)
+
+        assert first == ["", ""]
+        assert resolved == ["translated:one", "translated:two"]
+        assert backend.calls == [["one", "two"]]
+    finally:
+        queued.close()
+
+
+def test_create_default_translation_backend_auto_prefers_argos_without_initializing_google(monkeypatch) -> None:
+    init_counts = {"argos": 0, "google": 0}
+
+    class DummyArgosBackend(TranslationBackend):
+        name = "argos"
+
+        def __init__(self) -> None:
+            init_counts["argos"] += 1
+
+        def is_available(self) -> bool:
+            return True
+
+        def describe(self) -> str:
+            return "Argos Translate (Offline)"
+
+    class DummyGoogleBackend(TranslationBackend):
+        name = "google"
+
+        def __init__(self) -> None:
+            init_counts["google"] += 1
+
+        def is_available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("screenlens_detection.translation.ArgosTranslateBackend", DummyArgosBackend)
+    monkeypatch.setattr("screenlens_detection.translation.GoogleTranslateBackend", DummyGoogleBackend)
+    monkeypatch.setattr(
+        "screenlens_detection.translation.QueuedTranslationBackend",
+        lambda backend, **_kwargs: backend,
+    )
+
+    backend = create_default_translation_backend(mode="auto")
+
+    assert backend.describe() == "Argos Translate (Offline)"
+    assert init_counts == {"argos": 1, "google": 0}
