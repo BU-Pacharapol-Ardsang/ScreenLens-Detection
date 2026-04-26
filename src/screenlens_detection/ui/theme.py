@@ -55,7 +55,7 @@ def pick_section_fg(theme: Theme, *, section_fg: Optional[str]) -> Optional[str]
 def groupbox_style(*, bg: str, fg: str, radius_px: int) -> str:
     return (
         f"QGroupBox {{ background-color: {bg}; color: {fg}; border-radius: {radius_px}px; }}"
-        f"QGroupBox QLabel, QGroupBox QCheckBox {{ color: {fg}; }}"
+        f"QGroupBox QLabel, QGroupBox QCheckBox {{ color: {fg}; background-color: transparent; }}"
     )
 
 

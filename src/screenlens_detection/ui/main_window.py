@@ -129,16 +129,14 @@ class MainWindow(QMainWindow):
         QApplication.instance().setFont(font)
 
     def _apply_theme(self, theme: Theme) -> None:
+        isolate_panels = theme.window_bg is not None
         if theme.window_bg is not None:
             self._central_widget.setStyleSheet(f"background-color: {theme.window_bg};")
         else:
             self._central_widget.setStyleSheet("")
 
-        def reset_panel(widget: QWidget) -> None:
-            widget.setStyleSheet("")
-            widget.setPalette(self._base_palette)
-            widget.setBackgroundRole(QPalette.ColorRole.Window)
-            widget.setAutoFillBackground(True)
+        fallback_panel_bg = self._base_palette.color(QPalette.ColorRole.Window).name()
+        fallback_panel_fg = self._base_palette.color(QPalette.ColorRole.WindowText).name()
 
         controls_bg = pick_section_bg(theme, section_bg=theme.controls_panel_bg)
         controls_fg = pick_section_fg(theme, section_fg=theme.controls_panel_fg)
@@ -146,8 +144,12 @@ class MainWindow(QMainWindow):
             self.controls_box.setStyleSheet(
                 groupbox_style(bg=controls_bg, fg=controls_fg, radius_px=theme.radius_px)
             )
+        elif isolate_panels:
+            self.controls_box.setStyleSheet(
+                groupbox_style(bg=fallback_panel_bg, fg=fallback_panel_fg, radius_px=theme.radius_px)
+            )
         else:
-            reset_panel(self.controls_box)
+            self.controls_box.setStyleSheet("")
 
         pipeline_bg = pick_section_bg(theme, section_bg=theme.pipeline_panel_bg)
         pipeline_fg = pick_section_fg(theme, section_fg=theme.pipeline_panel_fg)
@@ -155,8 +157,12 @@ class MainWindow(QMainWindow):
             self.settings_box.setStyleSheet(
                 groupbox_style(bg=pipeline_bg, fg=pipeline_fg, radius_px=theme.radius_px)
             )
+        elif isolate_panels:
+            self.settings_box.setStyleSheet(
+                groupbox_style(bg=fallback_panel_bg, fg=fallback_panel_fg, radius_px=theme.radius_px)
+            )
         else:
-            reset_panel(self.settings_box)
+            self.settings_box.setStyleSheet("")
 
         runtime_bg = pick_section_bg(theme, section_bg=theme.runtime_panel_bg)
         runtime_fg = pick_section_fg(theme, section_fg=theme.runtime_panel_fg)
@@ -164,8 +170,12 @@ class MainWindow(QMainWindow):
             self.stats_box.setStyleSheet(
                 groupbox_style(bg=runtime_bg, fg=runtime_fg, radius_px=theme.radius_px)
             )
+        elif isolate_panels:
+            self.stats_box.setStyleSheet(
+                groupbox_style(bg=fallback_panel_bg, fg=fallback_panel_fg, radius_px=theme.radius_px)
+            )
         else:
-            reset_panel(self.stats_box)
+            self.stats_box.setStyleSheet("")
 
         detected_bg = pick_section_bg(theme, section_bg=theme.detected_panel_bg)
         detected_fg = pick_section_fg(theme, section_fg=theme.detected_panel_fg)
@@ -174,8 +184,13 @@ class MainWindow(QMainWindow):
                 groupbox_style(bg=detected_bg, fg=detected_fg, radius_px=theme.radius_px)
             )
             self.text_output.setStyleSheet(output_text_style(bg=detected_bg, fg=detected_fg))
+        elif isolate_panels:
+            self.output_box.setStyleSheet(
+                groupbox_style(bg=fallback_panel_bg, fg=fallback_panel_fg, radius_px=theme.radius_px)
+            )
+            self.text_output.setStyleSheet("")
         else:
-            reset_panel(self.output_box)
+            self.output_box.setStyleSheet("")
             self.text_output.setStyleSheet("")
 
         if (
