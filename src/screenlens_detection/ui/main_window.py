@@ -3,8 +3,9 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QCloseEvent, QImage, QPixmap
+from PySide6.QtGui import QCloseEvent, QFont, QImage, QPalette, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -25,6 +26,16 @@ from PySide6.QtWidgets import (
 import cv2
 import numpy as np
 
+from .theme import (
+    Theme,
+    button_style,
+    combobox_style,
+    groupbox_style,
+    output_text_style,
+    pick_section_bg,
+    pick_section_fg,
+    spinbox_style,
+)
 from ..capture import ScreenCapturer
 from ..languages import resolve_ocr_language, source_language_options, target_language_options
 from ..models import FrameAnalysis, MonitorSpec, PipelineSettings
@@ -35,10 +46,15 @@ from ..worker import ProcessingWorker
 
 
 class MainWindow(QMainWindow):
+
     def __init__(self) -> None:
         super().__init__()
+        self._set_global_font()
         self.setWindowTitle("ScreenLens-Detection")
         self.resize(1400, 900)
+
+        self._base_palette = QApplication.instance().palette()
+        self._theme = Theme()
 
         self.monitors: list[MonitorSpec] = []
         self.worker: ProcessingWorker | None = None
@@ -100,17 +116,149 @@ class MainWindow(QMainWindow):
         self.text_output.setReadOnly(True)
 
         self._build_ui()
+        self._apply_theme(self._theme)
         self._populate_language_controls()
         self._connect_signals()
         self._refresh_monitors()
 
+    @staticmethod
+    def _set_global_font() -> None:
+        """Set MNNEasyread as the global application font."""
+        font = QFont("MNNEasyread")
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        QApplication.instance().setFont(font)
+
+    def _apply_theme(self, theme: Theme) -> None:
+        if theme.window_bg is not None:
+            self._central_widget.setStyleSheet(f"background-color: {theme.window_bg};")
+        else:
+            self._central_widget.setStyleSheet("")
+
+        def reset_panel(widget: QWidget) -> None:
+            widget.setStyleSheet("")
+            widget.setPalette(self._base_palette)
+            widget.setBackgroundRole(QPalette.ColorRole.Window)
+            widget.setAutoFillBackground(True)
+
+        controls_bg = pick_section_bg(theme, section_bg=theme.controls_panel_bg)
+        controls_fg = pick_section_fg(theme, section_fg=theme.controls_panel_fg)
+        if controls_bg is not None and controls_fg is not None:
+            self.controls_box.setStyleSheet(
+                groupbox_style(bg=controls_bg, fg=controls_fg, radius_px=theme.radius_px)
+            )
+        else:
+            reset_panel(self.controls_box)
+
+        pipeline_bg = pick_section_bg(theme, section_bg=theme.pipeline_panel_bg)
+        pipeline_fg = pick_section_fg(theme, section_fg=theme.pipeline_panel_fg)
+        if pipeline_bg is not None and pipeline_fg is not None:
+            self.settings_box.setStyleSheet(
+                groupbox_style(bg=pipeline_bg, fg=pipeline_fg, radius_px=theme.radius_px)
+            )
+        else:
+            reset_panel(self.settings_box)
+
+        runtime_bg = pick_section_bg(theme, section_bg=theme.runtime_panel_bg)
+        runtime_fg = pick_section_fg(theme, section_fg=theme.runtime_panel_fg)
+        if runtime_bg is not None and runtime_fg is not None:
+            self.stats_box.setStyleSheet(
+                groupbox_style(bg=runtime_bg, fg=runtime_fg, radius_px=theme.radius_px)
+            )
+        else:
+            reset_panel(self.stats_box)
+
+        detected_bg = pick_section_bg(theme, section_bg=theme.detected_panel_bg)
+        detected_fg = pick_section_fg(theme, section_fg=theme.detected_panel_fg)
+        if detected_bg is not None and detected_fg is not None:
+            self.output_box.setStyleSheet(
+                groupbox_style(bg=detected_bg, fg=detected_fg, radius_px=theme.radius_px)
+            )
+            self.text_output.setStyleSheet(output_text_style(bg=detected_bg, fg=detected_fg))
+        else:
+            reset_panel(self.output_box)
+            self.text_output.setStyleSheet("")
+
+        if (
+            theme.control_bg is not None
+            and theme.control_fg is not None
+            and theme.control_border is not None
+        ):
+            combo = combobox_style(
+                bg=theme.control_bg,
+                fg=theme.control_fg,
+                border=theme.control_border,
+                radius_px=theme.radius_px,
+            )
+            spin = spinbox_style(
+                widget="QSpinBox",
+                bg=theme.control_bg,
+                fg=theme.control_fg,
+                border=theme.control_border,
+                radius_px=theme.radius_px,
+            )
+            dspin = spinbox_style(
+                widget="QDoubleSpinBox",
+                bg=theme.control_bg,
+                fg=theme.control_fg,
+                border=theme.control_border,
+                radius_px=theme.radius_px,
+            )
+            button = button_style(
+                bg=theme.control_bg,
+                fg=theme.control_fg,
+                border=theme.control_border,
+                radius_px=theme.radius_px,
+            )
+
+            self.monitor_combo.setStyleSheet(combo)
+            self.source_language_combo.setStyleSheet(combo)
+            self.target_language_combo.setStyleSheet(combo)
+
+            self.interval_spin.setStyleSheet(spin)
+            self.area_spin.setStyleSheet(spin)
+            self.scale_spin.setStyleSheet(dspin)
+
+            self.refresh_button.setStyleSheet(button)
+            self.start_button.setStyleSheet(button)
+            self.stop_button.setStyleSheet(button)
+        else:
+            self.monitor_combo.setStyleSheet("")
+            self.source_language_combo.setStyleSheet("")
+            self.target_language_combo.setStyleSheet("")
+            self.interval_spin.setStyleSheet("")
+            self.area_spin.setStyleSheet("")
+            self.scale_spin.setStyleSheet("")
+            self.refresh_button.setStyleSheet("")
+            self.start_button.setStyleSheet("")
+            self.stop_button.setStyleSheet("")
+
+        if (
+            theme.preview_bg is not None
+            and theme.preview_fg is not None
+            and theme.control_border is not None
+        ):
+            preview_style = (
+                "QLabel { "
+                f"background: {theme.preview_bg}; color: {theme.preview_fg}; "
+                f"border: 1px solid {theme.control_border}; border-radius: {theme.radius_px}px; "
+                "}"
+            )
+            self.preview_label.setStyleSheet(preview_style)
+            self.mask_label.setStyleSheet(preview_style)
+        else:
+            self.preview_label.setStyleSheet("")
+            self.mask_label.setStyleSheet("")
+
     def _build_ui(self) -> None:
         central = QWidget()
+        self._central_widget = central
         root = QVBoxLayout(central)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
         controls = QGroupBox("Controls")
+        self.controls_box = controls
+        controls.setAutoFillBackground(True)
         controls_layout = QGridLayout(controls)
         controls_layout.addWidget(QLabel("Monitor"), 0, 0)
         controls_layout.addWidget(self.monitor_combo, 0, 1)
@@ -120,6 +268,8 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.hotkey_label, 1, 0, 1, 5)
 
         settings_box = QGroupBox("Pipeline Settings")
+        self.settings_box = settings_box
+        settings_box.setAutoFillBackground(True)
         settings_layout = QFormLayout(settings_box)
         settings_layout.addRow("Capture interval", self.interval_spin)
         settings_layout.addRow("Upscale factor", self.scale_spin)
@@ -130,6 +280,8 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("", self.ocr_checkbox)
 
         stats_box = QGroupBox("Runtime Stats")
+        self.stats_box = stats_box
+        stats_box.setAutoFillBackground(True)
         stats_layout = QFormLayout(stats_box)
         stats_layout.addRow("FPS", self.fps_label)
         stats_layout.addRow("Detected boxes", self.detected_label)
@@ -146,6 +298,8 @@ class MainWindow(QMainWindow):
         views.addWidget(self.mask_label, 2)
 
         output_box = QGroupBox("Detected Text")
+        self.output_box = output_box
+        output_box.setAutoFillBackground(True)
         output_layout = QVBoxLayout(output_box)
         output_layout.addWidget(self.text_output)
 
@@ -382,9 +536,6 @@ class MainWindow(QMainWindow):
         label = QLabel(placeholder)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setMinimumSize(520, 320)
-        label.setStyleSheet(
-            "QLabel { background: #111827; color: #d1d5db; border: 1px solid #374151; }"
-        )
         return label
 
     @staticmethod
