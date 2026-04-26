@@ -29,6 +29,7 @@ from ..capture import ScreenCapturer
 from ..languages import resolve_ocr_language, source_language_options, target_language_options
 from ..models import FrameAnalysis, MonitorSpec, PipelineSettings
 from ..overlay import TranslationOverlay
+from ..text_detectors import text_detector_options
 from ..windows_capture_exclusion import set_window_capture_exclusion
 from ..windows_hotkeys import extract_hotkey_id, hotkey_labels, register_window_hotkeys, unregister_window_hotkeys
 from ..worker import ProcessingWorker
@@ -86,6 +87,7 @@ class MainWindow(QMainWindow):
 
         self.source_language_combo = QComboBox()
         self.target_language_combo = QComboBox()
+        self.text_detector_combo = QComboBox()
         self.translation_mode_combo = QComboBox()
         self.ocr_checkbox = QCheckBox("Enable OCR")
         self.ocr_checkbox.setChecked(True)
@@ -105,6 +107,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._populate_ocr_device_control()
+        self._populate_text_detector_control()
         self._populate_translation_mode_control()
         self._populate_language_controls()
         self._connect_signals()
@@ -130,6 +133,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Capture interval", self.interval_spin)
         settings_layout.addRow("Upscale factor", self.scale_spin)
         settings_layout.addRow("Min contour area", self.area_spin)
+        settings_layout.addRow("Text detector", self.text_detector_combo)
         settings_layout.addRow("OCR boxes/frame", self.ocr_boxes_control)
         settings_layout.addRow("Source language", self.source_language_combo)
         settings_layout.addRow("Target language", self.target_language_combo)
@@ -179,6 +183,7 @@ class MainWindow(QMainWindow):
         self.ocr_boxes_slider.setEnabled(not locked)
         self.source_language_combo.setEnabled(not locked)
         self.target_language_combo.setEnabled(not locked)
+        self.text_detector_combo.setEnabled(not locked)
         self.translation_mode_combo.setEnabled(not locked)
         self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
@@ -188,6 +193,11 @@ class MainWindow(QMainWindow):
         self.ocr_device_combo.addItem("CPU", userData="cpu")
         self.ocr_device_combo.addItem("GPU (NVIDIA CUDA)", userData="gpu")
         self.ocr_device_combo.setCurrentIndex(0)
+
+    def _populate_text_detector_control(self) -> None:
+        for option in text_detector_options():
+            self.text_detector_combo.addItem(option.label, userData=option.code)
+        self.text_detector_combo.setCurrentIndex(0)
 
     def _populate_translation_mode_control(self) -> None:
         self.translation_mode_combo.addItem("Argos Translate (Offline)", userData="argos")
@@ -237,6 +247,7 @@ class MainWindow(QMainWindow):
             capture_interval_ms=self.interval_spin.value(),
             upscale_factor=self.scale_spin.value(),
             min_contour_area=self.area_spin.value(),
+            text_detector_mode=self.text_detector_combo.currentData(),
             max_ocr_boxes_per_frame=self.ocr_boxes_slider.value(),
             source_language_code=self.source_language_combo.currentData(),
             target_language_code=self.target_language_combo.currentData(),

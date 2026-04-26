@@ -130,6 +130,76 @@ def test_pipeline_limits_ocr_boxes_per_frame() -> None:
     assert len(backend.calls) == 2
 
 
+def test_pipeline_keeps_detector_boxes_when_ocr_backend_is_unavailable() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(upscale_factor=1.0, ocr_enabled=True),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    gray = np.full((80, 220), 255, dtype=np.uint8)
+
+    detected = pipeline._annotate_with_ocr([(20, 20, 160, 28)], gray, (80, 220, 3), 1.0)
+
+    assert len(detected) == 1
+    assert detected[0].text == ""
+
+
+def test_pipeline_waits_for_ocr_boxes_to_stabilize() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(stable_ocr_frames=2),
+        RecordingOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    assert pipeline._stabilize_ocr_boxes([(20, 40, 180, 32)]) == []
+    assert pipeline._stabilize_ocr_boxes([(22, 41, 180, 32)]) == [(22, 41, 180, 32)]
+
+
+def test_pipeline_rejects_moving_ocr_boxes_until_they_stabilize() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(stable_ocr_frames=2),
+        RecordingOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    assert pipeline._stabilize_ocr_boxes([(20, 40, 180, 32)]) == []
+    assert pipeline._stabilize_ocr_boxes([(300, 40, 180, 32)]) == []
+    assert pipeline._stabilize_ocr_boxes([(300, 40, 180, 32)]) == [(300, 40, 180, 32)]
+
+
+def test_pipeline_filters_boxes_with_large_frame_to_frame_motion() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            motion_mean_threshold=10.0,
+            motion_changed_ratio_threshold=0.10,
+        ),
+        RecordingOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    box = (20, 10, 100, 20)
+    pipeline._previous_motion_gray = np.zeros((80, 180), dtype=np.uint8)
+    current = np.zeros((80, 180), dtype=np.uint8)
+    current[10:30, 20:120] = 255
+
+    assert pipeline._filter_motion_ocr_boxes([box], current) == []
+
+
+def test_pipeline_keeps_static_boxes_when_motion_filter_is_active() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            motion_mean_threshold=10.0,
+            motion_changed_ratio_threshold=0.10,
+        ),
+        RecordingOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    box = (20, 10, 100, 20)
+    pipeline._previous_motion_gray = np.zeros((80, 180), dtype=np.uint8)
+    current = np.zeros((80, 180), dtype=np.uint8)
+
+    assert pipeline._filter_motion_ocr_boxes([box], current) == [box]
+
+
 def test_pipeline_detects_actual_source_language_in_mixed_ocr_mode() -> None:
     pipeline = TextDetectionPipeline(
         PipelineSettings(source_language_code="tha+eng"),

@@ -82,8 +82,11 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
     try:
         google_index = window.translation_mode_combo.findData("google")
         assert google_index >= 0
+        easyocr_index = window.text_detector_combo.findData("easyocr")
+        assert easyocr_index >= 0
 
         window.translation_mode_combo.setCurrentIndex(google_index)
+        window.text_detector_combo.setCurrentIndex(easyocr_index)
         window.interval_spin.setValue(1000)
         window.scale_spin.setValue(1.0)
         window.area_spin.setValue(100)
@@ -95,7 +98,9 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         worker = DummyWorker.instances[-1]
         assert worker.started is True
         assert worker.settings.translation_mode == "google"
+        assert worker.settings.text_detector_mode == "easyocr"
         assert window.worker is worker
+        assert window.text_detector_combo.isEnabled() is False
         assert window.translation_mode_combo.isEnabled() is False
         assert window.stop_button.isEnabled() is True
         assert window.status_label.text() == "Synthetic worker running"
@@ -106,6 +111,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
 
         assert worker.stopped is True
         assert window.worker is None
+        assert window.text_detector_combo.isEnabled() is True
         assert window.translation_mode_combo.isEnabled() is True
         assert window.stop_button.isEnabled() is False
         assert window.status_label.text() == "Stopped"

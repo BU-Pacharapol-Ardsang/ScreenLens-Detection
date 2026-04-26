@@ -38,6 +38,7 @@ class PipelineSettings:
     min_box_height: int = 14
     max_box_height_ratio: float = 0.22
     max_boxes: int = 60
+    text_detector_mode: str = "opencv"
     source_language_code: str = "auto"
     target_language_code: str = "tha"
     translation_mode: str = "argos"
@@ -46,6 +47,11 @@ class PipelineSettings:
     ocr_language: str = "tha+eng"
     ocr_psm: int = 7
     max_ocr_boxes_per_frame: int = 8
+    stable_ocr_frames: int = 2
+    stable_box_iou_threshold: float = 0.45
+    motion_filter_enabled: bool = True
+    motion_mean_threshold: float = 18.0
+    motion_changed_ratio_threshold: float = 0.20
 
 
 @dataclass(slots=True, frozen=True)
