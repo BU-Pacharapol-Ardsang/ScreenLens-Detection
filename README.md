@@ -33,6 +33,7 @@ The current implementation uses this flow:
 - Segmentation preview for demonstrations
 - Bounding-box detection for on-screen text regions
 - Optional OCR with `EasyOCR` or `pytesseract`
+- Selectable translation backend: `Argos Translate (Offline)`, `Google Translate (Online)`, or disabled
 - Adjustable capture interval, scale factor, contour area, and OCR language
 - Clean Python package structure for future translation/overlay features
 
@@ -78,6 +79,21 @@ pip install -e ".[ocr_easy]"
 ```
 
 EasyOCR is heavier because it pulls in PyTorch, but the app will automatically prefer it once installed.
+If you want NVIDIA CUDA acceleration, use the Windows setup script instead so PyTorch is installed from the official CUDA wheel index:
+
+```powershell
+.\scripts\setup_windows.ps1 -TorchRuntime gpu
+```
+
+### Translation backends
+
+The app UI exposes three translation modes:
+
+- `Argos Translate (Offline)` for fully local translation after the bundled `en<->th` model files are installed
+- `Google Translate (Online)` for the previous `deep-translator` HTTP flow
+- `Disabled` if you want OCR only
+
+The Windows setup script downloads the `en->th` and `th->en` `.argosmodel` files into `vendor/argos/` so they can be bundled with the app and installed locally at runtime without requiring Google or a live network connection during use.
 
 ## Setup
 
@@ -86,6 +102,21 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -e .
 ```
+
+For Windows local development with EasyOCR and automatic CPU/GPU torch selection:
+
+```powershell
+.\scripts\setup_windows.ps1 -TorchRuntime auto
+```
+
+Force a specific runtime:
+
+```powershell
+.\scripts\setup_windows.ps1 -TorchRuntime cpu
+.\scripts\setup_windows.ps1 -TorchRuntime gpu
+```
+
+This setup also downloads the offline Argos Translate model files into `vendor/argos/`.
 
 For tests:
 
@@ -103,7 +134,7 @@ pip install -e ".[dev,ocr_easy]"
 For Windows packaging:
 
 ```powershell
-pip install -e ".[build]"
+.\scripts\setup_windows.ps1 -TorchRuntime auto -IncludeBuildTools
 ```
 
 ## Run
@@ -143,10 +174,10 @@ This avoids relying on a system Python install, `.pyw` file association, or a pr
 1. Prepare the build environment:
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e ".[build]"
+.\scripts\setup_windows.ps1 -TorchRuntime auto -IncludeBuildTools
 ```
+
+Use `-TorchRuntime gpu` if the build machine has an NVIDIA GPU and you want the packaged app to target CUDA explicitly.
 
 2. Optional: bundle OCR for offline VMs by placing Tesseract files in:
 
@@ -156,6 +187,14 @@ vendor/tesseract/
   tessdata/
     eng.traineddata
     tha.traineddata
+```
+
+The setup script already downloads bundled offline translation models into:
+
+```text
+vendor/argos/
+  translate-en_th.argosmodel
+  translate-th_en.argosmodel
 ```
 
 3. Build the app:
@@ -179,7 +218,9 @@ dist/ScreenLens/ScreenLens.exe
 Notes:
 
 - If `vendor/tesseract/tesseract.exe` exists, the build bundles it and the app prefers that copy automatically.
+- If `vendor/argos/*.argosmodel` exists, the build bundles the offline translation models and installs them automatically at runtime.
 - If no bundled or installed Tesseract is found, the app still opens in detection-only mode.
+- `scripts/setup_windows.ps1` installs EasyOCR and then pins `torch`/`torchvision` from the official PyTorch CPU or CUDA wheel index so the runtime matches your chosen device.
 - `screenlens.py` and `screenlens.pyw` are still useful for local development, but the built `.exe` is the correct path for blank Windows VMs.
 - `build_screenlens_exe.bat` is the simplest build entrypoint. It creates `.venv` automatically when missing, installs build tools, and then produces `dist\ScreenLens\ScreenLens.exe`.
 

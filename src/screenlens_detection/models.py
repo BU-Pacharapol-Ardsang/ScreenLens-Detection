@@ -40,7 +40,9 @@ class PipelineSettings:
     max_boxes: int = 60
     source_language_code: str = "auto"
     target_language_code: str = "tha"
+    translation_mode: str = "argos"
     ocr_enabled: bool = True
+    ocr_device_preference: str = "auto"
     ocr_language: str = "tha+eng"
     ocr_psm: int = 7
     max_ocr_boxes_per_frame: int = 8
@@ -97,6 +99,7 @@ class FrameAnalysis:
     processed_preview: object
     boxes: list[DetectionBox] = field(default_factory=list)
     status: str = ""
+    ocr_runtime: str = ""
     fps: float = 0.0
     ocr_available: bool = False
     monitor_label: str = ""
