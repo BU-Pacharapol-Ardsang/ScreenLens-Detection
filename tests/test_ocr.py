@@ -59,6 +59,7 @@ def test_easyocr_backend_maps_languages_and_aggregates_results(monkeypatch) -> N
             ]
 
     monkeypatch.setattr("screenlens_detection.ocr.EasyOCRReader", FakeReader)
+    monkeypatch.setattr("screenlens_detection.ocr._nvidia_cuda_available", lambda: False)
 
     backend = EasyOCRBackend()
     prepared = backend.prepare_image(np.full((18, 90), 255, dtype=np.uint8))

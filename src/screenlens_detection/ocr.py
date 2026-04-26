@@ -18,6 +18,11 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     EasyOCRReader = None
 
 try:
+    import torch
+except ImportError:  # pragma: no cover - optional runtime dependency
+    torch = None
+
+try:
     import pytesseract
 except ImportError:  # pragma: no cover - dependency is declared in pyproject
     pytesseract = None
@@ -38,6 +43,9 @@ class OCRBackend:
     def describe(self) -> str:
         return "OCR unavailable"
 
+    def runtime_diagnostics(self) -> str:
+        return self.describe()
+
     def prepare_image(self, image: np.ndarray) -> np.ndarray:
         return np.asarray(image)
 
@@ -55,8 +63,13 @@ class NoOpOCRBackend(OCRBackend):
 class EasyOCRBackend(OCRBackend):
     name = "easyocr"
 
-    def __init__(self, *, gpu: bool | None = None) -> None:
-        self._gpu = bool(gpu) if gpu is not None else False
+    def __init__(self, *, gpu: bool | None = None, device_preference: str = "auto") -> None:
+        if gpu is not None:
+            device_preference = "gpu" if gpu else "cpu"
+
+        self._device_preference = normalize_ocr_device_preference(device_preference)
+        self._gpu_available = _nvidia_cuda_available()
+        self._gpu = self._resolve_gpu_enabled()
         self._readers: dict[tuple[str, ...], object] = {}
 
     def is_available(self) -> bool:
@@ -64,9 +77,36 @@ class EasyOCRBackend(OCRBackend):
 
     def describe(self) -> str:
         if self.is_available():
+            if self._device_preference == "gpu" and not self._gpu:
+                return "EasyOCR (CPU fallback; NVIDIA CUDA unavailable)"
             device = "GPU" if self._gpu else "CPU"
             return f"EasyOCR ({device})"
         return "Install easyocr (and PyTorch) to enable the upgraded OCR backend"
+
+    def runtime_diagnostics(self) -> str:
+        if not self.is_available():
+            return "EasyOCR unavailable"
+
+        requested = _ocr_device_label(self._device_preference)
+        if self._gpu:
+            active = "GPU (NVIDIA CUDA)"
+        elif self._device_preference == "gpu":
+            active = "CPU fallback"
+        else:
+            active = "CPU"
+
+        details = [
+            "EasyOCR",
+            f"requested {requested}",
+            f"active {active}",
+            _torch_runtime_summary(),
+        ]
+
+        device_name = _torch_device_name()
+        if device_name:
+            details.append(device_name)
+
+        return " | ".join(part for part in details if part)
 
     def prepare_image(self, image: np.ndarray) -> np.ndarray:
         normalized = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -154,6 +194,13 @@ class EasyOCRBackend(OCRBackend):
             return (0.0, 0.0)
         return (min(ys), min(xs))
 
+    def _resolve_gpu_enabled(self) -> bool:
+        if self._device_preference == "gpu":
+            return self._gpu_available
+        if self._device_preference == "cpu":
+            return False
+        return self._gpu_available
+
 
 class TesseractOCRBackend(OCRBackend):
     name = "tesseract"
@@ -225,6 +272,11 @@ class TesseractOCRBackend(OCRBackend):
         if self.is_available():
             return f"Tesseract OCR ({self._binary})"
         return "Install or bundle Tesseract, or set TESSERACT_CMD to enable OCR"
+
+    def runtime_diagnostics(self) -> str:
+        if self.is_available():
+            return f"Tesseract OCR | active CPU process | binary {self._binary}"
+        return self.describe()
 
     def prepare_image(self, image: np.ndarray) -> np.ndarray:
         normalized = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -318,8 +370,11 @@ class TesseractOCRBackend(OCRBackend):
         return confidence_score + length_bonus
 
 
-def create_default_ocr_backend() -> OCRBackend:
+def create_default_ocr_backend(*, device_preference: str | None = None) -> OCRBackend:
     preference = os.getenv("SCREENLENS_OCR_BACKEND", "auto").strip().lower()
+    resolved_device_preference = normalize_ocr_device_preference(
+        device_preference if device_preference is not None else os.getenv("SCREENLENS_OCR_DEVICE", "auto")
+    )
     if preference in {"disabled", "none", "off"}:
         return NoOpOCRBackend()
 
@@ -330,16 +385,71 @@ def create_default_ocr_backend() -> OCRBackend:
         return NoOpOCRBackend()
 
     if preference == "easyocr":
-        backend = EasyOCRBackend()
+        backend = EasyOCRBackend(device_preference=resolved_device_preference)
         if backend.is_available():
             return backend
         return NoOpOCRBackend()
 
     for backend_cls in (EasyOCRBackend, TesseractOCRBackend):
-        backend = backend_cls()
+        if backend_cls is EasyOCRBackend:
+            backend = backend_cls(device_preference=resolved_device_preference)
+        else:
+            backend = backend_cls()
         if backend.is_available():
             return backend
     return NoOpOCRBackend()
+
+
+def normalize_ocr_device_preference(value: str | None) -> str:
+    normalized = (value or "auto").strip().lower()
+    if normalized in {"gpu", "cuda", "nvidia"}:
+        return "gpu"
+    if normalized == "cpu":
+        return "cpu"
+    return "auto"
+
+
+def _nvidia_cuda_available() -> bool:
+    if torch is None:
+        return False
+
+    try:
+        return bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
+    except Exception:
+        return False
+
+
+def _ocr_device_label(value: str) -> str:
+    labels = {
+        "auto": "Auto",
+        "cpu": "CPU",
+        "gpu": "GPU",
+    }
+    return labels.get(value, value.upper())
+
+
+def _torch_runtime_summary() -> str:
+    if torch is None:
+        return "torch unavailable"
+
+    cuda_runtime = getattr(getattr(torch, "version", None), "cuda", None)
+    if cuda_runtime:
+        build = f"torch {torch.__version__} (CUDA {cuda_runtime})"
+    else:
+        build = f"torch {torch.__version__} (CPU-only build)"
+
+    cuda_available = "cuda available" if _nvidia_cuda_available() else "cuda unavailable"
+    return f"{build}, {cuda_available}"
+
+
+def _torch_device_name() -> str:
+    if not _nvidia_cuda_available():
+        return ""
+
+    try:
+        return str(torch.cuda.get_device_name(0))
+    except Exception:
+        return ""
 
 
 def _runtime_tesseract_binary_candidates() -> list[Path]:

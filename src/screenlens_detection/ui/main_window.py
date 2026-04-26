@@ -29,6 +29,7 @@ from ..capture import ScreenCapturer
 from ..languages import resolve_ocr_language, source_language_options, target_language_options
 from ..models import FrameAnalysis, MonitorSpec, PipelineSettings
 from ..overlay import TranslationOverlay
+from ..text_detectors import text_detector_options
 from ..windows_capture_exclusion import set_window_capture_exclusion
 from ..windows_hotkeys import extract_hotkey_id, hotkey_labels, register_window_hotkeys, unregister_window_hotkeys
 from ..worker import ProcessingWorker
@@ -86,13 +87,18 @@ class MainWindow(QMainWindow):
 
         self.source_language_combo = QComboBox()
         self.target_language_combo = QComboBox()
+        self.text_detector_combo = QComboBox()
+        self.translation_mode_combo = QComboBox()
         self.ocr_checkbox = QCheckBox("Enable OCR")
         self.ocr_checkbox.setChecked(True)
+        self.ocr_device_combo = QComboBox()
 
         self.fps_label = QLabel("0.0")
         self.detected_label = QLabel("0")
         self.monitor_label = QLabel("-")
         self.status_label = QLabel("Idle")
+        self.ocr_runtime_label = QLabel("Not running")
+        self.ocr_runtime_label.setWordWrap(True)
 
         self.preview_label = self._create_image_label("Annotated preview")
         self.mask_label = self._create_image_label("Segmentation preview")
@@ -100,6 +106,9 @@ class MainWindow(QMainWindow):
         self.text_output.setReadOnly(True)
 
         self._build_ui()
+        self._populate_ocr_device_control()
+        self._populate_text_detector_control()
+        self._populate_translation_mode_control()
         self._populate_language_controls()
         self._connect_signals()
         self._refresh_monitors()
@@ -124,9 +133,12 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Capture interval", self.interval_spin)
         settings_layout.addRow("Upscale factor", self.scale_spin)
         settings_layout.addRow("Min contour area", self.area_spin)
+        settings_layout.addRow("Text detector", self.text_detector_combo)
         settings_layout.addRow("OCR boxes/frame", self.ocr_boxes_control)
         settings_layout.addRow("Source language", self.source_language_combo)
         settings_layout.addRow("Target language", self.target_language_combo)
+        settings_layout.addRow("Translation mode", self.translation_mode_combo)
+        settings_layout.addRow("OCR device", self.ocr_device_combo)
         settings_layout.addRow("", self.ocr_checkbox)
 
         stats_box = QGroupBox("Runtime Stats")
@@ -135,6 +147,7 @@ class MainWindow(QMainWindow):
         stats_layout.addRow("Detected boxes", self.detected_label)
         stats_layout.addRow("Monitor", self.monitor_label)
         stats_layout.addRow("Status", self.status_label)
+        stats_layout.addRow("OCR runtime", self.ocr_runtime_label)
 
         top_row = QHBoxLayout()
         top_row.addWidget(controls, 3)
@@ -170,7 +183,27 @@ class MainWindow(QMainWindow):
         self.ocr_boxes_slider.setEnabled(not locked)
         self.source_language_combo.setEnabled(not locked)
         self.target_language_combo.setEnabled(not locked)
+        self.text_detector_combo.setEnabled(not locked)
+        self.translation_mode_combo.setEnabled(not locked)
+        self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
+
+    def _populate_ocr_device_control(self) -> None:
+        self.ocr_device_combo.addItem("Auto", userData="auto")
+        self.ocr_device_combo.addItem("CPU", userData="cpu")
+        self.ocr_device_combo.addItem("GPU (NVIDIA CUDA)", userData="gpu")
+        self.ocr_device_combo.setCurrentIndex(0)
+
+    def _populate_text_detector_control(self) -> None:
+        for option in text_detector_options():
+            self.text_detector_combo.addItem(option.label, userData=option.code)
+        self.text_detector_combo.setCurrentIndex(0)
+
+    def _populate_translation_mode_control(self) -> None:
+        self.translation_mode_combo.addItem("Argos Translate (Offline)", userData="argos")
+        self.translation_mode_combo.addItem("Google Translate (Online)", userData="google")
+        self.translation_mode_combo.addItem("Disabled", userData="disabled")
+        self.translation_mode_combo.setCurrentIndex(0)
 
     def _populate_language_controls(self) -> None:
         for option in source_language_options():
@@ -193,10 +226,12 @@ class MainWindow(QMainWindow):
 
         if not self.monitors:
             self._set_base_status("No monitors detected")
+            self.ocr_runtime_label.setText("Not running")
             self.start_button.setEnabled(False)
             return
 
         self._set_base_status("Ready")
+        self.ocr_runtime_label.setText("Not running")
         self.start_button.setEnabled(True)
 
     def _start_worker(self) -> None:
@@ -212,10 +247,13 @@ class MainWindow(QMainWindow):
             capture_interval_ms=self.interval_spin.value(),
             upscale_factor=self.scale_spin.value(),
             min_contour_area=self.area_spin.value(),
+            text_detector_mode=self.text_detector_combo.currentData(),
             max_ocr_boxes_per_frame=self.ocr_boxes_slider.value(),
             source_language_code=self.source_language_combo.currentData(),
             target_language_code=self.target_language_combo.currentData(),
+            translation_mode=self.translation_mode_combo.currentData(),
             ocr_enabled=self.ocr_checkbox.isChecked(),
+            ocr_device_preference=self.ocr_device_combo.currentData(),
             ocr_language=resolve_ocr_language(self.source_language_combo.currentData()),
         )
 
@@ -224,6 +262,7 @@ class MainWindow(QMainWindow):
         self.worker.worker_error.connect(self._handle_error)
         self.worker.finished.connect(self._on_worker_finished)
         self._set_base_status("Starting OCR/translation...")
+        self.ocr_runtime_label.setText("Starting...")
         self._set_runtime_controls_locked(True)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -245,9 +284,11 @@ class MainWindow(QMainWindow):
         self._overlay_started_worker = False
         if self._base_status != "Error":
             self._set_base_status("Stopped")
+        self.ocr_runtime_label.setText("Stopped")
 
     def _handle_error(self, message: str) -> None:
         self._set_base_status("Error")
+        self.ocr_runtime_label.setText("Error")
         QMessageBox.critical(self, "ScreenLens-Detection", message)
         self._stop_worker()
 
@@ -262,6 +303,7 @@ class MainWindow(QMainWindow):
         self.detected_label.setText(str(len(analysis.boxes)))
         self.monitor_label.setText(analysis.monitor_label or "-")
         self._set_base_status(analysis.status)
+        self.ocr_runtime_label.setText(analysis.ocr_runtime or "Unavailable")
 
         if self.overlay_active:
             self.overlay_window.update_analysis(analysis)

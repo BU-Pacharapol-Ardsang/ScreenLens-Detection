@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
-from dataclasses import replace
 from time import perf_counter
 
 import cv2
@@ -16,7 +16,19 @@ from .languages import (
 )
 from .models import DetectionBox, FrameAnalysis, PipelineSettings
 from .ocr import OCRBackend
+from .text_detectors import (
+    TextDetectorBackend,
+    create_deep_text_detector_backend,
+    normalize_text_detector_mode,
+)
 from .translation import TranslationBackend
+
+
+@dataclass(slots=True)
+class _TrackedTextBox:
+    rect: tuple[int, int, int, int]
+    stable_frames: int = 1
+    missing_frames: int = 0
 
 
 class TextDetectionPipeline:
@@ -32,6 +44,14 @@ class TextDetectionPipeline:
         self.ocr_backend = ocr_backend
         self.translation_backend = translation_backend
         self._recent_translations: list[DetectionBox] = []
+        self._ocr_box_tracks: list[_TrackedTextBox] = []
+        self._previous_motion_gray: np.ndarray | None = None
+        self._deep_text_detector: TextDetectorBackend | None = None
+
+    def close(self) -> None:
+        self.translation_backend.close()
+        if self._deep_text_detector is not None:
+            self._deep_text_detector.close()
 
     def process(self, frame: np.ndarray, *, monitor_label: str = "") -> FrameAnalysis:
         started = perf_counter()
@@ -40,9 +60,12 @@ class TextDetectionPipeline:
         enhanced_gray = self._enhance_grayscale(scaled_frame)
         mask = self._build_text_mask(enhanced_gray)
         line_mask = self._build_line_mask(mask)
-        working_boxes = self._extract_text_boxes(line_mask, mask, enhanced_gray, scaled_frame.shape)
-        boxes = self._annotate_with_ocr(working_boxes, enhanced_gray, frame.shape, scale)
+        working_boxes = self._detect_text_boxes(scaled_frame, line_mask, mask, enhanced_gray)
+        stable_working_boxes = self._stabilize_ocr_boxes(working_boxes)
+        motion_filtered_boxes = self._filter_motion_ocr_boxes(stable_working_boxes, enhanced_gray)
+        boxes = self._annotate_with_ocr(motion_filtered_boxes, enhanced_gray, frame.shape, scale)
         boxes = self._apply_translations(boxes)
+        self._previous_motion_gray = enhanced_gray.copy()
 
         annotated = self._draw_annotations(frame.copy(), boxes)
         processed_preview = self._draw_mask_preview(line_mask, working_boxes)
@@ -53,6 +76,7 @@ class TextDetectionPipeline:
             processed_preview=processed_preview,
             boxes=boxes,
             status=self._status_message(),
+            ocr_runtime=self.ocr_backend.runtime_diagnostics(),
             fps=1.0 / elapsed,
             ocr_available=self.ocr_backend.is_available(),
             monitor_label=monitor_label,
@@ -145,6 +169,70 @@ class TextDetectionPipeline:
             cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
         )
 
+    def _detect_text_boxes(
+        self,
+        scaled_frame: np.ndarray,
+        line_mask: np.ndarray,
+        text_mask: np.ndarray,
+        enhanced_gray: np.ndarray,
+    ) -> list[tuple[int, int, int, int]]:
+        mode = normalize_text_detector_mode(self.settings.text_detector_mode)
+        if mode == "opencv":
+            return self._extract_text_boxes(line_mask, text_mask, enhanced_gray, scaled_frame.shape)
+
+        detector = self._ensure_deep_text_detector(mode)
+        if not detector.is_available():
+            return []
+
+        detected_boxes = detector.detect(scaled_frame)
+        return self._filter_detector_boxes(detected_boxes, scaled_frame.shape)
+
+    def _ensure_deep_text_detector(self, mode: str) -> TextDetectorBackend:
+        if self._deep_text_detector is None:
+            self._deep_text_detector = create_deep_text_detector_backend(
+                mode,
+                language=self.settings.ocr_language,
+                device_preference=self.settings.ocr_device_preference,
+            )
+        return self._deep_text_detector
+
+    def _filter_detector_boxes(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        frame_shape: tuple[int, int, int],
+    ) -> list[tuple[int, int, int, int]]:
+        frame_height, frame_width = frame_shape[:2]
+        frame_area = max(frame_height * frame_width, 1)
+        max_box_height = int(frame_height * self.settings.max_box_height_ratio)
+
+        candidates: list[tuple[int, int, int, int]] = []
+        for x, y, w, h in boxes:
+            left = max(int(x), 0)
+            top = max(int(y), 0)
+            right = min(max(int(x + w), left + 1), frame_width)
+            bottom = min(max(int(y + h), top + 1), frame_height)
+            clipped_w = right - left
+            clipped_h = bottom - top
+            area = clipped_w * clipped_h
+            aspect_ratio = clipped_w / max(clipped_h, 1)
+
+            if area < self.settings.min_contour_area:
+                continue
+            if area > int(frame_area * 0.20):
+                continue
+            if clipped_w < self.settings.min_box_width or clipped_h < self.settings.min_box_height:
+                continue
+            if clipped_h > max_box_height:
+                continue
+            if not 0.6 <= aspect_ratio <= 60.0:
+                continue
+
+            candidates.append((left, top, clipped_w, clipped_h))
+
+        merged = self._merge_text_boxes(candidates)
+        merged.sort(key=lambda box: (box[1], box[0]))
+        return merged[: self.settings.max_boxes]
+
     def _extract_text_boxes(
         self,
         line_mask: np.ndarray,
@@ -217,7 +305,8 @@ class TextDetectionPipeline:
             crop = enhanced_gray[crop_y1:crop_y2, crop_x1:crop_x2]
             text = ""
             confidence = None
-            if self.settings.ocr_enabled and self.ocr_backend.is_available():
+            ocr_attempted = self.settings.ocr_enabled and self.ocr_backend.is_available()
+            if ocr_attempted:
                 ocr_crop = self.ocr_backend.prepare_image(crop)
                 ocr_result = self.ocr_backend.recognize(
                     ocr_crop,
@@ -228,7 +317,7 @@ class TextDetectionPipeline:
                 confidence = ocr_result.confidence
 
             text = self._normalize_recognized_text(text)
-            if self.settings.ocr_enabled and not self._is_usable_text(text, confidence):
+            if ocr_attempted and not self._is_usable_text(text, confidence):
                 continue
 
             mapped_x = int(x / scale)
@@ -269,10 +358,156 @@ class TextDetectionPipeline:
         if len(working_boxes) <= limit:
             return working_boxes
 
-        prioritized = sorted(working_boxes, key=lambda box: box[2] * box[3], reverse=True)
+        prioritized = sorted(working_boxes, key=self._ocr_candidate_priority, reverse=True)
         selected = prioritized[:limit]
         selected.sort(key=lambda box: (box[1], box[0]))
         return selected
+
+    @staticmethod
+    def _ocr_candidate_priority(box: tuple[int, int, int, int]) -> float:
+        _x, _y, w, h = box
+        area = w * h
+        aspect_ratio = w / max(h, 1)
+
+        score = (
+            min(w / 8.0, 120.0)
+            + min(area / 900.0, 80.0)
+            + min(aspect_ratio, 16.0) * 4.0
+        )
+        if aspect_ratio < 1.25:
+            score -= 80.0
+        if aspect_ratio > 28.0:
+            score -= 35.0
+        if h > 90:
+            score -= min((h - 90) * 1.4, 90.0)
+        if area > 140_000:
+            score -= min((area - 140_000) / 1200.0, 120.0)
+        return score
+
+    def _stabilize_ocr_boxes(
+        self,
+        working_boxes: list[tuple[int, int, int, int]],
+    ) -> list[tuple[int, int, int, int]]:
+        if not self.settings.ocr_enabled or not self.ocr_backend.is_available():
+            self._ocr_box_tracks = []
+            return working_boxes
+
+        minimum_stable_frames = max(self.settings.stable_ocr_frames, 1)
+        if minimum_stable_frames <= 1:
+            return working_boxes
+
+        matched_track_indices: set[int] = set()
+        next_tracks: list[_TrackedTextBox] = []
+
+        for box in working_boxes:
+            match_index = self._find_matching_track(box, matched_track_indices)
+            if match_index is None:
+                next_tracks.append(_TrackedTextBox(rect=box))
+                continue
+
+            matched_track_indices.add(match_index)
+            track = self._ocr_box_tracks[match_index]
+            next_tracks.append(
+                _TrackedTextBox(
+                    rect=box,
+                    stable_frames=track.stable_frames + 1,
+                    missing_frames=0,
+                )
+            )
+
+        for index, track in enumerate(self._ocr_box_tracks):
+            if index in matched_track_indices:
+                continue
+            if track.missing_frames >= 1:
+                continue
+            next_tracks.append(
+                _TrackedTextBox(
+                    rect=track.rect,
+                    stable_frames=track.stable_frames,
+                    missing_frames=track.missing_frames + 1,
+                )
+            )
+
+        self._ocr_box_tracks = next_tracks
+        stable_boxes = [
+            track.rect
+            for track in self._ocr_box_tracks
+            if track.missing_frames == 0 and track.stable_frames >= minimum_stable_frames
+        ]
+        stable_boxes.sort(key=lambda box: (box[1], box[0]))
+        return stable_boxes
+
+    def _find_matching_track(
+        self,
+        box: tuple[int, int, int, int],
+        used_indices: set[int],
+    ) -> int | None:
+        threshold = max(min(self.settings.stable_box_iou_threshold, 1.0), 0.0)
+        best_index: int | None = None
+        best_score = 0.0
+
+        for index, track in enumerate(self._ocr_box_tracks):
+            if index in used_indices:
+                continue
+            score = self._intersection_over_union(box, track.rect)
+            if score >= threshold and score > best_score:
+                best_index = index
+                best_score = score
+
+        return best_index
+
+    def _filter_motion_ocr_boxes(
+        self,
+        working_boxes: list[tuple[int, int, int, int]],
+        enhanced_gray: np.ndarray,
+    ) -> list[tuple[int, int, int, int]]:
+        if not self.settings.motion_filter_enabled:
+            return working_boxes
+        if self._previous_motion_gray is None or self._previous_motion_gray.shape != enhanced_gray.shape:
+            return working_boxes
+
+        filtered: list[tuple[int, int, int, int]] = []
+        for box in working_boxes:
+            if not self._box_has_excessive_motion(box, enhanced_gray):
+                filtered.append(box)
+        return filtered
+
+    def _box_has_excessive_motion(
+        self,
+        box: tuple[int, int, int, int],
+        enhanced_gray: np.ndarray,
+    ) -> bool:
+        if self._previous_motion_gray is None:
+            return False
+
+        x, y, w, h = box
+        current_roi = enhanced_gray[y : y + h, x : x + w]
+        previous_roi = self._previous_motion_gray[y : y + h, x : x + w]
+        if current_roi.size == 0 or previous_roi.size != current_roi.size:
+            return False
+
+        delta = cv2.absdiff(current_roi, previous_roi)
+        mean_delta = float(np.mean(delta))
+        _, changed_mask = cv2.threshold(delta, 24, 255, cv2.THRESH_BINARY)
+        changed_ratio = cv2.countNonZero(changed_mask) / max(delta.size, 1)
+        return (
+            mean_delta >= self.settings.motion_mean_threshold
+            and changed_ratio >= self.settings.motion_changed_ratio_threshold
+        )
+
+    @staticmethod
+    def _intersection_over_union(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> float:
+        intersection = TextDetectionPipeline._intersection_area(first, second)
+        if intersection <= 0:
+            return 0.0
+
+        first_area = max(first[2] * first[3], 1)
+        second_area = max(second[2] * second[3], 1)
+        union = max(first_area + second_area - intersection, 1)
+        return intersection / union
 
     def _apply_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
         if not boxes:
@@ -574,13 +809,22 @@ class TextDetectionPipeline:
         source_language = get_source_language_option(self.settings.source_language_code)
         target_language = get_target_language_option(self.settings.target_language_code)
         route = f"{source_language.label} -> {target_language.label}"
+        detector_status = self._detector_status_message()
         translation_status = self.translation_backend.describe()
         if self.settings.ocr_enabled and self.ocr_backend.is_available():
-            ocr_status = f"OCR enabled ({self.settings.max_ocr_boxes_per_frame} boxes/frame)"
-            return f"{route} | {ocr_status} | {translation_status}"
+            ocr_status = f"{self.ocr_backend.describe()} | {self.settings.max_ocr_boxes_per_frame} boxes/frame"
+            return f"{route} | {detector_status} | {ocr_status} | {translation_status}"
         if self.settings.ocr_enabled:
-            return f"{route} | {self.ocr_backend.describe()} | {translation_status}"
-        return f"{route} | OCR disabled | {translation_status}"
+            return f"{route} | {detector_status} | {self.ocr_backend.describe()} | {translation_status}"
+        return f"{route} | {detector_status} | OCR disabled | {translation_status}"
+
+    def _detector_status_message(self) -> str:
+        mode = normalize_text_detector_mode(self.settings.text_detector_mode)
+        if mode == "opencv":
+            return "OpenCV morphology detector"
+
+        detector = self._ensure_deep_text_detector(mode)
+        return detector.describe()
 
     def _resolve_source_language(self, text: str) -> tuple[str, str]:
         if self.settings.source_language_code not in {"auto", "tha+eng"}:

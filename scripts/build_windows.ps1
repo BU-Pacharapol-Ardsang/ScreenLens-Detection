@@ -1,5 +1,7 @@
 param(
     [string]$PythonExe = "",
+    [ValidateSet("auto", "cpu", "gpu")]
+    [string]$TorchRuntime = "auto",
     [switch]$Clean
 )
 
@@ -7,6 +9,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $specPath = Join-Path $repoRoot "screenlens.spec"
 $distPath = Join-Path $repoRoot "dist"
 $buildPath = Join-Path $repoRoot "build"
+$setupScriptPath = Join-Path $repoRoot "scripts\setup_windows.ps1"
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 $vendorBinary = Join-Path $repoRoot "vendor\tesseract\tesseract.exe"
 
@@ -80,12 +83,7 @@ if ($Clean) {
 
 Write-Host "Using Python: $pythonPath" -ForegroundColor Cyan
 
-& $pythonPath -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
-
-& $pythonPath -m pip install -e ".[build]"
+& $setupScriptPath -PythonExe $pythonPath -TorchRuntime $TorchRuntime -IncludeBuildTools
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
