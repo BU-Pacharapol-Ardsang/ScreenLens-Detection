@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PySide6.QtCore import QRect, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .models import DetectionBox, FrameAnalysis, MonitorSpec
@@ -45,6 +45,12 @@ def scale_overlay_rect(
         max(int(box.w * scale_x), 1),
         max(int(box.h * scale_y), 1),
     )
+
+
+def overlay_font_pixel_size(rect_height: int) -> int:
+    if rect_height <= 0:
+        return 1
+    return max(min(int(rect_height * 0.62), 28), 1)
 
 
 class TranslationOverlay(QWidget):
@@ -110,27 +116,49 @@ class TranslationOverlay(QWidget):
         background = QColor(15, 23, 42, 212)
         text_color = QColor(248, 250, 252)
 
-        painter.setPen(QPen(accent, 2))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 10, 10)
-
-        min_bubble_width = 180
-        bubble_width = min(max(rect.width(), min_bubble_width), max(self.width() - rect.left() - 12, 80))
-        bubble_height = min(max(rect.height(), 44), max(self.height() - rect.top() - 12, 36))
-        bubble_rect = QRect(rect.left(), rect.top(), bubble_width, bubble_height)
+        bubble_rect = rect.adjusted(0, 0, -1, -1)
+        radius = max(min(rect.height() // 4, 8), 2)
 
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(background)
-        painter.drawRoundedRect(bubble_rect, 10, 10)
+        painter.drawRoundedRect(bubble_rect, radius, radius)
 
-        font_size = max(min(int(bubble_rect.height() * 0.42), 28), 11)
-        painter.setFont(QFont("Segoe UI", font_size, QFont.Weight.DemiBold))
+        painter.setPen(QPen(accent, 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(bubble_rect, radius, radius)
+
+        horizontal_padding = max(min(rect.height() // 4, 12), 2)
+        vertical_padding = max(min(rect.height() // 8, 6), 1)
+        text_rect = bubble_rect.adjusted(
+            horizontal_padding,
+            vertical_padding,
+            -horizontal_padding,
+            -vertical_padding,
+        )
+        if text_rect.width() <= 0 or text_rect.height() <= 0:
+            text_rect = bubble_rect
+
+        font = self._font_for_text(text, text_rect, overlay_font_pixel_size(rect.height()))
+        painter.setFont(font)
         painter.setPen(text_color)
         painter.drawText(
-            bubble_rect.adjusted(12, 8, -12, -8),
+            text_rect,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap,
             text,
         )
+
+    @staticmethod
+    def _font_for_text(text: str, rect: QRect, max_pixel_size: int) -> QFont:
+        flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap
+        font = QFont("Segoe UI")
+        font.setWeight(QFont.Weight.DemiBold)
+        for pixel_size in range(max(max_pixel_size, 1), 0, -1):
+            font.setPixelSize(pixel_size)
+            bounds = QFontMetrics(font).boundingRect(rect, flags, text)
+            if bounds.height() <= rect.height() and bounds.width() <= rect.width():
+                return font
+        font.setPixelSize(1)
+        return font
 
     def _apply_monitor_geometry(self, monitor: MonitorSpec) -> None:
         app = QApplication.instance()
