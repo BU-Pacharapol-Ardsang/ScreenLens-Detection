@@ -394,3 +394,82 @@ def test_overlay_realtime_tracking_clears_on_probable_scene_change() -> None:
     overlay.apply_tracking_frame(TrackingFrame(current, global_confidence=0.02))
 
     assert overlay._overlay_boxes == []
+
+
+def test_overlay_realtime_tracking_uses_local_consensus_for_uncached_labels() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 320, 180)
+    overlay._max_local_tracked_boxes = 1
+    overlay.set_tracking_enabled(True)
+    overlay.set_realtime_tracking_active(True)
+
+    previous = np.full((180, 320), 255, dtype=np.uint8)
+    current = np.full((180, 320), 255, dtype=np.uint8)
+    cv2.putText(previous, "LINE ONE", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 0, 2, cv2.LINE_AA)
+    cv2.putText(previous, "LINE TWO", (20, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 0, 2, cv2.LINE_AA)
+    cv2.putText(current, "LINE ONE", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 0, 2, cv2.LINE_AA)
+    cv2.putText(current, "LINE TWO", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 0, 2, cv2.LINE_AA)
+
+    overlay.apply_tracking_frame(TrackingFrame(previous))
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=np.zeros((180, 320, 3), dtype=np.uint8),
+            processed_preview=np.zeros((180, 320, 3), dtype=np.uint8),
+            boxes=[
+                DetectionBox(x=18, y=48, w=130, h=30, text="Line one", translated_text="One translated"),
+                DetectionBox(x=18, y=103, w=130, h=30, text="Line two", translated_text="Two translated"),
+            ],
+        )
+    )
+
+    overlay.apply_tracking_frame(TrackingFrame(current, global_confidence=0.02))
+
+    positions = {box.text: (box.x, box.y) for box in overlay._overlay_boxes}
+    assert positions["One translated"] == (18, 23)
+    assert positions["Two translated"] == (18, 78)
+
+
+def test_overlay_realtime_tracking_does_not_clear_scene_change_when_local_anchor_matches() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 240, 160)
+    overlay.set_tracking_enabled(True)
+    overlay.set_realtime_tracking_active(True)
+
+    rng = np.random.default_rng(7)
+    previous = rng.integers(0, 256, (160, 240), dtype=np.uint8)
+    current = rng.integers(0, 256, (160, 240), dtype=np.uint8)
+    overlay.apply_tracking_frame(TrackingFrame(previous))
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=np.zeros((160, 240, 3), dtype=np.uint8),
+            processed_preview=np.zeros((160, 240, 3), dtype=np.uint8),
+            boxes=[
+                DetectionBox(
+                    x=72,
+                    y=84,
+                    w=82,
+                    h=24,
+                    text="Moving text",
+                    translated_text="Moving translated",
+                )
+            ],
+        )
+    )
+
+    template_rect = overlay._template_rect_for_box(overlay._overlay_boxes[0], previous.shape, 1.0)
+    assert template_rect is not None
+    left, top, right, bottom = template_rect
+    offset_y = -32
+    current[top + offset_y : bottom + offset_y, left:right] = previous[top:bottom, left:right]
+
+    overlay.apply_tracking_frame(TrackingFrame(current, global_confidence=0.02))
+
+    assert [(box.x, box.y, box.text) for box in overlay._overlay_boxes] == [
+        (72, 52, "Moving translated")
+    ]

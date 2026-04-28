@@ -23,6 +23,14 @@ class OverlayBox:
     translated: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class _LocalTrack:
+    box: OverlayBox
+    offset_x: int
+    offset_y: int
+    confidence: float
+
+
 def overlay_text_for_box(box: DetectionBox) -> str:
     translated = " ".join(box.translated_text.split())
     if translated:
@@ -128,10 +136,11 @@ class TranslationOverlay(QWidget):
 
         frame_scale = max(float(getattr(tracking_frame, "frame_scale", 1.0)), 1e-6)
         global_confidence = float(getattr(tracking_frame, "global_confidence", 0.0))
-        if self._is_probable_scene_change(previous_gray, gray, global_confidence=global_confidence):
-            self.clear_analysis()
-            return
-
+        probable_scene_change = self._is_probable_scene_change(
+            previous_gray,
+            gray,
+            global_confidence=global_confidence,
+        )
         tracked_boxes = self._track_boxes_between_frames(
             previous_gray,
             gray,
@@ -141,9 +150,25 @@ class TranslationOverlay(QWidget):
             global_confidence=global_confidence,
         )
         if tracked_boxes:
-            self._tracking_lost_frames = 0
+            has_fresh_track = any(box.missing_frames == 0 for box in tracked_boxes)
+            if probable_scene_change and not has_fresh_track:
+                self.clear_analysis()
+                return
+
+            if has_fresh_track:
+                self._tracking_lost_frames = 0
+            else:
+                self._tracking_lost_frames += 1
+                if self._tracking_lost_frames >= self._max_realtime_lost_frames:
+                    self.clear_analysis()
+                    return
+
             self._overlay_boxes = self._limit_overlay_boxes(tracked_boxes)
             self.update()
+            return
+
+        if probable_scene_change:
+            self.clear_analysis()
             return
 
         self._tracking_lost_frames += 1
@@ -183,12 +208,33 @@ class TranslationOverlay(QWidget):
     ) -> list[OverlayBox]:
         tracked_boxes: list[OverlayBox] = []
         local_candidate_indices = self._local_tracking_candidate_indices(self._overlay_boxes)
+        local_tracks: dict[int, _LocalTrack] = {}
+
+        for index in local_candidate_indices:
+            if index >= len(self._overlay_boxes):
+                continue
+
+            local_track = self._track_box_locally(
+                self._overlay_boxes[index],
+                previous_gray,
+                current_gray,
+                frame_scale,
+            )
+            if local_track is not None:
+                local_tracks[index] = local_track
+
+        consensus_offset = self._consensus_motion_offset(
+            list(local_tracks.values()),
+            global_offset_x=global_offset_x,
+            global_offset_y=global_offset_y,
+            global_confidence=global_confidence,
+        )
+
         for index, box in enumerate(self._overlay_boxes):
-            if index in local_candidate_indices:
-                tracked = self._track_box_locally(box, previous_gray, current_gray, frame_scale)
-                if tracked is not None:
-                    tracked_boxes.append(tracked)
-                    continue
+            local_track = local_tracks.get(index)
+            if local_track is not None:
+                tracked_boxes.append(local_track.box)
+                continue
 
             fallback = self._track_box_with_global_fallback(
                 box,
@@ -198,6 +244,7 @@ class TranslationOverlay(QWidget):
                 global_offset_x=global_offset_x,
                 global_offset_y=global_offset_y,
                 global_confidence=global_confidence,
+                consensus_offset=consensus_offset,
                 allow_global_motion=index in local_candidate_indices,
             )
             if fallback is not None:
@@ -212,7 +259,7 @@ class TranslationOverlay(QWidget):
         previous_gray: np.ndarray,
         current_gray: np.ndarray,
         frame_scale: float,
-    ) -> OverlayBox | None:
+    ) -> _LocalTrack | None:
         template_rect = self._template_rect_for_box(box, previous_gray.shape, frame_scale)
         if template_rect is None:
             return None
@@ -229,11 +276,22 @@ class TranslationOverlay(QWidget):
         if confidence < self._local_tracking_min_confidence:
             return None
 
-        return self._offset_single_box(
+        tracked_offset_x = int(round(offset_x / frame_scale))
+        tracked_offset_y = int(round(offset_y / frame_scale))
+        tracked_box = self._offset_single_box(
             box,
-            int(round(offset_x / frame_scale)),
-            int(round(offset_y / frame_scale)),
+            tracked_offset_x,
+            tracked_offset_y,
             missing_frames=0,
+        )
+        if tracked_box is None:
+            return None
+
+        return _LocalTrack(
+            box=tracked_box,
+            offset_x=tracked_offset_x,
+            offset_y=tracked_offset_y,
+            confidence=confidence,
         )
 
     def _track_box_with_global_fallback(
@@ -246,6 +304,7 @@ class TranslationOverlay(QWidget):
         global_offset_x: float,
         global_offset_y: float,
         global_confidence: float,
+        consensus_offset: tuple[int, int] | None,
         allow_global_motion: bool,
     ) -> OverlayBox | None:
         missing_frames = box.missing_frames + 1
@@ -255,6 +314,15 @@ class TranslationOverlay(QWidget):
         same_position_score = self._same_position_match_score(box, previous_gray, current_gray, frame_scale)
         if same_position_score >= self._local_tracking_min_confidence:
             return self._offset_single_box(box, 0, 0, missing_frames=0)
+
+        if consensus_offset is not None:
+            consensus_x, consensus_y = consensus_offset
+            return self._offset_single_box(
+                box,
+                consensus_x,
+                consensus_y,
+                missing_frames=missing_frames,
+            )
 
         if allow_global_motion and global_confidence >= 0.28:
             tracked = self._offset_single_box(
@@ -267,6 +335,98 @@ class TranslationOverlay(QWidget):
                 return tracked
 
         return self._offset_single_box(box, 0, 0, missing_frames=missing_frames)
+
+    def _consensus_motion_offset(
+        self,
+        local_tracks: list[_LocalTrack],
+        *,
+        global_offset_x: float,
+        global_offset_y: float,
+        global_confidence: float,
+    ) -> tuple[int, int] | None:
+        moving_tracks = [
+            track
+            for track in local_tracks
+            if self._motion_magnitude(track.offset_x, track.offset_y) >= 3
+        ]
+        if not moving_tracks:
+            global_x = int(round(global_offset_x))
+            global_y = int(round(global_offset_y))
+            if global_confidence >= 0.28 and self._motion_magnitude(global_x, global_y) >= 3:
+                return global_x, global_y
+            return None
+
+        clusters: list[dict[str, float]] = []
+        tolerance = 18.0
+        for track in moving_tracks:
+            weight = self._motion_vote_weight(track)
+            best_cluster: dict[str, float] | None = None
+            best_distance = float("inf")
+            for cluster in clusters:
+                mean_x = cluster["sum_x"] / max(cluster["weight"], 1e-6)
+                mean_y = cluster["sum_y"] / max(cluster["weight"], 1e-6)
+                distance = max(abs(track.offset_x - mean_x), abs(track.offset_y - mean_y))
+                if distance <= tolerance and distance < best_distance:
+                    best_cluster = cluster
+                    best_distance = distance
+
+            if best_cluster is None:
+                clusters.append(
+                    {
+                        "sum_x": track.offset_x * weight,
+                        "sum_y": track.offset_y * weight,
+                        "weight": weight,
+                        "count": 1.0,
+                        "confidence": track.confidence * weight,
+                    }
+                )
+                continue
+
+            best_cluster["sum_x"] += track.offset_x * weight
+            best_cluster["sum_y"] += track.offset_y * weight
+            best_cluster["weight"] += weight
+            best_cluster["count"] += 1.0
+            best_cluster["confidence"] += track.confidence * weight
+
+        if not clusters:
+            return None
+
+        global_motion_available = global_confidence >= 0.28 and self._motion_magnitude(
+            int(round(global_offset_x)),
+            int(round(global_offset_y)),
+        ) >= 3
+
+        def cluster_score(cluster: dict[str, float]) -> float:
+            mean_x = cluster["sum_x"] / max(cluster["weight"], 1e-6)
+            mean_y = cluster["sum_y"] / max(cluster["weight"], 1e-6)
+            score = cluster["weight"] + (cluster["count"] * 0.65)
+            if global_motion_available:
+                distance = max(abs(mean_x - global_offset_x), abs(mean_y - global_offset_y))
+                score += max(24.0 - distance, -24.0) * 0.08
+            return score
+
+        best = max(clusters, key=cluster_score)
+        mean_confidence = best["confidence"] / max(best["weight"], 1e-6)
+        if best["count"] < 2.0 and mean_confidence < 0.62 and not global_motion_available:
+            return None
+
+        consensus_x = int(round(best["sum_x"] / max(best["weight"], 1e-6)))
+        consensus_y = int(round(best["sum_y"] / max(best["weight"], 1e-6)))
+        if self._motion_magnitude(consensus_x, consensus_y) < 3:
+            return None
+        return consensus_x, consensus_y
+
+    @staticmethod
+    def _motion_magnitude(offset_x: float, offset_y: float) -> float:
+        return max(abs(offset_x), abs(offset_y))
+
+    @staticmethod
+    def _motion_vote_weight(track: _LocalTrack) -> float:
+        area = max(track.box.w * track.box.h, 1)
+        area_weight = 1.0 + min(area / 9000.0, 4.0)
+        confidence_weight = max(track.confidence, 0.05)
+        translated_bonus = 1.3 if track.box.translated else 1.0
+        return area_weight * confidence_weight * translated_bonus
 
     def _template_rect_for_box(
         self,
