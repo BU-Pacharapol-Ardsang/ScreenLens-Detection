@@ -114,6 +114,8 @@ class FrameAnalysis:
     content_offset_x: float = 0.0
     content_offset_y: float = 0.0
     content_motion_confidence: float = 0.0
+    source_frame: object | None = None
+    translated_preview: object | None = None
 
     @property
     def detected_text(self) -> list[str]:

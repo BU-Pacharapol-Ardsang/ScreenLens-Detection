@@ -80,6 +80,7 @@ class TextDetectionPipeline:
             annotated_frame=annotated,
             processed_preview=processed_preview,
             boxes=boxes,
+            source_frame=frame.copy(),
             status=self._status_message(),
             ocr_runtime=self.ocr_backend.runtime_diagnostics(),
             fps=1.0 / elapsed,
