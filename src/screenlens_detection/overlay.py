@@ -9,18 +9,8 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .models import DetectionBox, FrameAnalysis, MonitorSpec
+from .overlay_tracks import OverlayBox, OverlayTrackManager
 from .windows_capture_exclusion import set_window_capture_exclusion
-
-
-@dataclass(slots=True, frozen=True)
-class OverlayBox:
-    x: int
-    y: int
-    w: int
-    h: int
-    text: str
-    missing_frames: int = 0
-    translated: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -29,6 +19,21 @@ class _LocalTrack:
     offset_x: int
     offset_y: int
     confidence: float
+
+
+@dataclass(slots=True)
+class _VisualAnchor:
+    key: str
+    template: np.ndarray
+    core_template: np.ndarray
+    core_raw_template: np.ndarray
+    box_offset_x: int
+    box_offset_y: int
+    core_offset_x: int
+    core_offset_y: int
+    last_box: OverlayBox
+    missing_frames: int = 0
+    confidence: float = 1.0
 
 
 def overlay_text_for_box(box: DetectionBox) -> str:
@@ -85,15 +90,26 @@ class TranslationOverlay(QWidget):
         self._overlay_boxes: list[OverlayBox] = []
         self._capture_exclusion_applied = False
         self._tracking_enabled = False
+        self._tracking_mode = "legacy"
         self._realtime_tracking_active = False
         self._tracking_lost_frames = 0
         self._tracking_gray_frame: np.ndarray | None = None
+        self._tracking_frame_scale = 1.0
+        self._visual_anchors: list[_VisualAnchor] = []
         self._max_tracked_missing_frames = 10
         self._max_realtime_lost_frames = 6
         self._max_local_tracked_boxes = 12
+        self._max_anchor_tracked_boxes = 16
         self._max_visible_overlay_boxes = 24
+        self._max_visible_predicted_frames = 3
         self._local_tracking_min_confidence = 0.42
+        self._anchor_tracking_min_confidence = 0.62
+        self._anchor_core_min_confidence = 0.62
         self._scene_change_ratio_threshold = 0.42
+        self._track_manager = OverlayTrackManager(
+            max_visible_tracks=self._max_visible_overlay_boxes,
+            max_predicted_frames=self._max_visible_predicted_frames,
+        )
 
     def show_for_monitor(self, monitor: MonitorSpec) -> None:
         self._monitor = monitor
@@ -103,8 +119,17 @@ class TranslationOverlay(QWidget):
         self.raise_()
 
     def clear_analysis(self) -> None:
+        self._track_manager.clear()
         self._overlay_boxes = []
+        self._visual_anchors = []
         self.update()
+
+    def set_tracking_mode(self, mode: str | None) -> None:
+        normalized = mode if mode in {"legacy", "anchor"} else "legacy"
+        if normalized == self._tracking_mode:
+            return
+        self._tracking_mode = normalized
+        self._visual_anchors = []
 
     def set_tracking_enabled(self, enabled: bool) -> None:
         self._tracking_enabled = enabled
@@ -128,14 +153,36 @@ class TranslationOverlay(QWidget):
             return
 
         previous_gray = self._tracking_gray_frame
+        frame_scale = max(float(getattr(tracking_frame, "frame_scale", 1.0)), 1e-6)
         self._tracking_gray_frame = gray.copy()
+        self._tracking_frame_scale = frame_scale
         if not self._tracking_enabled or not self._realtime_tracking_active or not self._overlay_boxes:
             return
+
+        global_confidence = float(getattr(tracking_frame, "global_confidence", 0.0))
+        if self._tracking_mode == "anchor":
+            probable_scene_change = (
+                previous_gray is not None
+                and previous_gray.shape == gray.shape
+                and self._is_probable_scene_change(
+                    previous_gray,
+                    gray,
+                    global_confidence=global_confidence,
+                )
+            )
+            self._apply_visual_anchor_tracking(
+                gray,
+                frame_scale=frame_scale,
+                global_offset_x=float(getattr(tracking_frame, "global_offset_x", 0.0)),
+                global_offset_y=float(getattr(tracking_frame, "global_offset_y", 0.0)),
+                global_confidence=global_confidence,
+                probable_scene_change=probable_scene_change,
+            )
+            return
+
         if previous_gray is None or previous_gray.shape != gray.shape:
             return
 
-        frame_scale = max(float(getattr(tracking_frame, "frame_scale", 1.0)), 1e-6)
-        global_confidence = float(getattr(tracking_frame, "global_confidence", 0.0))
         probable_scene_change = self._is_probable_scene_change(
             previous_gray,
             gray,
@@ -163,7 +210,9 @@ class TranslationOverlay(QWidget):
                     self.clear_analysis()
                     return
 
-            self._overlay_boxes = self._limit_overlay_boxes(tracked_boxes)
+            self._overlay_boxes = self._track_manager.update_from_visual_tracking(
+                self._limit_overlay_boxes(tracked_boxes)
+            )
             self.update()
             return
 
@@ -172,29 +221,217 @@ class TranslationOverlay(QWidget):
             return
 
         self._tracking_lost_frames += 1
+        self._overlay_boxes = self._track_manager.mark_all_occluded()
+        self.update()
         if self._tracking_lost_frames >= self._max_realtime_lost_frames:
-            self.clear_analysis()
+            self._overlay_boxes = self._track_manager.mark_all_occluded()
+            self.update()
 
     def apply_tracking_offset(self, offset_x: float, offset_y: float, confidence: float) -> None:
         if not self._tracking_enabled or not self._realtime_tracking_active or not self._overlay_boxes:
             return
 
+        if self._tracking_mode == "anchor":
+            return
+
         if confidence < 0.10:
             self._tracking_lost_frames += 1
             if self._tracking_lost_frames >= self._max_realtime_lost_frames:
-                self.clear_analysis()
+                self._overlay_boxes = self._track_manager.mark_all_occluded()
+                self.update()
             return
 
         self._tracking_lost_frames = 0
-        self._overlay_boxes = self._limit_overlay_boxes(
-            self._offset_overlay_boxes(
-                self._overlay_boxes,
-                int(round(offset_x)),
-                int(round(offset_y)),
-                increment_missing=False,
+        self._overlay_boxes = self._track_manager.update_from_visual_tracking(
+            self._limit_overlay_boxes(
+                self._offset_overlay_boxes(
+                    self._overlay_boxes,
+                    int(round(offset_x)),
+                    int(round(offset_y)),
+                    increment_missing=False,
+                )
             )
         )
         self.update()
+
+    def _apply_visual_anchor_tracking(
+        self,
+        current_gray: np.ndarray,
+        *,
+        frame_scale: float,
+        global_offset_x: float,
+        global_offset_y: float,
+        global_confidence: float,
+        probable_scene_change: bool,
+    ) -> None:
+        if not self._visual_anchors:
+            return
+
+        tracked_boxes = self._track_boxes_with_visual_anchors(
+            current_gray,
+            frame_scale=frame_scale,
+            global_offset_x=global_offset_x,
+            global_offset_y=global_offset_y,
+            global_confidence=global_confidence,
+        )
+        if tracked_boxes:
+            self._tracking_lost_frames = 0
+            self._overlay_boxes = self._track_manager.update_from_visual_tracking(
+                self._limit_overlay_boxes(tracked_boxes)
+            )
+            self.update()
+            return
+
+        self._tracking_lost_frames += 1
+        self._overlay_boxes = self._track_manager.mark_all_occluded()
+        self.update()
+        if probable_scene_change or self._tracking_lost_frames >= 2:
+            self._visual_anchors = []
+
+    def _track_boxes_with_visual_anchors(
+        self,
+        current_gray: np.ndarray,
+        *,
+        frame_scale: float,
+        global_offset_x: float,
+        global_offset_y: float,
+        global_confidence: float,
+    ) -> list[OverlayBox]:
+        tracked_boxes: list[OverlayBox] = []
+        used_anchor_indices: set[int] = set()
+        candidate_boxes = sorted(
+            self._overlay_boxes,
+            key=self._overlay_box_priority,
+            reverse=True,
+        )[: self._max_anchor_tracked_boxes]
+
+        for box in candidate_boxes:
+            anchor_index = self._find_visual_anchor_index(box, used_anchor_indices)
+            if anchor_index is None:
+                continue
+
+            anchor = self._visual_anchors[anchor_index]
+            match = self._match_visual_anchor(
+                anchor,
+                box,
+                current_gray,
+                frame_scale=frame_scale,
+                global_offset_x=global_offset_x,
+                global_offset_y=global_offset_y,
+                global_confidence=global_confidence,
+            )
+            if match is None:
+                continue
+
+            tracked_box, confidence = match
+            anchor.last_box = tracked_box
+            anchor.missing_frames = 0
+            anchor.confidence = confidence
+            self._refresh_visual_anchor_template(anchor, tracked_box, current_gray, frame_scale, confidence)
+            used_anchor_indices.add(anchor_index)
+            tracked_boxes.append(tracked_box)
+
+        self._visual_anchors = [
+            anchor
+            for index, anchor in enumerate(self._visual_anchors)
+            if index in used_anchor_indices
+        ]
+        tracked_boxes.sort(key=lambda item: (item.y, item.x))
+        return tracked_boxes
+
+    def _match_visual_anchor(
+        self,
+        anchor: _VisualAnchor,
+        box: OverlayBox,
+        current_gray: np.ndarray,
+        *,
+        frame_scale: float,
+        global_offset_x: float,
+        global_offset_y: float,
+        global_confidence: float,
+    ) -> tuple[OverlayBox, float] | None:
+        search_rect = self._anchor_search_rect(
+            anchor,
+            box,
+            current_gray.shape,
+            frame_scale=frame_scale,
+            global_offset_x=global_offset_x,
+            global_offset_y=global_offset_y,
+            global_confidence=global_confidence,
+        )
+        if search_rect is None:
+            return None
+
+        match = self._match_template_image(anchor.template, current_gray, search_rect)
+        if match is None:
+            return None
+
+        match_left, match_top, confidence, confidence_margin = match
+        required_confidence = self._anchor_tracking_min_confidence
+        if global_confidence < 0.28:
+            required_confidence = max(required_confidence, 0.68)
+        if anchor.missing_frames:
+            required_confidence = max(required_confidence, 0.74)
+        if confidence < required_confidence:
+            return None
+        if confidence_margin < 0.06 and confidence < 0.88:
+            return None
+
+        tracked_x = int(round((match_left + anchor.box_offset_x) / frame_scale))
+        tracked_y = int(round((match_top + anchor.box_offset_y) / frame_scale))
+        tracked = self._place_single_box(box, tracked_x, tracked_y, missing_frames=0)
+        if tracked is None:
+            return None
+        if self._visual_anchor_core_match_score(anchor, tracked, current_gray, frame_scale) < self._anchor_core_min_confidence:
+            return None
+        return tracked, confidence
+
+    def _anchor_search_rect(
+        self,
+        anchor: _VisualAnchor,
+        box: OverlayBox,
+        frame_shape: tuple[int, ...],
+        *,
+        frame_scale: float,
+        global_offset_x: float,
+        global_offset_y: float,
+        global_confidence: float,
+    ) -> tuple[int, int, int, int] | None:
+        height, width = frame_shape[:2]
+        template_h, template_w = anchor.template.shape[:2]
+        expected_left = int(round(box.x * frame_scale)) - anchor.box_offset_x
+        expected_top = int(round(box.y * frame_scale)) - anchor.box_offset_y
+        if global_confidence >= 0.16:
+            expected_left += int(round(global_offset_x * frame_scale))
+            expected_top += int(round(global_offset_y * frame_scale))
+
+        box_w = max(int(round(box.w * frame_scale)), 1)
+        box_h = max(int(round(box.h * frame_scale)), 1)
+        radius_x = min(
+            max(box_w * 2, int(64 * frame_scale)),
+            max(int(width * 0.18), int(64 * frame_scale)),
+        )
+        radius_y = min(
+            max(box_h * 8, int(80 * frame_scale)),
+            max(int(height * 0.35), int(80 * frame_scale)),
+        )
+        if global_confidence >= 0.28:
+            radius_x = min(
+                max(box_w, int(40 * frame_scale)),
+                max(int(width * 0.10), int(40 * frame_scale)),
+            )
+            radius_y = min(
+                max(box_h * 4, int(60 * frame_scale)),
+                max(int(height * 0.22), int(60 * frame_scale)),
+            )
+
+        search_left = max(expected_left - radius_x, 0)
+        search_top = max(expected_top - radius_y, 0)
+        search_right = min(expected_left + template_w + radius_x, width)
+        search_bottom = min(expected_top + template_h + radius_y, height)
+        if search_right - search_left < template_w or search_bottom - search_top < template_h:
+            return None
+        return search_left, search_top, search_right, search_bottom
 
     def _track_boxes_between_frames(
         self,
@@ -334,7 +571,7 @@ class TranslationOverlay(QWidget):
             if tracked is not None:
                 return tracked
 
-        return self._offset_single_box(box, 0, 0, missing_frames=missing_frames)
+        return None
 
     def _consensus_motion_offset(
         self,
@@ -449,6 +686,48 @@ class TranslationOverlay(QWidget):
             return None
         return left, top, right, bottom
 
+    def _anchor_template_rect_for_box(
+        self,
+        box: OverlayBox,
+        frame_shape: tuple[int, ...],
+        frame_scale: float = 1.0,
+    ) -> tuple[int, int, int, int] | None:
+        height, width = frame_shape[:2]
+        scaled_x = int(round(box.x * frame_scale))
+        scaled_y = int(round(box.y * frame_scale))
+        scaled_w = max(int(round(box.w * frame_scale)), 1)
+        scaled_h = max(int(round(box.h * frame_scale)), 1)
+        pad_x = max(int(scaled_w * 0.50), int(28 * frame_scale), 8)
+        pad_y = max(int(scaled_h * 1.25), int(22 * frame_scale), 8)
+        left = max(scaled_x - pad_x, 0)
+        top = max(scaled_y - pad_y, 0)
+        right = min(scaled_x + scaled_w + pad_x, width)
+        bottom = min(scaled_y + scaled_h + pad_y, height)
+        if right - left < 10 or bottom - top < 10:
+            return None
+        return left, top, right, bottom
+
+    def _anchor_core_rect_for_box(
+        self,
+        box: OverlayBox,
+        frame_shape: tuple[int, ...],
+        frame_scale: float = 1.0,
+    ) -> tuple[int, int, int, int] | None:
+        height, width = frame_shape[:2]
+        scaled_x = int(round(box.x * frame_scale))
+        scaled_y = int(round(box.y * frame_scale))
+        scaled_w = max(int(round(box.w * frame_scale)), 1)
+        scaled_h = max(int(round(box.h * frame_scale)), 1)
+        pad_x = max(min(scaled_w // 10, int(12 * frame_scale)), max(int(3 * frame_scale), 2))
+        pad_y = max(min(scaled_h // 4, int(8 * frame_scale)), max(int(3 * frame_scale), 2))
+        left = max(scaled_x - pad_x, 0)
+        top = max(scaled_y - pad_y, 0)
+        right = min(scaled_x + scaled_w + pad_x, width)
+        bottom = min(scaled_y + scaled_h + pad_y, height)
+        if right - left < 8 or bottom - top < 8:
+            return None
+        return left, top, right, bottom
+
     def _search_rect_for_template(
         self,
         template_rect: tuple[int, int, int, int],
@@ -524,6 +803,236 @@ class TranslationOverlay(QWidget):
             return 0.0
         _offset_x, _offset_y, confidence = match
         return confidence
+
+    def _capture_visual_anchors(self, observations: list[OverlayBox]) -> None:
+        if self._tracking_gray_frame is None or not observations:
+            return
+
+        used_anchor_indices: set[int] = set()
+        for box in sorted(observations, key=self._overlay_box_priority, reverse=True)[: self._max_anchor_tracked_boxes]:
+            anchor = self._new_visual_anchor(box, self._tracking_gray_frame, self._tracking_frame_scale)
+            if anchor is None:
+                continue
+
+            match_index = self._find_visual_anchor_index(box, used_anchor_indices)
+            if match_index is None:
+                self._visual_anchors.append(anchor)
+                used_anchor_indices.add(len(self._visual_anchors) - 1)
+                continue
+
+            self._visual_anchors[match_index] = anchor
+            used_anchor_indices.add(match_index)
+
+        self._prune_visual_anchors()
+
+    def _new_visual_anchor(
+        self,
+        box: OverlayBox,
+        gray_frame: np.ndarray,
+        frame_scale: float,
+    ) -> _VisualAnchor | None:
+        template_rect = self._anchor_template_rect_for_box(box, gray_frame.shape, frame_scale)
+        core_rect = self._anchor_core_rect_for_box(box, gray_frame.shape, frame_scale)
+        if template_rect is None or core_rect is None:
+            return None
+
+        left, top, right, bottom = template_rect
+        template = self._anchor_feature_image(gray_frame[top:bottom, left:right])
+        if template.size == 0 or float(np.std(template)) < 3.0:
+            return None
+
+        core_left, core_top, core_right, core_bottom = core_rect
+        core_raw_template = gray_frame[core_top:core_bottom, core_left:core_right]
+        core_template = self._anchor_feature_image(core_raw_template)
+        if core_template.size == 0 or float(np.std(core_template)) < 3.0:
+            return None
+
+        scaled_x = int(round(box.x * frame_scale))
+        scaled_y = int(round(box.y * frame_scale))
+        return _VisualAnchor(
+            key=self._anchor_key(box),
+            template=template.copy(),
+            core_template=core_template.copy(),
+            core_raw_template=core_raw_template.copy(),
+            box_offset_x=scaled_x - left,
+            box_offset_y=scaled_y - top,
+            core_offset_x=core_left - scaled_x,
+            core_offset_y=core_top - scaled_y,
+            last_box=box,
+        )
+
+    def _refresh_visual_anchor_template(
+        self,
+        anchor: _VisualAnchor,
+        box: OverlayBox,
+        gray_frame: np.ndarray,
+        frame_scale: float,
+        confidence: float,
+    ) -> None:
+        if confidence < 0.72:
+            return
+
+        refreshed = self._new_visual_anchor(box, gray_frame, frame_scale)
+        if refreshed is None:
+            return
+
+        anchor.key = refreshed.key
+        anchor.template = refreshed.template
+        anchor.core_template = refreshed.core_template
+        anchor.core_raw_template = refreshed.core_raw_template
+        anchor.box_offset_x = refreshed.box_offset_x
+        anchor.box_offset_y = refreshed.box_offset_y
+        anchor.core_offset_x = refreshed.core_offset_x
+        anchor.core_offset_y = refreshed.core_offset_y
+
+    def _find_visual_anchor_index(
+        self,
+        box: OverlayBox,
+        used_indices: set[int],
+    ) -> int | None:
+        key = self._anchor_key(box)
+        best_index: int | None = None
+        best_score = 0.0
+        for index, anchor in enumerate(self._visual_anchors):
+            if index in used_indices:
+                continue
+            if anchor.key != key:
+                continue
+
+            iou = self._box_iou(box, anchor.last_box)
+            proximity = self._box_center_proximity(box, anchor.last_box)
+            score = (iou * 0.70) + (proximity * 0.30) - (anchor.missing_frames * 0.20)
+            if score > best_score:
+                best_index = index
+                best_score = score
+
+        return best_index
+
+    def _prune_visual_anchors(self) -> None:
+        self._visual_anchors.sort(
+            key=lambda anchor: self._overlay_box_priority(anchor.last_box) - (anchor.missing_frames * 80.0),
+            reverse=True,
+        )
+        self._visual_anchors = self._visual_anchors[: self._max_visible_overlay_boxes]
+
+    @staticmethod
+    def _match_template_image(
+        template: np.ndarray,
+        current_gray: np.ndarray,
+        search_rect: tuple[int, int, int, int],
+    ) -> tuple[float, float, float, float] | None:
+        search_left, search_top, search_right, search_bottom = search_rect
+        search = TranslationOverlay._anchor_feature_image(
+            current_gray[search_top:search_bottom, search_left:search_right]
+        )
+        if template.size == 0 or search.size == 0:
+            return None
+        if template.shape[0] > search.shape[0] or template.shape[1] > search.shape[1]:
+            return None
+        if float(np.std(template)) < 3.0:
+            return None
+
+        scale = 1.0
+        template_area = template.shape[0] * template.shape[1]
+        search_area = search.shape[0] * search.shape[1]
+        if template_area > 70_000 or search_area > 360_000:
+            scale = 0.5
+            template = cv2.resize(template, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            search = cv2.resize(search, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            if template.shape[0] < 5 or template.shape[1] < 5:
+                return None
+
+        result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+        _min_value, max_value, _min_location, max_location = cv2.minMaxLoc(result)
+        suppressed = result.copy()
+        suppression_left = max(max_location[0] - max(template.shape[1] // 3, 4), 0)
+        suppression_top = max(max_location[1] - max(template.shape[0] // 3, 4), 0)
+        suppression_right = min(max_location[0] + max(template.shape[1] // 3, 4) + 1, suppressed.shape[1])
+        suppression_bottom = min(max_location[1] + max(template.shape[0] // 3, 4) + 1, suppressed.shape[0])
+        suppressed[suppression_top:suppression_bottom, suppression_left:suppression_right] = -1.0
+        second_value = -1.0
+        if np.any(suppressed > -1.0):
+            _second_min, second_value, _second_min_location, _second_location = cv2.minMaxLoc(suppressed)
+
+        match_left = search_left + (max_location[0] / scale)
+        match_top = search_top + (max_location[1] / scale)
+        return match_left, match_top, float(max_value), float(max_value - second_value)
+
+    @staticmethod
+    def _anchor_feature_image(gray: np.ndarray) -> np.ndarray:
+        if gray.size == 0:
+            return gray
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        gradient = cv2.morphologyEx(
+            blurred,
+            cv2.MORPH_GRADIENT,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        )
+        return cv2.normalize(gradient, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    @staticmethod
+    def _visual_anchor_core_match_score(
+        anchor: _VisualAnchor,
+        box: OverlayBox,
+        current_gray: np.ndarray,
+        frame_scale: float,
+    ) -> float:
+        scaled_x = int(round(box.x * frame_scale))
+        scaled_y = int(round(box.y * frame_scale))
+        left = scaled_x + anchor.core_offset_x
+        top = scaled_y + anchor.core_offset_y
+        height, width = current_gray.shape[:2]
+        core_h, core_w = anchor.core_template.shape[:2]
+        right = left + core_w
+        bottom = top + core_h
+        if left < 0 or top < 0 or right > width or bottom > height:
+            return 0.0
+
+        current_core_raw = current_gray[top:bottom, left:right]
+        current_core = TranslationOverlay._anchor_feature_image(current_core_raw)
+        if current_core.shape != anchor.core_template.shape:
+            return 0.0
+        if float(np.std(current_core)) < 3.0 or float(np.std(anchor.core_template)) < 3.0:
+            return 0.0
+
+        feature_result = cv2.matchTemplate(current_core, anchor.core_template, cv2.TM_CCOEFF_NORMED)
+        _feature_min, feature_value, _feature_min_location, _feature_location = cv2.minMaxLoc(feature_result)
+
+        if current_core_raw.shape != anchor.core_raw_template.shape:
+            return 0.0
+        if float(np.std(current_core_raw)) < 3.0 or float(np.std(anchor.core_raw_template)) < 3.0:
+            return 0.0
+
+        raw_result = cv2.matchTemplate(current_core_raw, anchor.core_raw_template, cv2.TM_CCOEFF_NORMED)
+        _raw_min, raw_value, _raw_min_location, _raw_location = cv2.minMaxLoc(raw_result)
+        return min(float(feature_value), float(raw_value))
+
+    @staticmethod
+    def _anchor_key(box: OverlayBox) -> str:
+        return " ".join(box.text.casefold().split())
+
+    @staticmethod
+    def _box_iou(first: OverlayBox, second: OverlayBox) -> float:
+        left = max(first.x, second.x)
+        top = max(first.y, second.y)
+        right = min(first.x + first.w, second.x + second.w)
+        bottom = min(first.y + first.h, second.y + second.h)
+        intersection = max(right - left, 0) * max(bottom - top, 0)
+        if intersection <= 0:
+            return 0.0
+        first_area = max(first.w * first.h, 1)
+        second_area = max(second.w * second.h, 1)
+        return intersection / max(first_area + second_area - intersection, 1)
+
+    @staticmethod
+    def _box_center_proximity(first: OverlayBox, second: OverlayBox) -> float:
+        first_center_x = first.x + (first.w / 2.0)
+        first_center_y = first.y + (first.h / 2.0)
+        second_center_x = second.x + (second.w / 2.0)
+        second_center_y = second.y + (second.h / 2.0)
+        distance = max(abs(first_center_x - second_center_x), abs(first_center_y - second_center_y))
+        tolerance = max(first.w, first.h, second.w, second.h, 1) * 10.0
+        return max(1.0 - (distance / tolerance), 0.0)
 
     def _local_tracking_candidate_indices(self, boxes: list[OverlayBox]) -> set[int]:
         ranked: list[tuple[float, int]] = []
@@ -605,6 +1114,31 @@ class TranslationOverlay(QWidget):
             return None
         return tracked
 
+    def _place_single_box(
+        self,
+        box: OverlayBox,
+        x: int,
+        y: int,
+        *,
+        missing_frames: int,
+    ) -> OverlayBox | None:
+        width = self._monitor.width if self._monitor is not None else self.width()
+        height = self._monitor.height if self._monitor is not None else self.height()
+        tracked = OverlayBox(
+            x=x,
+            y=y,
+            w=box.w,
+            h=box.h,
+            text=box.text,
+            missing_frames=missing_frames,
+            translated=box.translated,
+        )
+        if tracked.x + tracked.w <= 0 or tracked.y + tracked.h <= 0:
+            return None
+        if tracked.x >= width or tracked.y >= height:
+            return None
+        return tracked
+
     def update_analysis(self, analysis: FrameAnalysis) -> None:
         current_boxes = [
             OverlayBox(
@@ -620,43 +1154,26 @@ class TranslationOverlay(QWidget):
         ]
 
         if self._tracking_enabled:
-            self._overlay_boxes = self._limit_overlay_boxes(self._merge_tracked_boxes(current_boxes, analysis))
+            self._track_manager.max_visible_tracks = self._max_visible_overlay_boxes
+            self._track_manager.max_predicted_frames = self._max_visible_predicted_frames
+            self._overlay_boxes = self._track_manager.update_from_pipeline(
+                current_boxes,
+                self._predict_tracked_boxes(analysis),
+            )
+            if self._tracking_mode == "anchor" and current_boxes:
+                self._capture_visual_anchors(current_boxes)
         elif current_boxes:
-            self._overlay_boxes = self._limit_overlay_boxes(current_boxes)
+            self._track_manager.max_visible_tracks = self._max_visible_overlay_boxes
+            self._overlay_boxes = self._track_manager.replace_with_observations(current_boxes)
         else:
+            self._track_manager.clear()
             self._overlay_boxes = []
         self.update()
 
-    def _merge_tracked_boxes(
-        self,
-        current_boxes: list[OverlayBox],
-        analysis: FrameAnalysis,
-    ) -> list[OverlayBox]:
-        predicted_boxes = self._predict_tracked_boxes(analysis)
-        if not predicted_boxes:
-            return current_boxes
-        if not current_boxes:
-            return predicted_boxes
-
-        merged: list[OverlayBox] = list(current_boxes)
-        matched_predicted_indices: set[int] = set()
-        for current_box in current_boxes:
-            match_index = self._find_matching_overlay_box(current_box, predicted_boxes, matched_predicted_indices)
-            if match_index is not None:
-                matched_predicted_indices.add(match_index)
-
-        for index, predicted_box in enumerate(predicted_boxes):
-            if index in matched_predicted_indices:
-                continue
-            if self._overlaps_any(predicted_box, current_boxes):
-                continue
-            merged.append(predicted_box)
-
-        merged.sort(key=lambda box: (box.y, box.x))
-        return merged
-
     def _predict_tracked_boxes(self, analysis: FrameAnalysis) -> list[OverlayBox]:
         if not self._overlay_boxes:
+            return []
+        if self._tracking_mode == "anchor" and self._realtime_tracking_active:
             return []
         if self._realtime_tracking_active:
             return self._offset_overlay_boxes(self._overlay_boxes, 0, 0, increment_missing=True)
@@ -665,6 +1182,8 @@ class TranslationOverlay(QWidget):
 
         offset_x = int(round(analysis.content_offset_x))
         offset_y = int(round(analysis.content_offset_y))
+        if self._motion_magnitude(offset_x, offset_y) < 3:
+            return []
         return self._offset_overlay_boxes(self._overlay_boxes, offset_x, offset_y, increment_missing=True)
 
     def _offset_overlay_boxes(
@@ -698,66 +1217,6 @@ class TranslationOverlay(QWidget):
                 continue
             next_boxes.append(tracked)
         return next_boxes
-
-    def _find_matching_overlay_box(
-        self,
-        current_box: OverlayBox,
-        predicted_boxes: list[OverlayBox],
-        used_indices: set[int],
-    ) -> int | None:
-        best_index: int | None = None
-        best_score = 0.0
-        current_rect = (current_box.x, current_box.y, current_box.w, current_box.h)
-
-        for index, predicted_box in enumerate(predicted_boxes):
-            if index in used_indices:
-                continue
-
-            predicted_rect = (predicted_box.x, predicted_box.y, predicted_box.w, predicted_box.h)
-            iou = self._intersection_over_union(current_rect, predicted_rect)
-            if iou < 0.25:
-                continue
-
-            text_score = self._text_similarity(current_box.text, predicted_box.text)
-            score = (iou * 0.75) + (text_score * 0.25)
-            if score > best_score:
-                best_score = score
-                best_index = index
-
-        return best_index
-
-    @classmethod
-    def _overlaps_any(cls, box: OverlayBox, current_boxes: list[OverlayBox]) -> bool:
-        rect = (box.x, box.y, box.w, box.h)
-        return any(
-            cls._intersection_over_union(rect, (current.x, current.y, current.w, current.h)) >= 0.35
-            for current in current_boxes
-        )
-
-    @staticmethod
-    def _intersection_over_union(
-        first: tuple[int, int, int, int],
-        second: tuple[int, int, int, int],
-    ) -> float:
-        left = max(first[0], second[0])
-        top = max(first[1], second[1])
-        right = min(first[0] + first[2], second[0] + second[2])
-        bottom = min(first[1] + first[3], second[1] + second[3])
-        intersection = max(right - left, 0) * max(bottom - top, 0)
-        if intersection <= 0:
-            return 0.0
-
-        first_area = max(first[2] * first[3], 1)
-        second_area = max(second[2] * second[3], 1)
-        return intersection / max(first_area + second_area - intersection, 1)
-
-    @staticmethod
-    def _text_similarity(first: str, second: str) -> float:
-        first_tokens = set(first.casefold().split())
-        second_tokens = set(second.casefold().split())
-        if not first_tokens or not second_tokens:
-            return 0.0
-        return len(first_tokens & second_tokens) / len(first_tokens | second_tokens)
 
     def paintEvent(self, _event: object) -> None:
         if not self._overlay_boxes or self._monitor is None:

@@ -60,7 +60,7 @@ class MainWindow(QMainWindow):
         self.hotkey_label = QLabel(f"Global hotkeys: {hotkey_labels()} toggle live screen overlay")
 
         self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(80, 10000)
+        self.interval_spin.setRange(10, 10000)
         self.interval_spin.setValue(250)
         self.interval_spin.setSuffix(" ms")
 
@@ -95,6 +95,7 @@ class MainWindow(QMainWindow):
         self.ocr_checkbox.setChecked(True)
         self.overlay_tracking_checkbox = QCheckBox("Track overlay while scrolling")
         self.overlay_tracking_checkbox.setChecked(False)
+        self.overlay_tracking_mode_combo = QComboBox()
         self.ocr_device_combo = QComboBox()
 
         self.fps_label = QLabel("0.0")
@@ -113,6 +114,7 @@ class MainWindow(QMainWindow):
         self._populate_ocr_device_control()
         self._populate_text_detector_control()
         self._populate_translation_mode_control()
+        self._populate_overlay_tracking_mode_control()
         self._populate_language_controls()
         self._connect_signals()
         self._refresh_monitors()
@@ -145,6 +147,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("OCR device", self.ocr_device_combo)
         settings_layout.addRow("", self.ocr_checkbox)
         settings_layout.addRow("", self.overlay_tracking_checkbox)
+        settings_layout.addRow("Overlay tracking", self.overlay_tracking_mode_combo)
 
         stats_box = QGroupBox("Runtime Stats")
         stats_layout = QFormLayout(stats_box)
@@ -193,6 +196,7 @@ class MainWindow(QMainWindow):
         self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
         self.overlay_tracking_checkbox.setEnabled(not locked)
+        self.overlay_tracking_mode_combo.setEnabled(not locked)
 
     def _populate_ocr_device_control(self) -> None:
         self.ocr_device_combo.addItem("Auto", userData="auto")
@@ -210,6 +214,11 @@ class MainWindow(QMainWindow):
         self.translation_mode_combo.addItem("Google Translate (Online)", userData="google")
         self.translation_mode_combo.addItem("Disabled", userData="disabled")
         self.translation_mode_combo.setCurrentIndex(0)
+
+    def _populate_overlay_tracking_mode_control(self) -> None:
+        self.overlay_tracking_mode_combo.addItem("Legacy motion", userData="legacy")
+        self.overlay_tracking_mode_combo.addItem("Visual anchor lock", userData="anchor")
+        self.overlay_tracking_mode_combo.setCurrentIndex(0)
 
     def _populate_language_controls(self) -> None:
         for option in source_language_options():
@@ -262,8 +271,10 @@ class MainWindow(QMainWindow):
             ocr_device_preference=self.ocr_device_combo.currentData(),
             ocr_language=resolve_ocr_language(self.source_language_combo.currentData()),
             overlay_tracking_enabled=self.overlay_tracking_checkbox.isChecked(),
+            overlay_tracking_mode=self.overlay_tracking_mode_combo.currentData(),
         )
 
+        self.overlay_window.set_tracking_mode(settings.overlay_tracking_mode)
         self.overlay_window.set_tracking_enabled(settings.overlay_tracking_enabled)
         self.worker = ProcessingWorker(monitor=monitor, settings=settings)
         self.worker.frame_ready.connect(self._handle_frame)
@@ -364,6 +375,7 @@ class MainWindow(QMainWindow):
             return
 
         self.overlay_window.show_for_monitor(monitor)
+        self.overlay_window.set_tracking_mode(self.overlay_tracking_mode_combo.currentData())
         self.overlay_window.set_tracking_enabled(self.overlay_tracking_checkbox.isChecked())
         self.overlay_window.clear_analysis()
         self.overlay_active = True

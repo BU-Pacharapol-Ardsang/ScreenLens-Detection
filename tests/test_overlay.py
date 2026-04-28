@@ -157,7 +157,7 @@ def test_overlay_keeps_unmatched_tracked_boxes_when_new_frame_has_partial_ocr() 
     ]
 
 
-def test_overlay_keeps_tracked_boxes_briefly_when_content_is_still() -> None:
+def test_overlay_hides_tracked_boxes_when_content_is_still_and_ocr_loses_text() -> None:
     from screenlens_detection.overlay import TranslationOverlay
 
     _app()
@@ -184,9 +184,7 @@ def test_overlay_keeps_tracked_boxes_briefly_when_content_is_still() -> None:
         )
     )
 
-    assert [(box.x, box.y, box.text, box.missing_frames) for box in overlay._overlay_boxes] == [
-        (20, 40, "Translated", 1)
-    ]
+    assert overlay._overlay_boxes == []
 
 
 def test_overlay_realtime_tracking_offset_moves_boxes_without_ocr_expiry() -> None:
@@ -271,6 +269,79 @@ def test_overlay_realtime_tracking_clears_after_repeated_lost_frames() -> None:
     assert overlay._overlay_boxes == []
 
 
+def test_overlay_realtime_tracking_hides_when_visual_text_disappears() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 300, 160)
+    overlay.set_tracking_enabled(True)
+    overlay.set_realtime_tracking_active(True)
+
+    previous = np.full((160, 300), 255, dtype=np.uint8)
+    current = np.full((160, 300), 255, dtype=np.uint8)
+    cv2.putText(previous, "GONE TEXT", (34, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 0, 2, cv2.LINE_AA)
+
+    overlay.apply_tracking_frame(TrackingFrame(previous))
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=np.zeros((160, 300, 3), dtype=np.uint8),
+            processed_preview=np.zeros((160, 300, 3), dtype=np.uint8),
+            boxes=[DetectionBox(x=32, y=60, w=150, h=30, text="Gone text", translated_text="Gone translated")],
+        )
+    )
+
+    overlay.apply_tracking_frame(TrackingFrame(current, global_confidence=0.02))
+
+    assert overlay._overlay_boxes == []
+
+
+def test_overlay_reuses_returning_text_without_duplicate_overlay() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    overlay = TranslationOverlay()
+    frame = np.zeros((180, 320, 3), dtype=np.uint8)
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 320, 180)
+    overlay.set_tracking_enabled(True)
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=frame,
+            processed_preview=frame,
+            boxes=[DetectionBox(x=20, y=80, w=140, h=24, text="Repeat", translated_text="Repeat translated")],
+        )
+    )
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=frame,
+            processed_preview=frame,
+            boxes=[],
+            content_offset_x=0,
+            content_offset_y=-24,
+            content_motion_confidence=0.20,
+        )
+    )
+
+    assert [(box.x, box.y, box.text, box.missing_frames) for box in overlay._overlay_boxes] == [
+        (20, 56, "Repeat translated", 1)
+    ]
+
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=frame,
+            processed_preview=frame,
+            boxes=[DetectionBox(x=20, y=82, w=140, h=24, text="Repeat", translated_text="Repeat translated")],
+            content_offset_x=0,
+            content_offset_y=0,
+            content_motion_confidence=0.20,
+        )
+    )
+
+    assert [(box.x, box.y, box.text, box.missing_frames) for box in overlay._overlay_boxes] == [
+        (20, 82, "Repeat translated", 0)
+    ]
+
+
 def test_overlay_realtime_tracking_tracks_each_label_locally() -> None:
     from screenlens_detection.overlay import TranslationOverlay
 
@@ -306,6 +377,36 @@ def test_overlay_realtime_tracking_tracks_each_label_locally() -> None:
     positions = {box.text: (box.x, box.y) for box in overlay._overlay_boxes}
     assert positions["Tab translated"] == (14, 14)
     assert positions["Content translated"] == (80, 62)
+
+
+def test_overlay_realtime_tracking_follows_independently_moving_text() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 320, 180)
+    overlay.set_tracking_enabled(True)
+    overlay.set_realtime_tracking_active(True)
+
+    previous = np.full((180, 320), 255, dtype=np.uint8)
+    current = np.full((180, 320), 255, dtype=np.uint8)
+    cv2.putText(previous, "FLOATING", (42, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.8, 0, 2, cv2.LINE_AA)
+    cv2.putText(current, "FLOATING", (42, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.8, 0, 2, cv2.LINE_AA)
+
+    overlay.apply_tracking_frame(TrackingFrame(previous))
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=np.zeros((180, 320, 3), dtype=np.uint8),
+            processed_preview=np.zeros((180, 320, 3), dtype=np.uint8),
+            boxes=[DetectionBox(x=40, y=60, w=150, h=34, text="Floating", translated_text="Floating translated")],
+        )
+    )
+
+    overlay.apply_tracking_frame(TrackingFrame(current, global_offset_x=0.0, global_offset_y=0.0, global_confidence=0.02))
+
+    assert [(box.x, box.y, box.text, box.missing_frames) for box in overlay._overlay_boxes] == [
+        (40, 92, "Floating translated", 0)
+    ]
 
 
 def test_overlay_realtime_tracking_handles_downscaled_tracking_frames() -> None:
@@ -472,4 +573,150 @@ def test_overlay_realtime_tracking_does_not_clear_scene_change_when_local_anchor
 
     assert [(box.x, box.y, box.text) for box in overlay._overlay_boxes] == [
         (72, 52, "Moving translated")
+    ]
+
+
+def test_overlay_anchor_tracking_locks_to_saved_visual_patch() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 360, 220)
+    overlay.set_tracking_mode("anchor")
+    overlay.set_tracking_enabled(True)
+    overlay.set_realtime_tracking_active(True)
+
+    previous = np.full((220, 360), 245, dtype=np.uint8)
+    current = np.full((220, 360), 245, dtype=np.uint8)
+    cv2.rectangle(previous, (72, 120), (260, 168), 230, -1)
+    cv2.rectangle(previous, (72, 120), (260, 168), 120, 1)
+    cv2.putText(previous, "QUEST LINE", (84, 152), cv2.FONT_HERSHEY_SIMPLEX, 0.75, 20, 2, cv2.LINE_AA)
+    cv2.rectangle(current, (72, 52), (260, 100), 230, -1)
+    cv2.rectangle(current, (72, 52), (260, 100), 120, 1)
+    cv2.putText(current, "QUEST LINE", (84, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.75, 20, 2, cv2.LINE_AA)
+
+    overlay.apply_tracking_frame(TrackingFrame(previous))
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=np.zeros((220, 360, 3), dtype=np.uint8),
+            processed_preview=np.zeros((220, 360, 3), dtype=np.uint8),
+            boxes=[DetectionBox(x=82, y=128, w=164, h=32, text="Quest", translated_text="Quest translated")],
+        )
+    )
+
+    overlay.apply_tracking_frame(TrackingFrame(current, global_confidence=0.02))
+
+    assert [(box.x, box.y, box.text, box.missing_frames) for box in overlay._overlay_boxes] == [
+        (82, 60, "Quest translated", 0)
+    ]
+
+
+def test_overlay_anchor_tracking_hides_when_saved_visual_patch_is_lost() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 360, 220)
+    overlay.set_tracking_mode("anchor")
+    overlay.set_tracking_enabled(True)
+    overlay.set_realtime_tracking_active(True)
+
+    previous = np.full((220, 360), 245, dtype=np.uint8)
+    current = np.full((220, 360), 245, dtype=np.uint8)
+    cv2.rectangle(previous, (72, 76), (260, 124), 230, -1)
+    cv2.rectangle(previous, (72, 76), (260, 124), 120, 1)
+    cv2.putText(previous, "QUEST LINE", (84, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.75, 20, 2, cv2.LINE_AA)
+
+    overlay.apply_tracking_frame(TrackingFrame(previous))
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=np.zeros((220, 360, 3), dtype=np.uint8),
+            processed_preview=np.zeros((220, 360, 3), dtype=np.uint8),
+            boxes=[DetectionBox(x=82, y=84, w=164, h=32, text="Quest", translated_text="Quest translated")],
+        )
+    )
+
+    overlay.apply_tracking_frame(TrackingFrame(current, global_confidence=0.02))
+
+    assert overlay._overlay_boxes == []
+
+
+def test_overlay_anchor_tracking_does_not_restore_lost_box_from_pipeline_prediction() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 360, 220)
+    overlay.set_tracking_mode("anchor")
+    overlay.set_tracking_enabled(True)
+    overlay.set_realtime_tracking_active(True)
+
+    previous = np.full((220, 360), 245, dtype=np.uint8)
+    current = np.full((220, 360), 245, dtype=np.uint8)
+    cv2.rectangle(previous, (72, 76), (260, 124), 230, -1)
+    cv2.rectangle(previous, (72, 76), (260, 124), 120, 1)
+    cv2.putText(previous, "QUEST LINE", (84, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.75, 20, 2, cv2.LINE_AA)
+
+    overlay.apply_tracking_frame(TrackingFrame(previous))
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=np.zeros((220, 360, 3), dtype=np.uint8),
+            processed_preview=np.zeros((220, 360, 3), dtype=np.uint8),
+            boxes=[DetectionBox(x=82, y=84, w=164, h=32, text="Quest", translated_text="Quest translated")],
+        )
+    )
+    overlay.apply_tracking_frame(TrackingFrame(current, global_confidence=0.02))
+
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=np.zeros((220, 360, 3), dtype=np.uint8),
+            processed_preview=np.zeros((220, 360, 3), dtype=np.uint8),
+            boxes=[],
+            content_offset_x=0,
+            content_offset_y=-80,
+            content_motion_confidence=0.90,
+        )
+    )
+
+    assert overlay._overlay_boxes == []
+
+
+def test_overlay_anchor_tracking_removes_only_the_box_whose_visual_patch_is_lost() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 420, 260)
+    overlay.set_tracking_mode("anchor")
+    overlay.set_tracking_enabled(True)
+    overlay.set_realtime_tracking_active(True)
+
+    previous = np.full((260, 420), 246, dtype=np.uint8)
+    current = np.full((260, 420), 246, dtype=np.uint8)
+    cv2.rectangle(previous, (64, 144), (250, 192), 230, -1)
+    cv2.rectangle(previous, (64, 144), (250, 192), 90, 1)
+    cv2.putText(previous, "KEEP LINE", (78, 176), cv2.FONT_HERSHEY_SIMPLEX, 0.75, 20, 2, cv2.LINE_AA)
+    cv2.rectangle(previous, (64, 56), (250, 104), 226, -1)
+    cv2.rectangle(previous, (64, 56), (250, 104), 90, 1)
+    cv2.putText(previous, "DROP LINE", (78, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.75, 20, 2, cv2.LINE_AA)
+    cv2.rectangle(current, (64, 92), (250, 140), 230, -1)
+    cv2.rectangle(current, (64, 92), (250, 140), 90, 1)
+    cv2.putText(current, "KEEP LINE", (78, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.75, 20, 2, cv2.LINE_AA)
+
+    overlay.apply_tracking_frame(TrackingFrame(previous))
+    overlay.update_analysis(
+        FrameAnalysis(
+            annotated_frame=np.zeros((260, 420, 3), dtype=np.uint8),
+            processed_preview=np.zeros((260, 420, 3), dtype=np.uint8),
+            boxes=[
+                DetectionBox(x=76, y=152, w=160, h=32, text="Keep", translated_text="Keep translated"),
+                DetectionBox(x=76, y=64, w=160, h=32, text="Drop", translated_text="Drop translated"),
+            ],
+        )
+    )
+
+    overlay.apply_tracking_frame(TrackingFrame(current, global_confidence=0.02))
+
+    assert [(box.x, box.y, box.text, box.missing_frames) for box in overlay._overlay_boxes] == [
+        (76, 100, "Keep translated", 0)
     ]

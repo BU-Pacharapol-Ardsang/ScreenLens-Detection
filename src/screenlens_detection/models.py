@@ -53,6 +53,7 @@ class PipelineSettings:
     motion_mean_threshold: float = 18.0
     motion_changed_ratio_threshold: float = 0.20
     overlay_tracking_enabled: bool = False
+    overlay_tracking_mode: str = "legacy"
 
 
 @dataclass(slots=True, frozen=True)
