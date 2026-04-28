@@ -60,7 +60,7 @@ class MainWindow(QMainWindow):
         self.hotkey_label = QLabel(f"Global hotkeys: {hotkey_labels()} toggle live screen overlay")
 
         self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(80, 3000)
+        self.interval_spin.setRange(80, 10000)
         self.interval_spin.setValue(250)
         self.interval_spin.setSuffix(" ms")
 
@@ -74,10 +74,10 @@ class MainWindow(QMainWindow):
         self.area_spin.setValue(250)
 
         self.ocr_boxes_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ocr_boxes_slider.setRange(1, 60)
+        self.ocr_boxes_slider.setRange(1, 256)
         self.ocr_boxes_slider.setPageStep(4)
         self.ocr_boxes_slider.setTickInterval(1)
-        self.ocr_boxes_slider.setValue(8)
+        self.ocr_boxes_slider.setValue(16)
         self.ocr_boxes_value_label = QLabel(str(self.ocr_boxes_slider.value()))
         self.ocr_boxes_value_label.setMinimumWidth(28)
         self.ocr_boxes_control = QWidget()
