@@ -91,6 +91,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         window.scale_spin.setValue(1.0)
         window.area_spin.setValue(100)
         window.ocr_boxes_slider.setValue(2)
+        window.overlay_tracking_checkbox.setChecked(True)
 
         window._start_worker()
         app.processEvents()
@@ -99,9 +100,11 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert worker.started is True
         assert worker.settings.translation_mode == "google"
         assert worker.settings.text_detector_mode == "easyocr"
+        assert worker.settings.overlay_tracking_enabled is True
         assert window.worker is worker
         assert window.text_detector_combo.isEnabled() is False
         assert window.translation_mode_combo.isEnabled() is False
+        assert window.overlay_tracking_checkbox.isEnabled() is False
         assert window.stop_button.isEnabled() is True
         assert window.status_label.text() == "Synthetic worker running"
         assert window.ocr_runtime_label.text() == "Synthetic OCR runtime"

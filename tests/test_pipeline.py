@@ -340,3 +340,83 @@ def test_pipeline_reuses_recent_translation_for_similar_box_in_next_frame() -> N
 
     assert first_result[0].translated_text.startswith("translated:")
     assert second_result[0].translated_text == first_result[0].translated_text
+
+
+def test_pipeline_reuses_tracked_translation_after_blank_and_scroll() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(overlay_tracking_enabled=True),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=200,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    first_result = pipeline._apply_translations(first_frame)
+
+    assert first_result[0].translated_text.startswith("translated:")
+    assert pipeline._apply_translations([]) == []
+
+    moved_frame = [
+        DetectionBox(
+            x=100,
+            y=520,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    moved_result = pipeline._apply_translations(moved_frame)
+
+    assert moved_result[0].translated_text == first_result[0].translated_text
+    assert backend.calls == 1
+
+
+def test_pipeline_clears_recent_translation_without_overlay_tracking() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(overlay_tracking_enabled=False),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=200,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    pipeline._apply_translations(first_frame)
+    pipeline._apply_translations([])
+
+    moved_frame = [
+        DetectionBox(
+            x=100,
+            y=520,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    moved_result = pipeline._apply_translations(moved_frame)
+
+    assert moved_result[0].translated_text == ""
+    assert backend.calls == 2

@@ -29,6 +29,7 @@ from ..capture import ScreenCapturer
 from ..languages import resolve_ocr_language, source_language_options, target_language_options
 from ..models import FrameAnalysis, MonitorSpec, PipelineSettings
 from ..overlay import TranslationOverlay
+from ..overlay_tracker import OverlayTrackingWorker
 from ..text_detectors import text_detector_options
 from ..windows_capture_exclusion import set_window_capture_exclusion
 from ..windows_hotkeys import extract_hotkey_id, hotkey_labels, register_window_hotkeys, unregister_window_hotkeys
@@ -43,6 +44,7 @@ class MainWindow(QMainWindow):
 
         self.monitors: list[MonitorSpec] = []
         self.worker: ProcessingWorker | None = None
+        self.overlay_tracker: OverlayTrackingWorker | None = None
         self.overlay_window = TranslationOverlay()
         self.overlay_active = False
         self._overlay_started_worker = False
@@ -91,6 +93,8 @@ class MainWindow(QMainWindow):
         self.translation_mode_combo = QComboBox()
         self.ocr_checkbox = QCheckBox("Enable OCR")
         self.ocr_checkbox.setChecked(True)
+        self.overlay_tracking_checkbox = QCheckBox("Track overlay while scrolling")
+        self.overlay_tracking_checkbox.setChecked(False)
         self.ocr_device_combo = QComboBox()
 
         self.fps_label = QLabel("0.0")
@@ -140,6 +144,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Translation mode", self.translation_mode_combo)
         settings_layout.addRow("OCR device", self.ocr_device_combo)
         settings_layout.addRow("", self.ocr_checkbox)
+        settings_layout.addRow("", self.overlay_tracking_checkbox)
 
         stats_box = QGroupBox("Runtime Stats")
         stats_layout = QFormLayout(stats_box)
@@ -187,6 +192,7 @@ class MainWindow(QMainWindow):
         self.translation_mode_combo.setEnabled(not locked)
         self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
+        self.overlay_tracking_checkbox.setEnabled(not locked)
 
     def _populate_ocr_device_control(self) -> None:
         self.ocr_device_combo.addItem("Auto", userData="auto")
@@ -255,8 +261,10 @@ class MainWindow(QMainWindow):
             ocr_enabled=self.ocr_checkbox.isChecked(),
             ocr_device_preference=self.ocr_device_combo.currentData(),
             ocr_language=resolve_ocr_language(self.source_language_combo.currentData()),
+            overlay_tracking_enabled=self.overlay_tracking_checkbox.isChecked(),
         )
 
+        self.overlay_window.set_tracking_enabled(settings.overlay_tracking_enabled)
         self.worker = ProcessingWorker(monitor=monitor, settings=settings)
         self.worker.frame_ready.connect(self._handle_frame)
         self.worker.worker_error.connect(self._handle_error)
@@ -267,6 +275,8 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.worker.start()
+        if self.overlay_active and settings.overlay_tracking_enabled:
+            self._start_overlay_tracker(monitor)
 
     def _stop_worker(self) -> None:
         self._overlay_started_worker = False
@@ -277,6 +287,7 @@ class MainWindow(QMainWindow):
         self.worker.stop()
 
     def _on_worker_finished(self) -> None:
+        self._stop_overlay_tracker()
         self.worker = None
         self._set_runtime_controls_locked(False)
         self.start_button.setEnabled(bool(self.monitors))
@@ -353,6 +364,7 @@ class MainWindow(QMainWindow):
             return
 
         self.overlay_window.show_for_monitor(monitor)
+        self.overlay_window.set_tracking_enabled(self.overlay_tracking_checkbox.isChecked())
         self.overlay_window.clear_analysis()
         self.overlay_active = True
 
@@ -361,6 +373,8 @@ class MainWindow(QMainWindow):
             self._start_worker()
             return
 
+        if self.overlay_tracking_checkbox.isChecked():
+            self._start_overlay_tracker(monitor)
         self._overlay_started_worker = False
         self._refresh_status_label()
 
@@ -373,10 +387,44 @@ class MainWindow(QMainWindow):
             self.worker.stop()
 
     def _hide_overlay(self) -> None:
+        self._stop_overlay_tracker()
         self.overlay_active = False
         self.overlay_window.clear_analysis()
         self.overlay_window.hide()
         self._refresh_status_label()
+
+    def _start_overlay_tracker(self, monitor: MonitorSpec) -> None:
+        if self.overlay_tracker is not None:
+            return
+
+        self.overlay_window.set_realtime_tracking_active(True)
+        self.overlay_tracker = OverlayTrackingWorker(monitor)
+        self.overlay_tracker.frame_ready.connect(self._handle_overlay_tracking_frame)
+        self.overlay_tracker.worker_error.connect(self._handle_overlay_tracker_error)
+        self.overlay_tracker.finished.connect(self._on_overlay_tracker_finished)
+        self.overlay_tracker.start()
+        self._refresh_status_label()
+
+    def _stop_overlay_tracker(self) -> None:
+        tracker = self.overlay_tracker
+        self.overlay_tracker = None
+        self.overlay_window.set_realtime_tracking_active(False)
+        if tracker is not None:
+            tracker.stop()
+        self._refresh_status_label()
+
+    def _on_overlay_tracker_finished(self) -> None:
+        self.overlay_tracker = None
+        self.overlay_window.set_realtime_tracking_active(False)
+        self._refresh_status_label()
+
+    def _handle_overlay_tracking_frame(self, tracking_frame: object) -> None:
+        if self.overlay_active:
+            self.overlay_window.apply_tracking_frame(tracking_frame)
+
+    def _handle_overlay_tracker_error(self, message: str) -> None:
+        self._stop_overlay_tracker()
+        self._set_base_status(f"{self._base_status} | Overlay tracking unavailable: {message}")
 
     def _set_base_status(self, text: str) -> None:
         self._base_status = text
@@ -386,6 +434,8 @@ class MainWindow(QMainWindow):
         status = self._base_status
         if self.overlay_active:
             status = f"{status} | Overlay ON"
+        if self.overlay_tracker is not None:
+            status = f"{status} | Tracking ON"
         self.status_label.setText(status)
 
     def _ensure_hotkeys_registered(self) -> None:
