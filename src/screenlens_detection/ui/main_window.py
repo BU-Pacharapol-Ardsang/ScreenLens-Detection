@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QCloseEvent, QImage, QPixmap
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QColor, QCloseEvent, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,7 +28,9 @@ import numpy as np
 from ..capture import ScreenCapturer
 from ..languages import resolve_ocr_language, source_language_options, target_language_options
 from ..models import FrameAnalysis, MonitorSpec, PipelineSettings
-from ..overlay import TranslationOverlay
+from ..overlay import TranslationOverlay, overlay_font_pixel_size, overlay_text_for_box
+from ..overlay_tracker import OverlayTrackingWorker
+from ..recording import RecordingSession, recording_fps_from_settings
 from ..text_detectors import text_detector_options
 from ..windows_capture_exclusion import set_window_capture_exclusion
 from ..windows_hotkeys import extract_hotkey_id, hotkey_labels, register_window_hotkeys, unregister_window_hotkeys
@@ -43,6 +45,7 @@ class MainWindow(QMainWindow):
 
         self.monitors: list[MonitorSpec] = []
         self.worker: ProcessingWorker | None = None
+        self.overlay_tracker: OverlayTrackingWorker | None = None
         self.overlay_window = TranslationOverlay()
         self.overlay_active = False
         self._overlay_started_worker = False
@@ -55,10 +58,12 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("Start")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
+        self.record_button = QPushButton("Start Recording")
+        self.record_button.setEnabled(False)
         self.hotkey_label = QLabel(f"Global hotkeys: {hotkey_labels()} toggle live screen overlay")
 
         self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(80, 3000)
+        self.interval_spin.setRange(10, 10000)
         self.interval_spin.setValue(250)
         self.interval_spin.setSuffix(" ms")
 
@@ -72,10 +77,10 @@ class MainWindow(QMainWindow):
         self.area_spin.setValue(250)
 
         self.ocr_boxes_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ocr_boxes_slider.setRange(1, 60)
+        self.ocr_boxes_slider.setRange(1, 256)
         self.ocr_boxes_slider.setPageStep(4)
         self.ocr_boxes_slider.setTickInterval(1)
-        self.ocr_boxes_slider.setValue(8)
+        self.ocr_boxes_slider.setValue(16)
         self.ocr_boxes_value_label = QLabel(str(self.ocr_boxes_slider.value()))
         self.ocr_boxes_value_label.setMinimumWidth(28)
         self.ocr_boxes_control = QWidget()
@@ -91,24 +96,31 @@ class MainWindow(QMainWindow):
         self.translation_mode_combo = QComboBox()
         self.ocr_checkbox = QCheckBox("Enable OCR")
         self.ocr_checkbox.setChecked(True)
+        self.overlay_tracking_checkbox = QCheckBox("Track overlay while scrolling")
+        self.overlay_tracking_checkbox.setChecked(False)
+        self.overlay_tracking_mode_combo = QComboBox()
         self.ocr_device_combo = QComboBox()
 
         self.fps_label = QLabel("0.0")
         self.detected_label = QLabel("0")
         self.monitor_label = QLabel("-")
         self.status_label = QLabel("Idle")
+        self.recording_label = QLabel("Off")
         self.ocr_runtime_label = QLabel("Not running")
         self.ocr_runtime_label.setWordWrap(True)
 
         self.preview_label = self._create_image_label("Annotated preview")
         self.mask_label = self._create_image_label("Segmentation preview")
+        self.translated_preview_label = self._create_image_label("Translated preview")
         self.text_output = QPlainTextEdit()
         self.text_output.setReadOnly(True)
+        self._recording_session: RecordingSession | None = None
 
         self._build_ui()
         self._populate_ocr_device_control()
         self._populate_text_detector_control()
         self._populate_translation_mode_control()
+        self._populate_overlay_tracking_mode_control()
         self._populate_language_controls()
         self._connect_signals()
         self._refresh_monitors()
@@ -126,7 +138,8 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.refresh_button, 0, 2)
         controls_layout.addWidget(self.start_button, 0, 3)
         controls_layout.addWidget(self.stop_button, 0, 4)
-        controls_layout.addWidget(self.hotkey_label, 1, 0, 1, 5)
+        controls_layout.addWidget(self.record_button, 0, 5)
+        controls_layout.addWidget(self.hotkey_label, 1, 0, 1, 6)
 
         settings_box = QGroupBox("Pipeline Settings")
         settings_layout = QFormLayout(settings_box)
@@ -140,6 +153,8 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Translation mode", self.translation_mode_combo)
         settings_layout.addRow("OCR device", self.ocr_device_combo)
         settings_layout.addRow("", self.ocr_checkbox)
+        settings_layout.addRow("", self.overlay_tracking_checkbox)
+        settings_layout.addRow("Overlay tracking", self.overlay_tracking_mode_combo)
 
         stats_box = QGroupBox("Runtime Stats")
         stats_layout = QFormLayout(stats_box)
@@ -147,6 +162,7 @@ class MainWindow(QMainWindow):
         stats_layout.addRow("Detected boxes", self.detected_label)
         stats_layout.addRow("Monitor", self.monitor_label)
         stats_layout.addRow("Status", self.status_label)
+        stats_layout.addRow("Recording", self.recording_label)
         stats_layout.addRow("OCR runtime", self.ocr_runtime_label)
 
         top_row = QHBoxLayout()
@@ -155,8 +171,9 @@ class MainWindow(QMainWindow):
         top_row.addWidget(stats_box, 2)
 
         views = QHBoxLayout()
-        views.addWidget(self.preview_label, 2)
-        views.addWidget(self.mask_label, 2)
+        views.addWidget(self.preview_label, 1)
+        views.addWidget(self.mask_label, 1)
+        views.addWidget(self.translated_preview_label, 1)
 
         output_box = QGroupBox("Detected Text")
         output_layout = QVBoxLayout(output_box)
@@ -172,6 +189,7 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(self._refresh_monitors)
         self.start_button.clicked.connect(self._start_worker)
         self.stop_button.clicked.connect(self._stop_worker)
+        self.record_button.clicked.connect(self._toggle_recording)
         self.ocr_boxes_slider.valueChanged.connect(self._update_ocr_boxes_label)
 
     def _set_runtime_controls_locked(self, locked: bool) -> None:
@@ -187,6 +205,8 @@ class MainWindow(QMainWindow):
         self.translation_mode_combo.setEnabled(not locked)
         self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
+        self.overlay_tracking_checkbox.setEnabled(not locked)
+        self.overlay_tracking_mode_combo.setEnabled(not locked)
 
     def _populate_ocr_device_control(self) -> None:
         self.ocr_device_combo.addItem("Auto", userData="auto")
@@ -204,6 +224,11 @@ class MainWindow(QMainWindow):
         self.translation_mode_combo.addItem("Google Translate (Online)", userData="google")
         self.translation_mode_combo.addItem("Disabled", userData="disabled")
         self.translation_mode_combo.setCurrentIndex(0)
+
+    def _populate_overlay_tracking_mode_control(self) -> None:
+        self.overlay_tracking_mode_combo.addItem("Legacy motion", userData="legacy")
+        self.overlay_tracking_mode_combo.addItem("Visual anchor lock", userData="anchor")
+        self.overlay_tracking_mode_combo.setCurrentIndex(0)
 
     def _populate_language_controls(self) -> None:
         for option in source_language_options():
@@ -255,8 +280,12 @@ class MainWindow(QMainWindow):
             ocr_enabled=self.ocr_checkbox.isChecked(),
             ocr_device_preference=self.ocr_device_combo.currentData(),
             ocr_language=resolve_ocr_language(self.source_language_combo.currentData()),
+            overlay_tracking_enabled=self.overlay_tracking_checkbox.isChecked(),
+            overlay_tracking_mode=self.overlay_tracking_mode_combo.currentData(),
         )
 
+        self.overlay_window.set_tracking_mode(settings.overlay_tracking_mode)
+        self.overlay_window.set_tracking_enabled(settings.overlay_tracking_enabled)
         self.worker = ProcessingWorker(monitor=monitor, settings=settings)
         self.worker.frame_ready.connect(self._handle_frame)
         self.worker.worker_error.connect(self._handle_error)
@@ -266,10 +295,14 @@ class MainWindow(QMainWindow):
         self._set_runtime_controls_locked(True)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.record_button.setEnabled(True)
         self.worker.start()
+        if self.overlay_active and settings.overlay_tracking_enabled:
+            self._start_overlay_tracker(monitor)
 
     def _stop_worker(self) -> None:
         self._overlay_started_worker = False
+        self._stop_recording()
         if self.overlay_active:
             self._hide_overlay()
         if self.worker is None:
@@ -277,10 +310,13 @@ class MainWindow(QMainWindow):
         self.worker.stop()
 
     def _on_worker_finished(self) -> None:
+        self._stop_recording()
+        self._stop_overlay_tracker()
         self.worker = None
         self._set_runtime_controls_locked(False)
         self.start_button.setEnabled(bool(self.monitors))
         self.stop_button.setEnabled(False)
+        self.record_button.setEnabled(False)
         self._overlay_started_worker = False
         if self._base_status != "Error":
             self._set_base_status("Stopped")
@@ -293,8 +329,13 @@ class MainWindow(QMainWindow):
         self._stop_worker()
 
     def _handle_frame(self, analysis: FrameAnalysis) -> None:
+        translated_preview = self._translated_preview_frame(analysis)
+        analysis.translated_preview = translated_preview
         self.preview_label.setPixmap(self._frame_to_pixmap(analysis.annotated_frame, self.preview_label))
         self.mask_label.setPixmap(self._frame_to_pixmap(analysis.processed_preview, self.mask_label))
+        self.translated_preview_label.setPixmap(
+            self._frame_to_pixmap(translated_preview, self.translated_preview_label)
+        )
 
         if analysis.fps < 1.0:
             self.fps_label.setText(f"{analysis.fps:.2f}")
@@ -307,6 +348,12 @@ class MainWindow(QMainWindow):
 
         if self.overlay_active:
             self.overlay_window.update_analysis(analysis)
+
+        if self._recording_session is not None:
+            try:
+                self._recording_session.write_frame(analysis)
+            except Exception as exc:
+                self._handle_recording_error(str(exc))
 
         if analysis.boxes:
             lines = []
@@ -353,6 +400,8 @@ class MainWindow(QMainWindow):
             return
 
         self.overlay_window.show_for_monitor(monitor)
+        self.overlay_window.set_tracking_mode(self.overlay_tracking_mode_combo.currentData())
+        self.overlay_window.set_tracking_enabled(self.overlay_tracking_checkbox.isChecked())
         self.overlay_window.clear_analysis()
         self.overlay_active = True
 
@@ -361,6 +410,8 @@ class MainWindow(QMainWindow):
             self._start_worker()
             return
 
+        if self.overlay_tracking_checkbox.isChecked():
+            self._start_overlay_tracker(monitor)
         self._overlay_started_worker = False
         self._refresh_status_label()
 
@@ -373,10 +424,44 @@ class MainWindow(QMainWindow):
             self.worker.stop()
 
     def _hide_overlay(self) -> None:
+        self._stop_overlay_tracker()
         self.overlay_active = False
         self.overlay_window.clear_analysis()
         self.overlay_window.hide()
         self._refresh_status_label()
+
+    def _start_overlay_tracker(self, monitor: MonitorSpec) -> None:
+        if self.overlay_tracker is not None:
+            return
+
+        self.overlay_window.set_realtime_tracking_active(True)
+        self.overlay_tracker = OverlayTrackingWorker(monitor)
+        self.overlay_tracker.frame_ready.connect(self._handle_overlay_tracking_frame)
+        self.overlay_tracker.worker_error.connect(self._handle_overlay_tracker_error)
+        self.overlay_tracker.finished.connect(self._on_overlay_tracker_finished)
+        self.overlay_tracker.start()
+        self._refresh_status_label()
+
+    def _stop_overlay_tracker(self) -> None:
+        tracker = self.overlay_tracker
+        self.overlay_tracker = None
+        self.overlay_window.set_realtime_tracking_active(False)
+        if tracker is not None:
+            tracker.stop()
+        self._refresh_status_label()
+
+    def _on_overlay_tracker_finished(self) -> None:
+        self.overlay_tracker = None
+        self.overlay_window.set_realtime_tracking_active(False)
+        self._refresh_status_label()
+
+    def _handle_overlay_tracking_frame(self, tracking_frame: object) -> None:
+        if self.overlay_active:
+            self.overlay_window.apply_tracking_frame(tracking_frame)
+
+    def _handle_overlay_tracker_error(self, message: str) -> None:
+        self._stop_overlay_tracker()
+        self._set_base_status(f"{self._base_status} | Overlay tracking unavailable: {message}")
 
     def _set_base_status(self, text: str) -> None:
         self._base_status = text
@@ -386,7 +471,51 @@ class MainWindow(QMainWindow):
         status = self._base_status
         if self.overlay_active:
             status = f"{status} | Overlay ON"
+        if self.overlay_tracker is not None:
+            status = f"{status} | Tracking ON"
+        if self._recording_session is not None:
+            status = f"{status} | Recording ON"
         self.status_label.setText(status)
+
+    def _toggle_recording(self) -> None:
+        if self._recording_session is not None:
+            self._stop_recording()
+            return
+        self._start_recording()
+
+    def _start_recording(self) -> None:
+        if self.worker is None:
+            QMessageBox.warning(self, "ScreenLens-Detection", "Start processing before recording.")
+            return
+
+        try:
+            self._recording_session = RecordingSession(fps=recording_fps_from_settings(self.worker.settings))
+        except Exception as exc:
+            self._handle_recording_error(str(exc))
+            return
+
+        self.record_button.setText("Stop Recording")
+        self.recording_label.setText(str(self._recording_session.directory))
+        self._refresh_status_label()
+
+    def _stop_recording(self) -> None:
+        session = self._recording_session
+        self._recording_session = None
+        if session is not None:
+            session.close()
+        self.record_button.setText("Start Recording")
+        self.recording_label.setText("Off")
+        self._refresh_status_label()
+
+    def _handle_recording_error(self, message: str) -> None:
+        session = self._recording_session
+        self._recording_session = None
+        if session is not None:
+            session.close()
+        self.record_button.setText("Start Recording")
+        self.recording_label.setText("Error")
+        self._refresh_status_label()
+        QMessageBox.critical(self, "ScreenLens-Detection", f"Recording failed: {message}")
 
     def _ensure_hotkeys_registered(self) -> None:
         if self._hotkeys_registered or sys.platform != "win32":
@@ -420,10 +549,69 @@ class MainWindow(QMainWindow):
         self.ocr_boxes_value_label.setText(str(value))
 
     @staticmethod
+    def _translated_preview_frame(analysis: FrameAnalysis) -> np.ndarray:
+        frame = analysis.source_frame
+        if frame is None:
+            frame = analysis.annotated_frame
+        preview = np.asarray(frame).copy()
+        if preview.ndim != 3 or preview.shape[2] != 3:
+            return np.asarray(analysis.annotated_frame).copy()
+
+        rgb = cv2.cvtColor(np.ascontiguousarray(preview), cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb.shape
+        image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
+        image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        painter = QPainter(image)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            for box in analysis.boxes:
+                text = overlay_text_for_box(box)
+                if not text:
+                    continue
+                MainWindow._paint_translated_preview_box(painter, QRect(box.x, box.y, box.w, box.h), text)
+        finally:
+            painter.end()
+
+        buffer = np.frombuffer(image.bits(), dtype=np.uint8)
+        rgba = buffer.reshape((image.height(), image.bytesPerLine()))[:, : image.width() * 4]
+        rgba = rgba.reshape((image.height(), image.width(), 4)).copy()
+        return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+
+    @staticmethod
+    def _paint_translated_preview_box(painter: QPainter, rect: QRect, text: str) -> None:
+        accent = QColor(48, 231, 149, 220)
+        background = QColor(15, 23, 42, 212)
+        text_color = QColor(248, 250, 252)
+
+        bubble_rect = rect.adjusted(0, 0, -1, -1)
+        radius = max(min(rect.height() // 4, 8), 2)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(background)
+        painter.drawRoundedRect(bubble_rect, radius, radius)
+
+        painter.setPen(QPen(accent, 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(bubble_rect, radius, radius)
+
+        horizontal_padding = max(min(rect.height() // 4, 12), 2)
+        vertical_padding = max(min(rect.height() // 8, 6), 1)
+        text_rect = bubble_rect.adjusted(horizontal_padding, vertical_padding, -horizontal_padding, -vertical_padding)
+        if text_rect.width() <= 0 or text_rect.height() <= 0:
+            text_rect = bubble_rect
+
+        painter.setFont(TranslationOverlay._font_for_text(text, text_rect, overlay_font_pixel_size(rect.height())))
+        painter.setPen(text_color)
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap,
+            text,
+        )
+
+    @staticmethod
     def _create_image_label(placeholder: str) -> QLabel:
         label = QLabel(placeholder)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setMinimumSize(520, 320)
+        label.setMinimumSize(360, 240)
         label.setStyleSheet(
             "QLabel { background: #111827; color: #d1d5db; border: 1px solid #374151; }"
         )

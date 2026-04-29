@@ -15,6 +15,7 @@ from .languages import (
     language_label,
 )
 from .models import DetectionBox, FrameAnalysis, PipelineSettings
+from .motion import estimate_grayscale_offset
 from .ocr import OCRBackend
 from .text_detectors import (
     TextDetectorBackend,
@@ -65,6 +66,10 @@ class TextDetectionPipeline:
         motion_filtered_boxes = self._filter_motion_ocr_boxes(stable_working_boxes, enhanced_gray)
         boxes = self._annotate_with_ocr(motion_filtered_boxes, enhanced_gray, frame.shape, scale)
         boxes = self._apply_translations(boxes)
+        content_offset_x, content_offset_y, content_motion_confidence = self._estimate_content_offset(
+            enhanced_gray,
+            scale,
+        )
         self._previous_motion_gray = enhanced_gray.copy()
 
         annotated = self._draw_annotations(frame.copy(), boxes)
@@ -75,11 +80,15 @@ class TextDetectionPipeline:
             annotated_frame=annotated,
             processed_preview=processed_preview,
             boxes=boxes,
+            source_frame=frame.copy(),
             status=self._status_message(),
             ocr_runtime=self.ocr_backend.runtime_diagnostics(),
             fps=1.0 / elapsed,
             ocr_available=self.ocr_backend.is_available(),
             monitor_label=monitor_label,
+            content_offset_x=content_offset_x,
+            content_offset_y=content_offset_y,
+            content_motion_confidence=content_motion_confidence,
         )
 
     def _scale_frame(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
@@ -495,6 +504,20 @@ class TextDetectionPipeline:
             and changed_ratio >= self.settings.motion_changed_ratio_threshold
         )
 
+    def _estimate_content_offset(self, enhanced_gray: np.ndarray, scale: float) -> tuple[float, float, float]:
+        if not self.settings.overlay_tracking_enabled:
+            return 0.0, 0.0, 0.0
+        if self._previous_motion_gray is None or self._previous_motion_gray.shape != enhanced_gray.shape:
+            return 0.0, 0.0, 0.0
+        return estimate_grayscale_offset(
+            self._previous_motion_gray,
+            enhanced_gray,
+            source_scale=scale,
+            max_dimension=360,
+            min_response=0.08,
+            max_offset_ratio=0.35,
+        )
+
     @staticmethod
     def _intersection_over_union(
         first: tuple[int, int, int, int],
@@ -511,7 +534,8 @@ class TextDetectionPipeline:
 
     def _apply_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
         if not boxes:
-            self._recent_translations = []
+            if not self.settings.overlay_tracking_enabled:
+                self._recent_translations = []
             return boxes
 
         translated_boxes = self._reuse_recent_translations(boxes)
@@ -568,16 +592,19 @@ class TextDetectionPipeline:
             if recent.target_language_code != box.target_language_code:
                 continue
 
-            overlap = self._intersection_area(current_rect, (recent.x, recent.y, recent.w, recent.h)) / current_area
-            if overlap < 0.35:
-                continue
-
             recent_text = self._normalize_text_for_matching(recent.text)
             if not recent_text:
                 continue
 
             similarity = SequenceMatcher(None, current_text, recent_text).ratio()
-            score = (overlap * 0.55) + (similarity * 0.45)
+            overlap = self._intersection_area(current_rect, (recent.x, recent.y, recent.w, recent.h)) / current_area
+            if overlap < 0.35:
+                if not self.settings.overlay_tracking_enabled or similarity < 0.88:
+                    continue
+                score = similarity * 0.90
+            else:
+                score = (overlap * 0.55) + (similarity * 0.45)
+
             if similarity >= 0.45 and score > best_score:
                 best_score = score
                 best_translation = recent.translated_text
@@ -615,8 +642,30 @@ class TextDetectionPipeline:
 
     def _remember_translations(self, boxes: list[DetectionBox]) -> None:
         remembered = [box for box in boxes if box.translated_text]
-        remembered.sort(key=self._translation_priority, reverse=True)
-        self._recent_translations = remembered[: max(self.settings.max_ocr_boxes_per_frame * 3, 24)]
+        if self.settings.overlay_tracking_enabled:
+            remembered.extend(recent for recent in self._recent_translations if recent.translated_text)
+
+        deduped: list[DetectionBox] = []
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        for box in remembered:
+            normalized_text = self._normalize_text_for_matching(box.text)
+            if not normalized_text:
+                continue
+            key = (
+                box.source_language_code,
+                box.target_language_code,
+                normalized_text,
+                box.translated_text,
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(box)
+
+        deduped.sort(key=self._translation_priority, reverse=True)
+        multiplier = 6 if self.settings.overlay_tracking_enabled else 3
+        minimum = 60 if self.settings.overlay_tracking_enabled else 24
+        self._recent_translations = deduped[: max(self.settings.max_ocr_boxes_per_frame * multiplier, minimum)]
 
     def _merge_text_boxes(
         self,

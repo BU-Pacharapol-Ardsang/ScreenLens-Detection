@@ -52,6 +52,8 @@ class PipelineSettings:
     motion_filter_enabled: bool = True
     motion_mean_threshold: float = 18.0
     motion_changed_ratio_threshold: float = 0.20
+    overlay_tracking_enabled: bool = False
+    overlay_tracking_mode: str = "legacy"
 
 
 @dataclass(slots=True, frozen=True)
@@ -109,6 +111,11 @@ class FrameAnalysis:
     fps: float = 0.0
     ocr_available: bool = False
     monitor_label: str = ""
+    content_offset_x: float = 0.0
+    content_offset_y: float = 0.0
+    content_motion_confidence: float = 0.0
+    source_frame: object | None = None
+    translated_preview: object | None = None
 
     @property
     def detected_text(self) -> list[str]:
