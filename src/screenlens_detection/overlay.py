@@ -1160,8 +1160,8 @@ class TranslationOverlay(QWidget):
                 current_boxes,
                 self._predict_tracked_boxes(analysis),
             )
-            if self._tracking_mode == "anchor" and current_boxes:
-                self._capture_visual_anchors(current_boxes)
+            if self._tracking_mode == "anchor" and self._overlay_boxes:
+                self._capture_visual_anchors(self._overlay_boxes)
         elif current_boxes:
             self._track_manager.max_visible_tracks = self._max_visible_overlay_boxes
             self._overlay_boxes = self._track_manager.replace_with_observations(current_boxes)
@@ -1172,8 +1172,6 @@ class TranslationOverlay(QWidget):
 
     def _predict_tracked_boxes(self, analysis: FrameAnalysis) -> list[OverlayBox]:
         if not self._overlay_boxes:
-            return []
-        if self._tracking_mode == "anchor" and self._realtime_tracking_active:
             return []
         if self._realtime_tracking_active:
             return self._offset_overlay_boxes(self._overlay_boxes, 0, 0, increment_missing=True)

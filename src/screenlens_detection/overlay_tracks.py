@@ -59,15 +59,40 @@ class OverlayTrackManager:
     ) -> list[OverlayBox]:
         used_track_ids: set[int] = set()
 
+        predicted_matches: dict[int, OverlayBox] = {}
+        predicted_used_ids: set[int] = set()
+        for predicted in predicted_boxes:
+            if predicted.missing_frames > self.max_predicted_frames:
+                continue
+            match = self._find_best_track(predicted, predicted_used_ids, allow_hidden=False)
+            if match is not None:
+                predicted_matches[match.track_id] = predicted
+                predicted_used_ids.add(match.track_id)
+
         for observation in observations:
             match = self._find_best_track(observation, used_track_ids, allow_hidden=True)
-            visible_observation = self._as_visible(observation, missing_frames=0)
             if match is None:
+                visible_observation = self._as_visible(observation, missing_frames=0)
                 self._tracks.append(self._new_track(visible_observation, state="active"))
                 used_track_ids.add(self._tracks[-1].track_id)
                 continue
 
-            self._refresh_track(match, visible_observation, state="active")
+            predicted = predicted_matches.get(match.track_id)
+            if predicted is not None:
+                merged_box = OverlayBox(
+                    x=predicted.x,
+                    y=predicted.y,
+                    w=predicted.w,
+                    h=predicted.h,
+                    text=observation.text,
+                    missing_frames=0,
+                    translated=observation.translated,
+                )
+                self._refresh_track(match, merged_box, state="active")
+            else:
+                visible_observation = self._as_visible(observation, missing_frames=0)
+                self._refresh_track(match, visible_observation, state="active")
+
             used_track_ids.add(match.track_id)
 
         for predicted in predicted_boxes:
