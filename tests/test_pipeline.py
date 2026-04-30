@@ -103,6 +103,22 @@ class RecordingOCRBackend(OCRBackend):
         return OCRResult(text="demo", confidence=95.0)
 
 
+class BatchRecordingOCRBackend(RecordingOCRBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_calls: list[tuple[int, str, list[int]]] = []
+
+    def recognize(self, image: object, *, language: str, psm: int) -> OCRResult:
+        raise AssertionError("pipeline should use recognize_batch for frame OCR")
+
+    def recognize_batch(self, images: list[object], *, language: str, psms: list[int]) -> list[OCRResult]:
+        self.batch_calls.append((len(images), language, list(psms)))
+        return [
+            OCRResult(text=f"demo {index}", confidence=95.0)
+            for index, _image in enumerate(images, start=1)
+        ]
+
+
 def test_pipeline_limits_ocr_boxes_per_frame() -> None:
     backend = RecordingOCRBackend()
     pipeline = TextDetectionPipeline(
@@ -128,6 +144,32 @@ def test_pipeline_limits_ocr_boxes_per_frame() -> None:
 
     assert len(detected) == 2
     assert len(backend.calls) == 2
+
+
+def test_pipeline_batches_ocr_crops_per_frame() -> None:
+    backend = BatchRecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=4,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+
+    working_boxes = [
+        (10, 10, 120, 28),
+        (20, 60, 160, 30),
+        (30, 110, 240, 32),
+    ]
+    gray = np.full((180, 360), 255, dtype=np.uint8)
+
+    detected = pipeline._annotate_with_ocr(working_boxes, gray, (180, 360, 3), 1.0)
+
+    assert backend.batch_calls == [(3, "eng", [7, 7, 7])]
+    assert [box.text for box in detected] == ["demo 1", "demo 2", "demo 3"]
 
 
 def test_pipeline_keeps_detector_boxes_when_ocr_backend_is_unavailable() -> None:

@@ -32,7 +32,6 @@ from ..overlay import TranslationOverlay, overlay_font_pixel_size, overlay_text_
 from ..overlay_tracker import OverlayTrackingWorker
 from ..recording import RecordingSession, recording_fps_from_settings
 from ..text_detectors import text_detector_options
-from ..windows_capture_exclusion import set_window_capture_exclusion
 from ..windows_hotkeys import extract_hotkey_id, hotkey_labels, register_window_hotkeys, unregister_window_hotkeys
 from ..worker import ProcessingWorker
 
@@ -50,7 +49,6 @@ class MainWindow(QMainWindow):
         self.overlay_active = False
         self._overlay_started_worker = False
         self._hotkeys_registered = False
-        self._capture_exclusion_applied = False
         self._base_status = "Idle"
 
         self.monitor_combo = QComboBox()
@@ -365,7 +363,6 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event: object) -> None:
         super().showEvent(event)
-        self._ensure_capture_exclusion()
         self._ensure_hotkeys_registered()
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -531,12 +528,6 @@ class MainWindow(QMainWindow):
             self.hotkey_label.setText(
                 f"Global hotkeys active: {hotkey_labels()} toggle live screen overlay"
             )
-
-    def _ensure_capture_exclusion(self) -> None:
-        if self._capture_exclusion_applied:
-            return
-
-        self._capture_exclusion_applied = set_window_capture_exclusion(int(self.winId()))
 
     def _unregister_hotkeys(self) -> None:
         if not self._hotkeys_registered or sys.platform != "win32":

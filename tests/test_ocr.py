@@ -71,3 +71,47 @@ def test_easyocr_backend_maps_languages_and_aggregates_results(monkeypatch) -> N
     assert prepared.shape[0] > 18
     assert result.text == "BBC security"
     assert result.confidence == 90.0
+
+
+def test_easyocr_backend_batches_pre_detected_crops(monkeypatch) -> None:
+    class FakeReader:
+        recognize_calls: list[tuple[tuple[int, ...], int, bool, list[list[int]]]] = []
+
+        def __init__(self, languages: list[str], *, gpu: bool, verbose: bool) -> None:
+            self.languages = tuple(languages)
+
+        def recognize(
+            self,
+            image: np.ndarray,
+            *,
+            horizontal_list: list[list[int]],
+            free_list: list[object],
+            detail: int,
+            paragraph: bool,
+            batch_size: int,
+            reformat: bool,
+        ):
+            self.recognize_calls.append((image.shape, batch_size, reformat, horizontal_list))
+            return [
+                ([[0, 0], [30, 0], [30, 10], [0, 10]], "first", 0.90),
+                ([[0, 26], [20, 26], [20, 38], [0, 38]], "second", 0.80),
+            ]
+
+    monkeypatch.setattr("screenlens_detection.ocr.EasyOCRReader", FakeReader)
+    monkeypatch.setattr("screenlens_detection.ocr._nvidia_cuda_available", lambda: True)
+
+    backend = EasyOCRBackend(device_preference="gpu")
+    results = backend.recognize_batch(
+        [
+            np.full((10, 30), 255, dtype=np.uint8),
+            np.full((12, 20), 255, dtype=np.uint8),
+        ],
+        language="eng",
+        psms=[7, 7],
+    )
+
+    assert [result.text for result in results] == ["first", "second"]
+    assert [result.confidence for result in results] == [90.0, 80.0]
+    assert FakeReader.recognize_calls == [
+        ((38, 30), 2, False, [[0, 30, 0, 10], [0, 20, 26, 38]])
+    ]
