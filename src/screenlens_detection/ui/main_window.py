@@ -50,6 +50,7 @@ class MainWindow(QMainWindow):
         self._overlay_started_worker = False
         self._hotkeys_registered = False
         self._base_status = "Idle"
+        defaults = PipelineSettings()
 
         self.monitor_combo = QComboBox()
         self.refresh_button = QPushButton("Refresh Monitors")
@@ -62,23 +63,23 @@ class MainWindow(QMainWindow):
 
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(10, 10000)
-        self.interval_spin.setValue(250)
+        self.interval_spin.setValue(defaults.capture_interval_ms)
         self.interval_spin.setSuffix(" ms")
 
         self.scale_spin = QDoubleSpinBox()
         self.scale_spin.setRange(1.0, 3.0)
         self.scale_spin.setSingleStep(0.25)
-        self.scale_spin.setValue(1.5)
+        self.scale_spin.setValue(defaults.upscale_factor)
 
         self.area_spin = QSpinBox()
         self.area_spin.setRange(50, 10000)
-        self.area_spin.setValue(250)
+        self.area_spin.setValue(defaults.min_contour_area)
 
         self.ocr_boxes_slider = QSlider(Qt.Orientation.Horizontal)
         self.ocr_boxes_slider.setRange(1, 256)
         self.ocr_boxes_slider.setPageStep(4)
         self.ocr_boxes_slider.setTickInterval(1)
-        self.ocr_boxes_slider.setValue(16)
+        self.ocr_boxes_slider.setValue(defaults.max_ocr_boxes_per_frame)
         self.ocr_boxes_value_label = QLabel(str(self.ocr_boxes_slider.value()))
         self.ocr_boxes_value_label.setMinimumWidth(28)
         self.ocr_boxes_control = QWidget()

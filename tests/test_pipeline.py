@@ -93,6 +93,53 @@ def test_pipeline_detects_document_lines_without_merging_whole_paragraph() -> No
     assert max(box.h for box in article_boxes) < 60
 
 
+def test_pipeline_detects_overlay_text_on_complex_video_frame() -> None:
+    rng = np.random.default_rng(5)
+    canvas = np.zeros((360, 960, 3), dtype=np.uint8)
+    canvas[:] = (8, 16, 25)
+    for _index in range(160):
+        start = (int(rng.integers(0, 960)), int(rng.integers(0, 360)))
+        end = (int(rng.integers(0, 960)), int(rng.integers(0, 360)))
+        color = tuple(int(value) for value in rng.integers(5, 80, size=3))
+        cv2.line(canvas, start, end, color, int(rng.integers(1, 3)), cv2.LINE_AA)
+
+    cv2.putText(
+        canvas,
+        "MISSION OBJECTIVE UPDATED",
+        (120, 260),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (0, 0, 0),
+        4,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "MISSION OBJECTIVE UPDATED",
+        (120, 260),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (235, 235, 235),
+        2,
+        cv2.LINE_AA,
+    )
+
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(upscale_factor=1.0, min_contour_area=100, max_boxes=50, ocr_enabled=False),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    analysis = pipeline.process(canvas, monitor_label="synthetic-video")
+
+    target = (110, 230, 430, 40)
+    assert any(_target_coverage((box.x, box.y, box.w, box.h), target) >= 0.65 for box in analysis.boxes)
+
+
+def _target_coverage(box: tuple[int, int, int, int], target: tuple[int, int, int, int]) -> float:
+    intersection = TextDetectionPipeline._intersection_area(box, target)
+    return intersection / max(target[2] * target[3], 1)
+
+
 class RecordingOCRBackend(OCRBackend):
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
@@ -174,6 +221,31 @@ def test_pipeline_batches_ocr_crops_per_frame() -> None:
     assert [box.text for box in detected] == ["demo 1", "demo 2", "demo 3"]
 
 
+def test_pipeline_skips_likely_browser_toolbar_before_ocr() -> None:
+    backend = BatchRecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=8,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+
+    working_boxes = [
+        (540, 36, 1320, 80),
+        (260, 620, 620, 46),
+    ]
+    gray = np.full((1080, 1920), 255, dtype=np.uint8)
+
+    detected = pipeline._annotate_with_ocr(working_boxes, gray, (1080, 1920, 3), 1.0)
+
+    assert backend.batch_calls == [(1, "eng", [7])]
+    assert [(box.x, box.y, box.w, box.h) for box in detected] == [(260, 620, 620, 46)]
+
+
 def test_pipeline_reuses_ocr_results_for_unchanged_crops() -> None:
     backend = BatchRecordingOCRBackend()
     pipeline = TextDetectionPipeline(
@@ -226,6 +298,30 @@ def test_pipeline_invalidates_cached_ocr_when_crop_changes() -> None:
     assert backend.batch_calls == [(1, "eng", [7]), (1, "eng", [7])]
 
 
+def test_pipeline_reuses_cached_ocr_for_motion_adjusted_box() -> None:
+    backend = BatchRecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=4,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+
+    gray = np.full((80, 220), 255, dtype=np.uint8)
+
+    first = pipeline._annotate_with_ocr([(10, 10, 120, 28)], gray, (80, 220, 3), 1.0)
+    pipeline._current_scaled_motion_offset = (20.0, 0.0, 0.24)
+    second = pipeline._annotate_with_ocr([(30, 10, 120, 28)], gray, (80, 220, 3), 1.0)
+
+    assert [box.text for box in first] == ["demo 1"]
+    assert [box.text for box in second] == ["demo 1"]
+    assert backend.batch_calls == [(1, "eng", [7])]
+
+
 def test_pipeline_keeps_detector_boxes_when_ocr_backend_is_unavailable() -> None:
     pipeline = TextDetectionPipeline(
         PipelineSettings(upscale_factor=1.0, ocr_enabled=True),
@@ -266,6 +362,7 @@ def test_pipeline_rejects_moving_ocr_boxes_until_they_stabilize() -> None:
 def test_pipeline_filters_boxes_with_large_frame_to_frame_motion() -> None:
     pipeline = TextDetectionPipeline(
         PipelineSettings(
+            motion_filter_enabled=True,
             motion_mean_threshold=10.0,
             motion_changed_ratio_threshold=0.10,
         ),
@@ -283,6 +380,7 @@ def test_pipeline_filters_boxes_with_large_frame_to_frame_motion() -> None:
 def test_pipeline_keeps_static_boxes_when_motion_filter_is_active() -> None:
     pipeline = TextDetectionPipeline(
         PipelineSettings(
+            motion_filter_enabled=True,
             motion_mean_threshold=10.0,
             motion_changed_ratio_threshold=0.10,
         ),
@@ -320,6 +418,16 @@ def test_pipeline_normalizes_stray_thai_noise_from_english_ocr() -> None:
     )
 
     assert normalized == "according to senior officials. It does not have nuclear weapons"
+
+
+def test_pipeline_rejects_toolbar_icon_garbage_ocr() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    assert pipeline._is_usable_text("8 O & 0 @ 60 Chat + auit", 64.0) is False
 
 
 class FirstOnlyTranslationBackend(TranslationBackend):
@@ -566,7 +674,7 @@ def test_pipeline_reuses_tracked_translation_after_blank_and_scroll() -> None:
     assert backend.calls == 1
 
 
-def test_pipeline_clears_recent_translation_without_overlay_tracking() -> None:
+def test_pipeline_reuses_recent_translation_across_short_blank_without_overlay_tracking() -> None:
     backend = OneShotTranslationBackend()
     pipeline = TextDetectionPipeline(
         PipelineSettings(overlay_tracking_enabled=False),
@@ -601,5 +709,86 @@ def test_pipeline_clears_recent_translation_without_overlay_tracking() -> None:
     ]
     moved_result = pipeline._apply_translations(moved_frame)
 
+    assert moved_result[0].translated_text.startswith("translated:")
+    assert backend.calls == 1
+
+
+def test_pipeline_clears_recent_translation_after_extended_blank_without_overlay_tracking() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(overlay_tracking_enabled=False),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=200,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    pipeline._apply_translations(first_frame)
+    pipeline._apply_translations([])
+    pipeline._apply_translations([])
+    pipeline._apply_translations([])
+
+    moved_frame = [
+        DetectionBox(
+            x=100,
+            y=520,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    moved_result = pipeline._apply_translations(moved_frame)
+
     assert moved_result[0].translated_text == ""
     assert backend.calls == 2
+
+
+def test_pipeline_reuses_recent_translation_for_textless_moving_box() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(overlay_tracking_enabled=False),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=200,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    first_result = pipeline._apply_translations(first_frame)
+    pipeline._current_motion_offset = (0.0, 36.0, 0.24)
+
+    moving_frame = [
+        DetectionBox(
+            x=100,
+            y=236,
+            w=900,
+            h=48,
+            text="",
+            target_language_code="tha",
+            target_language_label="Thai",
+        )
+    ]
+    moving_result = pipeline._apply_translations(moving_frame)
+
+    assert moving_result[0].text == first_frame[0].text
+    assert moving_result[0].translated_text == first_result[0].translated_text
+    assert backend.calls == 1

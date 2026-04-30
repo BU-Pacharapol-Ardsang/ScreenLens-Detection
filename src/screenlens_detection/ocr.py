@@ -121,6 +121,11 @@ class QueuedOCRBackend(OCRBackend):
         return f"{self._underlying.describe()} (queued)"
 
     def runtime_diagnostics(self) -> str:
+        if self._synchronous_batch_size > 0:
+            return (
+                f"{self._underlying.runtime_diagnostics()} | "
+                f"hybrid OCR queue, sync first {self._synchronous_batch_size}"
+            )
         return f"{self._underlying.runtime_diagnostics()} | async OCR queue"
 
     def prepare_image(self, image: np.ndarray) -> np.ndarray:
@@ -166,6 +171,10 @@ class QueuedOCRBackend(OCRBackend):
                 )[: self._synchronous_batch_size]
 
         if sync_indices:
+            sync_keys = {keys[index] for index in sync_indices}
+            with self._condition:
+                self._remove_queued_keys_locked(sync_keys)
+
             missing_images = [arrays[index] for index in sync_indices]
             missing_psms = [keys[index].psm for index in sync_indices]
             try:
@@ -209,6 +218,13 @@ class QueuedOCRBackend(OCRBackend):
         while len(self._queue) >= self._max_queue_size:
             dropped = self._queue.popleft()
             self._queued_keys.discard(dropped.key)
+
+    def _remove_queued_keys_locked(self, keys: set[_OCRCacheKey]) -> None:
+        if not keys or not self._queue:
+            return
+
+        self._queue = deque(item for item in self._queue if item.key not in keys)
+        self._queued_keys.difference_update(keys)
 
     def close(self) -> None:
         with self._condition:
@@ -539,6 +555,7 @@ class TesseractOCRBackend(OCRBackend):
     def __init__(self) -> None:
         self._binary = self._resolve_binary()
         self._tessdata_dir = self._resolve_tessdata_dir(self._binary)
+        self._available_languages = self._resolve_available_languages(self._tessdata_dir)
         if self._binary and pytesseract is not None:
             pytesseract.pytesseract.tesseract_cmd = self._binary
         if self._tessdata_dir:
@@ -596,6 +613,16 @@ class TesseractOCRBackend(OCRBackend):
                 return str(candidate)
         return None
 
+    @staticmethod
+    def _resolve_available_languages(tessdata_dir: str | None) -> set[str]:
+        if not tessdata_dir:
+            return set()
+
+        try:
+            return {path.stem for path in Path(tessdata_dir).glob("*.traineddata")}
+        except OSError:
+            return set()
+
     def is_available(self) -> bool:
         return self._binary is not None and pytesseract is not None
 
@@ -631,6 +658,7 @@ class TesseractOCRBackend(OCRBackend):
         if not self.is_available():
             return OCRResult()
 
+        language = self._resolve_requested_language(language)
         config = f"--oem 3 --psm {psm}"
         candidates = self._build_candidates(np.asarray(image))
         best = OCRResult()
@@ -644,6 +672,20 @@ class TesseractOCRBackend(OCRBackend):
                 best_score = score
 
         return best
+
+    def _resolve_requested_language(self, language: str) -> str:
+        requested = [token.strip() for token in language.split("+") if token.strip()]
+        if not requested or not self._available_languages:
+            return language
+
+        available = [token for token in requested if token in self._available_languages]
+        if available:
+            return "+".join(available)
+
+        fallback = [token for token in ("eng", "tha") if token in self._available_languages]
+        if fallback:
+            return "+".join(fallback)
+        return language
 
     def _build_candidates(self, image: np.ndarray) -> list[np.ndarray]:
         normalized = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -737,7 +779,7 @@ def _maybe_queue_ocr_backend(backend: OCRBackend) -> OCRBackend:
     async_setting = os.getenv("SCREENLENS_OCR_ASYNC", "1").strip().lower()
     if async_setting in {"0", "false", "no", "off", "disabled"}:
         return backend
-    sync_batch_size = _parse_non_negative_int(os.getenv("SCREENLENS_OCR_SYNC_BATCH_SIZE"), default=4)
+    sync_batch_size = _parse_non_negative_int(os.getenv("SCREENLENS_OCR_SYNC_BATCH_SIZE"), default=2)
     return QueuedOCRBackend(backend, synchronous_batch_size=sync_batch_size)
 
 
