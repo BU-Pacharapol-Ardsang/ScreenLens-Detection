@@ -28,7 +28,7 @@ class OverlayTrackingWorker(QThread):
     def __init__(self, monitor: MonitorSpec, *, interval_ms: int = 120) -> None:
         super().__init__()
         self.monitor = monitor
-        self.interval_ms = max(interval_ms, 80)
+        self.interval_ms = max(interval_ms, 90)
         self._running = False
 
     def run(self) -> None:
@@ -50,7 +50,7 @@ class OverlayTrackingWorker(QThread):
                         previous_gray,
                         current_gray,
                         source_scale=frame_scale,
-                        max_dimension=420,
+                        max_dimension=320,
                         min_response=0.10,
                         max_offset_ratio=0.30,
                     )
@@ -74,7 +74,7 @@ class OverlayTrackingWorker(QThread):
     def _prepare_tracking_frame(frame: np.ndarray) -> tuple[np.ndarray, float]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         height, width = gray.shape[:2]
-        frame_scale = min(1.0, 960.0 / max(height, width))
+        frame_scale = min(1.0, 640.0 / max(height, width))
         if frame_scale < 1.0:
             gray = cv2.resize(
                 gray,

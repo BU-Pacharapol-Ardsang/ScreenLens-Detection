@@ -52,6 +52,12 @@ class OCRBackend:
     def recognize(self, image: object, *, language: str, psm: int) -> OCRResult:
         return OCRResult()
 
+    def recognize_batch(self, images: list[object], *, language: str, psms: list[int]) -> list[OCRResult]:
+        return [
+            self.recognize(image, language=language, psm=psm)
+            for image, psm in zip(images, psms, strict=False)
+        ]
+
 
 class NoOpOCRBackend(OCRBackend):
     name = "disabled"
@@ -141,10 +147,53 @@ class EasyOCRBackend(OCRBackend):
         except Exception:
             return OCRResult()
 
+        return self._aggregate_results(results)
+
+    def recognize_batch(self, images: list[object], *, language: str, psms: list[int]) -> list[OCRResult]:
+        if not images:
+            return []
+        if not self.is_available():
+            return [OCRResult() for _image in images]
+        if len(images) == 1:
+            psm = psms[0] if psms else 7
+            return [self.recognize(images[0], language=language, psm=psm)]
+
+        try:
+            reader = self._get_reader(language)
+            arrays = [self._ensure_batch_image(image) for image in images]
+            canvas, regions = self._tile_batch_images(arrays)
+            horizontal_list = [[0, width, top, bottom] for top, bottom, width in regions]
+            raw_results = reader.recognize(
+                canvas,
+                horizontal_list=horizontal_list,
+                free_list=[],
+                detail=1,
+                paragraph=False,
+                batch_size=max(len(arrays), 1),
+                reformat=False,
+            )
+        except Exception:
+            return [OCRResult() for _image in images]
+
+        grouped_results: list[list[tuple[object, object, object]]] = [[] for _image in images]
+        fallback_index = 0
+        for result in sorted(raw_results, key=self._result_sort_key):
+            region_index = self._result_region_index(result, regions)
+            if region_index is None:
+                if fallback_index >= len(grouped_results):
+                    continue
+                region_index = fallback_index
+                fallback_index += 1
+            grouped_results[region_index].append(result)
+
+        return [self._aggregate_results(results) for results in grouped_results]
+
+    @staticmethod
+    def _aggregate_results(results: object) -> OCRResult:
         tokens: list[str] = []
         confidences: list[float] = []
 
-        ordered_results = sorted(results, key=self._result_sort_key)
+        ordered_results = sorted(results, key=EasyOCRBackend._result_sort_key)
         for _bbox, token, confidence in ordered_results:
             normalized_token = re.sub(r"\s+", " ", str(token)).strip()
             if not normalized_token:
@@ -159,6 +208,58 @@ class EasyOCRBackend(OCRBackend):
         normalized = " ".join(tokens)
         average_confidence = sum(confidences) / len(confidences) if confidences else None
         return OCRResult(text=normalized, confidence=average_confidence)
+
+    @staticmethod
+    def _ensure_batch_image(image: object) -> np.ndarray:
+        array = np.asarray(image)
+        if array.ndim == 3:
+            array = cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+        if array.dtype != np.uint8:
+            array = np.clip(array, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(array)
+
+    @staticmethod
+    def _tile_batch_images(images: list[np.ndarray]) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
+        gap = 16
+        max_width = max((image.shape[1] for image in images), default=1)
+        total_height = sum(image.shape[0] for image in images) + gap * max(len(images) - 1, 0)
+        canvas = np.full((max(total_height, 1), max(max_width, 1)), 255, dtype=np.uint8)
+
+        regions: list[tuple[int, int, int]] = []
+        top = 0
+        for image in images:
+            height, width = image.shape[:2]
+            bottom = top + height
+            canvas[top:bottom, :width] = image
+            regions.append((top, bottom, width))
+            top = bottom + gap
+
+        return canvas, regions
+
+    @staticmethod
+    def _result_region_index(
+        result: tuple[object, object, object],
+        regions: list[tuple[int, int, int]],
+    ) -> int | None:
+        center_y = EasyOCRBackend._result_center_y(result)
+        if center_y is None:
+            return None
+
+        for index, (top, bottom, _width) in enumerate(regions):
+            if top <= center_y <= bottom:
+                return index
+        return None
+
+    @staticmethod
+    def _result_center_y(result: tuple[object, object, object]) -> float | None:
+        bbox = result[0]
+        if not isinstance(bbox, list) or not bbox:
+            return None
+
+        ys = [float(point[1]) for point in bbox if isinstance(point, (list, tuple)) and len(point) >= 2]
+        if not ys:
+            return None
+        return (min(ys) + max(ys)) / 2.0
 
     def _get_reader(self, language: str) -> object:
         lang_list = self._resolve_language_list(language)

@@ -32,6 +32,13 @@ class _TrackedTextBox:
     missing_frames: int = 0
 
 
+@dataclass(slots=True, frozen=True)
+class _OCRCroppedBox:
+    rect: tuple[int, int, int, int]
+    crop: np.ndarray
+    psm: int
+
+
 class TextDetectionPipeline:
     """Realtime screen-text pipeline using traditional CV and optional OCR."""
 
@@ -302,6 +309,8 @@ class TextDetectionPipeline:
     ) -> list[DetectionBox]:
         detected_boxes: list[DetectionBox] = []
         ocr_boxes = self._select_ocr_boxes(working_boxes)
+        ocr_attempted = self.settings.ocr_enabled and self.ocr_backend.is_available()
+        ocr_candidates: list[_OCRCroppedBox] = []
 
         for x, y, w, h in ocr_boxes:
             pad_x = max(int(w * 0.04), 4)
@@ -312,16 +321,30 @@ class TextDetectionPipeline:
             crop_y2 = min(y + h + pad_y, enhanced_gray.shape[0])
 
             crop = enhanced_gray[crop_y1:crop_y2, crop_x1:crop_x2]
-            text = ""
-            confidence = None
-            ocr_attempted = self.settings.ocr_enabled and self.ocr_backend.is_available()
-            if ocr_attempted:
-                ocr_crop = self.ocr_backend.prepare_image(crop)
-                ocr_result = self.ocr_backend.recognize(
-                    ocr_crop,
-                    language=self.settings.ocr_language,
+            ocr_candidates.append(
+                _OCRCroppedBox(
+                    rect=(x, y, w, h),
+                    crop=crop,
                     psm=self._resolve_psm(w, h),
                 )
+            )
+
+        ocr_results = []
+        if ocr_attempted and ocr_candidates:
+            ocr_results = self.ocr_backend.recognize_batch(
+                [self.ocr_backend.prepare_image(candidate.crop) for candidate in ocr_candidates],
+                language=self.settings.ocr_language,
+                psms=[candidate.psm for candidate in ocr_candidates],
+            )
+
+        if len(ocr_results) < len(ocr_candidates):
+            ocr_results.extend([None] * (len(ocr_candidates) - len(ocr_results)))
+
+        for candidate, ocr_result in zip(ocr_candidates, ocr_results, strict=False):
+            x, y, w, h = candidate.rect
+            text = ""
+            confidence = None
+            if ocr_result is not None:
                 text = ocr_result.text
                 confidence = ocr_result.confidence
 
