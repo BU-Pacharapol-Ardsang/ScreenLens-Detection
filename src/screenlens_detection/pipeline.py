@@ -16,7 +16,7 @@ from .languages import (
 )
 from .models import DetectionBox, FrameAnalysis, PipelineSettings
 from .motion import estimate_grayscale_offset
-from .ocr import OCRBackend
+from .ocr import OCRBackend, OCRResult
 from .text_detectors import (
     TextDetectorBackend,
     create_deep_text_detector_backend,
@@ -39,6 +39,14 @@ class _OCRCroppedBox:
     psm: int
 
 
+@dataclass(slots=True)
+class _CachedOCRResult:
+    rect: tuple[int, int, int, int]
+    fingerprint: np.ndarray
+    text: str
+    confidence: float | None = None
+
+
 class TextDetectionPipeline:
     """Realtime screen-text pipeline using traditional CV and optional OCR."""
 
@@ -52,11 +60,15 @@ class TextDetectionPipeline:
         self.ocr_backend = ocr_backend
         self.translation_backend = translation_backend
         self._recent_translations: list[DetectionBox] = []
+        self._recent_translation_lookup: dict[tuple[str, str, str], str] = {}
+        self._recent_translation_candidates: list[tuple[DetectionBox, str]] = []
+        self._recent_ocr_results: list[_CachedOCRResult] = []
         self._ocr_box_tracks: list[_TrackedTextBox] = []
         self._previous_motion_gray: np.ndarray | None = None
         self._deep_text_detector: TextDetectorBackend | None = None
 
     def close(self) -> None:
+        self.ocr_backend.close()
         self.translation_backend.close()
         if self._deep_text_detector is not None:
             self._deep_text_detector.close()
@@ -329,18 +341,39 @@ class TextDetectionPipeline:
                 )
             )
 
-        ocr_results = []
+        ocr_results: list[OCRResult | None] = [None] * len(ocr_candidates)
+        candidate_fingerprints: list[np.ndarray] = []
         if ocr_attempted and ocr_candidates:
-            ocr_results = self.ocr_backend.recognize_batch(
-                [self.ocr_backend.prepare_image(candidate.crop) for candidate in ocr_candidates],
-                language=self.settings.ocr_language,
-                psms=[candidate.psm for candidate in ocr_candidates],
-            )
+            pending_indices: list[int] = []
+            pending_candidates: list[_OCRCroppedBox] = []
 
-        if len(ocr_results) < len(ocr_candidates):
-            ocr_results.extend([None] * (len(ocr_candidates) - len(ocr_results)))
+            for index, candidate in enumerate(ocr_candidates):
+                fingerprint = self._ocr_crop_fingerprint(candidate.crop)
+                candidate_fingerprints.append(fingerprint)
+                cached_result = self._find_cached_ocr_result(candidate.rect, fingerprint)
+                if cached_result is not None:
+                    ocr_results[index] = cached_result
+                    continue
 
-        for candidate, ocr_result in zip(ocr_candidates, ocr_results, strict=False):
+                pending_indices.append(index)
+                pending_candidates.append(candidate)
+
+            pending_results = []
+            if pending_candidates:
+                pending_results = self.ocr_backend.recognize_batch(
+                    [self.ocr_backend.prepare_image(candidate.crop) for candidate in pending_candidates],
+                    language=self.settings.ocr_language,
+                    psms=[candidate.psm for candidate in pending_candidates],
+                )
+
+            for index, ocr_result in zip(pending_indices, pending_results, strict=False):
+                ocr_results[index] = ocr_result
+
+        elif ocr_candidates:
+            candidate_fingerprints = [self._ocr_crop_fingerprint(candidate.crop) for candidate in ocr_candidates]
+
+        ocr_cache_updates: list[_CachedOCRResult] = []
+        for candidate_index, (candidate, ocr_result) in enumerate(zip(ocr_candidates, ocr_results, strict=False)):
             x, y, w, h = candidate.rect
             text = ""
             confidence = None
@@ -351,6 +384,17 @@ class TextDetectionPipeline:
             text = self._normalize_recognized_text(text)
             if ocr_attempted and not self._is_usable_text(text, confidence):
                 continue
+
+            if ocr_attempted and text:
+                if candidate_index < len(candidate_fingerprints):
+                    ocr_cache_updates.append(
+                        _CachedOCRResult(
+                            rect=candidate.rect,
+                            fingerprint=candidate_fingerprints[candidate_index],
+                            text=text,
+                            confidence=confidence,
+                        )
+                    )
 
             mapped_x = int(x / scale)
             mapped_y = int(y / scale)
@@ -377,7 +421,68 @@ class TextDetectionPipeline:
                 )
             )
 
+        if ocr_attempted:
+            self._remember_ocr_results(ocr_cache_updates)
+
         return detected_boxes
+
+    def _find_cached_ocr_result(self, rect: tuple[int, int, int, int], fingerprint: np.ndarray) -> OCRResult | None:
+        best_match: _CachedOCRResult | None = None
+        best_overlap = 0.0
+
+        for cached in self._recent_ocr_results:
+            overlap = self._intersection_over_union(rect, cached.rect)
+            if overlap < 0.82 or overlap <= best_overlap:
+                continue
+
+            difference = self._ocr_fingerprint_difference(fingerprint, cached.fingerprint)
+            if difference > 5.5:
+                continue
+
+            best_match = cached
+            best_overlap = overlap
+
+        if best_match is None:
+            return None
+        return OCRResult(text=best_match.text, confidence=best_match.confidence)
+
+    def _remember_ocr_results(self, updates: list[_CachedOCRResult]) -> None:
+        if not updates:
+            return
+
+        remembered = [*updates, *self._recent_ocr_results]
+        deduped: list[_CachedOCRResult] = []
+        for candidate in remembered:
+            if not candidate.text:
+                continue
+            if any(
+                existing.text == candidate.text
+                and self._intersection_over_union(existing.rect, candidate.rect) >= 0.92
+                for existing in deduped
+            ):
+                continue
+            deduped.append(candidate)
+
+        limit = max(self.settings.max_ocr_boxes_per_frame * 4, 32)
+        self._recent_ocr_results = deduped[:limit]
+
+    @staticmethod
+    def _ocr_crop_fingerprint(crop: np.ndarray) -> np.ndarray:
+        if crop.size == 0:
+            return np.zeros((12, 32), dtype=np.uint8)
+
+        gray = crop if crop.ndim == 2 else cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        if gray.dtype != np.uint8:
+            gray = np.clip(gray, 0, 255).astype(np.uint8)
+
+        resized = cv2.resize(gray, (32, 12), interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(resized)
+
+    @staticmethod
+    def _ocr_fingerprint_difference(first: np.ndarray, second: np.ndarray) -> float:
+        if first.shape != second.shape:
+            return float("inf")
+        return float(np.mean(cv2.absdiff(first, second)))
 
     def _select_ocr_boxes(
         self,
@@ -559,6 +664,8 @@ class TextDetectionPipeline:
         if not boxes:
             if not self.settings.overlay_tracking_enabled:
                 self._recent_translations = []
+                self._recent_translation_lookup = {}
+                self._recent_translation_candidates = []
             return boxes
 
         translated_boxes = self._reuse_recent_translations(boxes)
@@ -570,20 +677,38 @@ class TextDetectionPipeline:
 
         for (source_language_code, target_language_code), indices in grouped_indices.items():
             prioritized_indices = self._prioritize_translation_indices(translated_boxes, indices)
-            texts = [translated_boxes[index].text for index in prioritized_indices]
+            unique_text_order: list[str] = []
+            text_to_indices: dict[str, list[int]] = {}
+
+            for index in prioritized_indices:
+                text = translated_boxes[index].text
+                normalized_text = self._normalize_text_for_matching(text)
+                if not normalized_text:
+                    continue
+                if normalized_text not in text_to_indices:
+                    unique_text_order.append(text)
+                    text_to_indices[normalized_text] = [index]
+                else:
+                    text_to_indices[normalized_text].append(index)
+
+            if not unique_text_order:
+                continue
+
             translated_batch = self.translation_backend.translate_batch(
-                texts,
+                unique_text_order,
                 source_language_code=source_language_code,
                 target_language_code=target_language_code,
             )
-            for index, translated_text in zip(prioritized_indices, translated_batch, strict=False):
-                translated_boxes[index] = replace(translated_boxes[index], translated_text=translated_text)
+            for text, translated_text in zip(unique_text_order, translated_batch, strict=False):
+                normalized_text = self._normalize_text_for_matching(text)
+                for index in text_to_indices.get(normalized_text, []):
+                    translated_boxes[index] = replace(translated_boxes[index], translated_text=translated_text)
 
         self._remember_translations(translated_boxes)
         return translated_boxes
 
     def _reuse_recent_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
-        if not self._recent_translations:
+        if not self._recent_translation_candidates:
             return list(boxes)
 
         reused_boxes: list[DetectionBox] = []
@@ -599,24 +724,24 @@ class TextDetectionPipeline:
         if not box.text:
             return ""
 
-        current_rect = (box.x, box.y, box.w, box.h)
-        current_area = max(box.w * box.h, 1)
         current_text = self._normalize_text_for_matching(box.text)
         if not current_text:
             return ""
 
+        direct_match = self._recent_translation_lookup.get(
+            (box.source_language_code, box.target_language_code, current_text),
+        )
+        if direct_match:
+            return direct_match
+
+        current_rect = (box.x, box.y, box.w, box.h)
+        current_area = max(box.w * box.h, 1)
         best_score = 0.0
         best_translation = ""
-        for recent in self._recent_translations:
-            if not recent.translated_text:
-                continue
+        for recent, recent_text in self._recent_translation_candidates:
             if recent.source_language_code != box.source_language_code:
                 continue
             if recent.target_language_code != box.target_language_code:
-                continue
-
-            recent_text = self._normalize_text_for_matching(recent.text)
-            if not recent_text:
                 continue
 
             similarity = SequenceMatcher(None, current_text, recent_text).ratio()
@@ -689,6 +814,15 @@ class TextDetectionPipeline:
         multiplier = 6 if self.settings.overlay_tracking_enabled else 3
         minimum = 60 if self.settings.overlay_tracking_enabled else 24
         self._recent_translations = deduped[: max(self.settings.max_ocr_boxes_per_frame * multiplier, minimum)]
+        self._recent_translation_lookup = {}
+        self._recent_translation_candidates = []
+        for box in self._recent_translations:
+            normalized_text = self._normalize_text_for_matching(box.text)
+            if normalized_text and box.translated_text:
+                self._recent_translation_lookup[
+                    (box.source_language_code, box.target_language_code, normalized_text)
+                ] = box.translated_text
+                self._recent_translation_candidates.append((box, normalized_text))
 
     def _merge_text_boxes(
         self,

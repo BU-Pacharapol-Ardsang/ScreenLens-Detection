@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import cv2
 import numpy as np
 
@@ -172,6 +174,58 @@ def test_pipeline_batches_ocr_crops_per_frame() -> None:
     assert [box.text for box in detected] == ["demo 1", "demo 2", "demo 3"]
 
 
+def test_pipeline_reuses_ocr_results_for_unchanged_crops() -> None:
+    backend = BatchRecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=4,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+
+    working_boxes = [
+        (10, 10, 120, 28),
+        (20, 60, 160, 30),
+    ]
+    gray = np.full((140, 260), 255, dtype=np.uint8)
+
+    first = pipeline._annotate_with_ocr(working_boxes, gray, (140, 260, 3), 1.0)
+    second = pipeline._annotate_with_ocr(working_boxes, gray, (140, 260, 3), 1.0)
+
+    assert backend.batch_calls == [(2, "eng", [7, 7])]
+    assert [box.text for box in first] == ["demo 1", "demo 2"]
+    assert [box.text for box in second] == ["demo 1", "demo 2"]
+
+
+def test_pipeline_invalidates_cached_ocr_when_crop_changes() -> None:
+    backend = BatchRecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=4,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+
+    working_boxes = [(10, 10, 120, 28)]
+    gray = np.full((80, 180), 255, dtype=np.uint8)
+    changed_gray = gray.copy()
+    changed_gray[10:38, 10:130] = 0
+
+    pipeline._annotate_with_ocr(working_boxes, gray, (80, 180, 3), 1.0)
+    pipeline._annotate_with_ocr(working_boxes, gray, (80, 180, 3), 1.0)
+    pipeline._annotate_with_ocr(working_boxes, changed_gray, (80, 180, 3), 1.0)
+
+    assert backend.batch_calls == [(1, "eng", [7]), (1, "eng", [7])]
+
+
 def test_pipeline_keeps_detector_boxes_when_ocr_backend_is_unavailable() -> None:
     pipeline = TextDetectionPipeline(
         PipelineSettings(upscale_factor=1.0, ocr_enabled=True),
@@ -300,6 +354,21 @@ class OneShotTranslationBackend(TranslationBackend):
         return [""] * len(texts)
 
 
+class RecordingRouteTranslationBackend(TranslationBackend):
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, list[str]]] = []
+
+    def translate_batch(
+        self,
+        texts: list[str],
+        *,
+        source_language_code: str,
+        target_language_code: str,
+    ) -> list[str]:
+        self.calls.append((source_language_code, target_language_code, list(texts)))
+        return [f"{target_language_code}:{text}" for text in texts]
+
+
 def test_pipeline_prioritizes_content_lines_for_translation_budget() -> None:
     backend = FirstOnlyTranslationBackend()
     pipeline = TextDetectionPipeline(
@@ -344,6 +413,78 @@ def test_pipeline_prioritizes_content_lines_for_translation_budget() -> None:
     assert backend.calls[0][0].startswith("US Treasury Secretary Scott Bessent")
     assert translated[1].translated_text.startswith("translated:")
     assert translated[0].translated_text == ""
+
+
+def test_pipeline_deduplicates_repeated_text_before_translation() -> None:
+    backend = RecordingRouteTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    boxes = [
+        DetectionBox(
+            x=10,
+            y=20,
+            w=500,
+            h=42,
+            text="Breaking news from BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+        DetectionBox(
+            x=10,
+            y=90,
+            w=500,
+            h=42,
+            text="Breaking news from BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+    ]
+
+    translated = pipeline._apply_translations(boxes)
+
+    assert backend.calls == [("eng", "tha", ["Breaking news from BBC"])]
+    assert translated[0].translated_text == "tha:Breaking news from BBC"
+    assert translated[1].translated_text == "tha:Breaking news from BBC"
+
+
+def test_pipeline_recent_translation_lookup_keeps_language_route_separate() -> None:
+    backend = RecordingRouteTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    thai_target = DetectionBox(
+        x=10,
+        y=20,
+        w=500,
+        h=42,
+        text="Breaking news from BBC",
+        source_language_code="eng",
+        source_language_label="English",
+        target_language_code="tha",
+        target_language_label="Thai",
+    )
+    english_target = replace(
+        thai_target,
+        target_language_code="eng",
+        target_language_label="English",
+    )
+
+    first = pipeline._apply_translations([thai_target])
+    second = pipeline._apply_translations([english_target])
+
+    assert first[0].translated_text == "tha:Breaking news from BBC"
+    assert second[0].translated_text == "eng:Breaking news from BBC"
+    assert backend.calls == [
+        ("eng", "tha", ["Breaking news from BBC"]),
+        ("eng", "eng", ["Breaking news from BBC"]),
+    ]
 
 
 def test_pipeline_reuses_recent_translation_for_similar_box_in_next_frame() -> None:
