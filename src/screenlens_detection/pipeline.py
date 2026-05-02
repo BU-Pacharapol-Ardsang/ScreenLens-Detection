@@ -79,6 +79,12 @@ class TextDetectionPipeline:
         self._last_ocr_candidate_count = 0
         self._last_ocr_submitted_count = 0
         self._ocr_box_tracks: list[_TrackedTextBox] = []
+        self._scanline_source_boxes: list[tuple[int, int, int, int]] = []
+        self._scanline_frame_index = 0
+        self._scanline_last_band_index: int | None = None
+        self._scanline_last_band_count = 0
+        self._scanline_source_shape: tuple[int, int, int] | None = None
+        self._scanline_detection_shape: tuple[int, int, int] | None = None
         self._previous_motion_gray: np.ndarray | None = None
         self._current_motion_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._current_scaled_motion_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -99,10 +105,19 @@ class TextDetectionPipeline:
         detection_frame, detection_scale = self._scale_frame(frame)
         self._active_detection_scale = detection_scale
         detection_gray = self._enhance_grayscale(detection_frame)
-        mask = self._build_text_mask(detection_frame, detection_gray)
-        line_mask = self._build_line_mask(mask)
-        detection_boxes = self._detect_text_boxes(detection_frame, line_mask, mask, detection_gray)
-        working_boxes = self._map_boxes_to_source_frame(detection_boxes, frame.shape, detection_scale)
+        if self.settings.scanline_roi_enabled:
+            detection_boxes, line_mask, working_boxes = self._scanline_detection_pass(
+                detection_frame,
+                detection_gray,
+                frame.shape,
+                detection_scale,
+            )
+        else:
+            self._reset_scanline_state()
+            mask = self._build_text_mask(detection_frame, detection_gray)
+            line_mask = self._build_line_mask(mask)
+            detection_boxes = self._detect_text_boxes(detection_frame, line_mask, mask, detection_gray)
+            working_boxes = self._map_boxes_to_source_frame(detection_boxes, frame.shape, detection_scale)
         ocr_gray = self._source_ocr_grayscale(frame, detection_gray, detection_scale)
         stable_working_boxes = self._stabilize_ocr_boxes(working_boxes)
         motion_filtered_boxes = self._filter_motion_ocr_boxes(stable_working_boxes, ocr_gray)
@@ -189,6 +204,147 @@ class TextDetectionPipeline:
             bottom = min(max(int(np.ceil((y + h) / scale)) + pad_y, top + 1), source_height)
             mapped.append((left, top, right - left, bottom - top))
         return mapped
+
+    @staticmethod
+    def _map_boxes_to_detection_frame(
+        boxes: list[tuple[int, int, int, int]],
+        detection_shape: tuple[int, int, int],
+        scale: float,
+    ) -> list[tuple[int, int, int, int]]:
+        if not boxes:
+            return []
+
+        detection_height, detection_width = detection_shape[:2]
+        mapped: list[tuple[int, int, int, int]] = []
+        for x, y, w, h in boxes:
+            left = max(min(int(round(x * scale)), detection_width - 1), 0)
+            top = max(min(int(round(y * scale)), detection_height - 1), 0)
+            right = min(max(int(round((x + w) * scale)), left + 1), detection_width)
+            bottom = min(max(int(round((y + h) * scale)), top + 1), detection_height)
+            mapped.append((left, top, right - left, bottom - top))
+        return mapped
+
+    def _scanline_detection_pass(
+        self,
+        detection_frame: np.ndarray,
+        detection_gray: np.ndarray,
+        source_shape: tuple[int, int, int],
+        detection_scale: float,
+    ) -> tuple[list[tuple[int, int, int, int]], np.ndarray, list[tuple[int, int, int, int]]]:
+        if self._scanline_source_shape != source_shape or self._scanline_detection_shape != detection_frame.shape:
+            self._reset_scanline_state()
+            self._scanline_source_shape = source_shape
+            self._scanline_detection_shape = detection_frame.shape
+
+        frame_height = detection_gray.shape[0]
+        band_count = self._scanline_band_count(frame_height)
+        band_index = self._scanline_frame_index % band_count
+        self._scanline_frame_index += 1
+        self._scanline_last_band_index = band_index
+        self._scanline_last_band_count = band_count
+
+        core_top, core_bottom, scan_top, scan_bottom = self._scanline_band_bounds(
+            frame_height,
+            band_count,
+            band_index,
+        )
+        roi_frame = detection_frame[scan_top:scan_bottom, :]
+        roi_gray = detection_gray[scan_top:scan_bottom, :]
+        mask_roi = self._build_text_mask(roi_frame, roi_gray)
+        line_mask_roi = self._build_line_mask(mask_roi)
+
+        roi_boxes = self._detect_text_boxes(
+            roi_frame,
+            line_mask_roi,
+            mask_roi,
+            roi_gray,
+            filter_frame_shape=detection_frame.shape,
+        )
+        active_detection_boxes = [
+            (x, y + scan_top, w, h)
+            for x, y, w, h in roi_boxes
+            if self._box_center_y_in_span((x, y + scan_top, w, h), core_top, core_bottom)
+        ]
+        active_source_boxes = self._map_boxes_to_source_frame(
+            active_detection_boxes,
+            source_shape,
+            detection_scale,
+        )
+
+        source_core_top = max(int(np.floor(core_top / detection_scale)), 0)
+        source_core_bottom = min(int(np.ceil(core_bottom / detection_scale)), source_shape[0])
+        self._scanline_source_boxes = self._merge_scanline_source_boxes(
+            active_source_boxes,
+            source_core_top,
+            source_core_bottom,
+        )
+
+        line_mask = np.zeros_like(detection_gray)
+        line_mask[scan_top:scan_bottom, :] = line_mask_roi
+        preview_boxes = self._map_boxes_to_detection_frame(
+            self._scanline_source_boxes,
+            detection_frame.shape,
+            detection_scale,
+        )
+        return preview_boxes, line_mask, list(self._scanline_source_boxes)
+
+    def _scanline_band_count(self, frame_height: int) -> int:
+        if frame_height <= 0:
+            return 1
+        return min(max(self.settings.scanline_roi_band_count, 2), frame_height)
+
+    def _scanline_band_bounds(
+        self,
+        frame_height: int,
+        band_count: int,
+        band_index: int,
+    ) -> tuple[int, int, int, int]:
+        band_height = max(int(np.ceil(frame_height / max(band_count, 1))), 1)
+        core_top = min(band_index * band_height, frame_height)
+        core_bottom = min(max(core_top + band_height, core_top + 1), frame_height)
+        overlap = max(int(round(band_height * self.settings.scanline_roi_overlap_ratio)), 6)
+        scan_top = max(core_top - overlap, 0)
+        scan_bottom = min(core_bottom + overlap, frame_height)
+        return core_top, core_bottom, scan_top, scan_bottom
+
+    def _merge_scanline_source_boxes(
+        self,
+        active_boxes: list[tuple[int, int, int, int]],
+        source_core_top: int,
+        source_core_bottom: int,
+    ) -> list[tuple[int, int, int, int]]:
+        retained_boxes = [
+            box
+            for box in self._scanline_source_boxes
+            if not self._box_center_y_in_span(box, source_core_top, source_core_bottom)
+        ]
+        combined = [*active_boxes, *retained_boxes]
+        combined.sort(key=self._ocr_candidate_priority, reverse=True)
+
+        deduped: list[tuple[int, int, int, int]] = []
+        for box in combined:
+            if any(self._intersection_over_union(box, existing) >= 0.78 for existing in deduped):
+                continue
+            deduped.append(box)
+
+        return self._limit_detected_boxes(deduped)
+
+    @staticmethod
+    def _box_center_y_in_span(
+        box: tuple[int, int, int, int],
+        top: int,
+        bottom: int,
+    ) -> bool:
+        center_y = box[1] + (box[3] / 2.0)
+        return top <= center_y < bottom
+
+    def _reset_scanline_state(self) -> None:
+        self._scanline_source_boxes = []
+        self._scanline_frame_index = 0
+        self._scanline_last_band_index = None
+        self._scanline_last_band_count = 0
+        self._scanline_source_shape = None
+        self._scanline_detection_shape = None
 
     def _enhance_grayscale(self, frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -437,17 +593,20 @@ class TextDetectionPipeline:
         line_mask: np.ndarray,
         text_mask: np.ndarray,
         enhanced_gray: np.ndarray,
+        *,
+        filter_frame_shape: tuple[int, int, int] | None = None,
     ) -> list[tuple[int, int, int, int]]:
+        threshold_shape = filter_frame_shape if filter_frame_shape is not None else scaled_frame.shape
         mode = normalize_text_detector_mode(self.settings.text_detector_mode)
         if mode == "opencv":
-            return self._extract_text_boxes(line_mask, text_mask, enhanced_gray, scaled_frame.shape)
+            return self._extract_text_boxes(line_mask, text_mask, enhanced_gray, threshold_shape)
 
         detector = self._ensure_deep_text_detector(mode)
         if not detector.is_available():
             return []
 
         detected_boxes = detector.detect(scaled_frame)
-        return self._filter_detector_boxes(detected_boxes, scaled_frame.shape)
+        return self._filter_detector_boxes(detected_boxes, threshold_shape)
 
     def _ensure_deep_text_detector(self, mode: str) -> TextDetectorBackend:
         if self._deep_text_detector is None:
@@ -465,7 +624,10 @@ class TextDetectionPipeline:
     ) -> list[tuple[int, int, int, int]]:
         frame_height, frame_width = frame_shape[:2]
         frame_area = max(frame_height * frame_width, 1)
-        max_box_height = int(frame_height * self.settings.max_box_height_ratio)
+        max_box_height = max(
+            int(frame_height * self.settings.max_box_height_ratio),
+            self._scaled_detection_length(72, minimum=36),
+        )
         min_contour_area = self._scaled_detection_area(self.settings.min_contour_area, minimum=24)
         min_box_width = self._scaled_detection_length(self.settings.min_box_width, minimum=8)
         min_box_height = self._scaled_detection_length(self.settings.min_box_height, minimum=4)
@@ -504,7 +666,10 @@ class TextDetectionPipeline:
         frame_shape: tuple[int, int, int],
     ) -> list[tuple[int, int, int, int]]:
         component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(line_mask, connectivity=8)
-        max_box_height = int(frame_shape[0] * self.settings.max_box_height_ratio)
+        max_box_height = max(
+            int(frame_shape[0] * self.settings.max_box_height_ratio),
+            self._scaled_detection_length(72, minimum=36),
+        )
         frame_area = frame_shape[0] * frame_shape[1]
         min_contour_area = self._scaled_detection_area(self.settings.min_contour_area, minimum=24)
         min_box_width = self._scaled_detection_length(self.settings.min_box_width, minimum=8)
@@ -1664,11 +1829,18 @@ class TextDetectionPipeline:
         mode = normalize_text_detector_mode(self.settings.text_detector_mode)
         scale = self._effective_detection_scale()
         scale_suffix = f" @ {scale:.2f}x" if abs(scale - 1.0) >= 0.01 else ""
+        scanline_suffix = ""
+        if self.settings.scanline_roi_enabled:
+            band_count = self._scanline_last_band_count or max(self.settings.scanline_roi_band_count, 2)
+            if self._scanline_last_band_index is None:
+                scanline_suffix = f" | scanline {band_count} bands"
+            else:
+                scanline_suffix = f" | scanline {self._scanline_last_band_index + 1}/{band_count}"
         if mode == "opencv":
-            return f"OpenCV morphology detector{scale_suffix}"
+            return f"OpenCV morphology detector{scale_suffix}{scanline_suffix}"
 
         detector = self._ensure_deep_text_detector(mode)
-        return f"{detector.describe()}{scale_suffix}"
+        return f"{detector.describe()}{scale_suffix}{scanline_suffix}"
 
     def _effective_detection_scale(self) -> float:
         detector_scale = min(max(self.settings.detection_scale, 0.25), 1.0)

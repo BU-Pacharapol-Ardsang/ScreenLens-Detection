@@ -140,6 +140,69 @@ def _target_coverage(box: tuple[int, int, int, int], target: tuple[int, int, int
     return intersection / max(target[2] * target[3], 1)
 
 
+def test_pipeline_scanline_mode_reuses_boxes_outside_active_band() -> None:
+    canvas = np.full((240, 640, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        canvas,
+        "Realtime OCR Demo",
+        (30, 80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "Realtime OCR Demo",
+        (30, 200),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    bottom_only = np.full_like(canvas, 255)
+    cv2.putText(
+        bottom_only,
+        "Realtime OCR Demo",
+        (30, 200),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            detection_scale=0.66,
+            min_contour_area=80,
+            max_boxes=20,
+            ocr_enabled=False,
+            scanline_roi_enabled=True,
+            scanline_roi_band_count=2,
+        ),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    top_target = (24, 49, 305, 55)
+    bottom_target = (24, 168, 305, 56)
+
+    first = pipeline.process(canvas, monitor_label="scanline-test")
+    second = pipeline.process(canvas, monitor_label="scanline-test")
+    third = pipeline.process(bottom_only, monitor_label="scanline-test")
+
+    assert any(_target_coverage((box.x, box.y, box.w, box.h), top_target) >= 0.55 for box in first.boxes)
+    assert any(_target_coverage((box.x, box.y, box.w, box.h), top_target) >= 0.55 for box in second.boxes)
+    assert any(_target_coverage((box.x, box.y, box.w, box.h), bottom_target) >= 0.55 for box in second.boxes)
+    assert not any(_target_coverage((box.x, box.y, box.w, box.h), top_target) >= 0.55 for box in third.boxes)
+    assert any(_target_coverage((box.x, box.y, box.w, box.h), bottom_target) >= 0.55 for box in third.boxes)
+    assert "scanline 1/2" in third.status
+
+
 class RecordingOCRBackend(OCRBackend):
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []

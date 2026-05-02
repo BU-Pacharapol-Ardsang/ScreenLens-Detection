@@ -84,9 +84,12 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert google_index >= 0
         easyocr_index = window.text_detector_combo.findData("easyocr")
         assert easyocr_index >= 0
+        scanline_index = window.scanline_roi_combo.findData(True)
+        assert scanline_index >= 0
 
         window.translation_mode_combo.setCurrentIndex(google_index)
         window.text_detector_combo.setCurrentIndex(easyocr_index)
+        window.scanline_roi_combo.setCurrentIndex(scanline_index)
         window.interval_spin.setValue(1000)
         window.scale_spin.setValue(1.0)
         window.detection_scale_spin.setValue(0.50)
@@ -105,10 +108,12 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert worker.settings.translation_mode == "google"
         assert worker.settings.text_detector_mode == "easyocr"
         assert worker.settings.detection_scale == 0.50
+        assert worker.settings.scanline_roi_enabled is True
         assert worker.settings.overlay_tracking_enabled is True
         assert worker.settings.overlay_tracking_mode == "anchor"
         assert window.worker is worker
         assert window.text_detector_combo.isEnabled() is False
+        assert window.scanline_roi_combo.isEnabled() is False
         assert window.translation_mode_combo.isEnabled() is False
         assert window.overlay_tracking_checkbox.isEnabled() is False
         assert window.overlay_tracking_mode_combo.isEnabled() is False
@@ -122,6 +127,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert worker.stopped is True
         assert window.worker is None
         assert window.text_detector_combo.isEnabled() is True
+        assert window.scanline_roi_combo.isEnabled() is True
         assert window.translation_mode_combo.isEnabled() is True
         assert window.stop_button.isEnabled() is False
         assert window.status_label.text() == "Stopped"

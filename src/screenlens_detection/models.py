@@ -40,6 +40,9 @@ class PipelineSettings:
     max_box_height_ratio: float = 0.22
     max_boxes: int = 60
     text_detector_mode: str = "opencv"
+    scanline_roi_enabled: bool = False
+    scanline_roi_band_count: int = 6
+    scanline_roi_overlap_ratio: float = 0.18
     source_language_code: str = "auto"
     target_language_code: str = "tha"
     translation_mode: str = "argos"

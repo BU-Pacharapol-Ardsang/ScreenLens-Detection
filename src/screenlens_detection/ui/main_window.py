@@ -98,6 +98,7 @@ class MainWindow(QMainWindow):
         self.source_language_combo = QComboBox()
         self.target_language_combo = QComboBox()
         self.text_detector_combo = QComboBox()
+        self.scanline_roi_combo = QComboBox()
         self.translation_mode_combo = QComboBox()
         self.ocr_checkbox = QCheckBox("Enable OCR")
         self.ocr_checkbox.setChecked(True)
@@ -124,6 +125,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._populate_ocr_device_control()
         self._populate_text_detector_control()
+        self._populate_scanline_roi_control()
         self._populate_translation_mode_control()
         self._populate_overlay_tracking_mode_control()
         self._populate_language_controls()
@@ -153,6 +155,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Detector scale", self.detection_scale_spin)
         settings_layout.addRow("Min contour area", self.area_spin)
         settings_layout.addRow("Text detector", self.text_detector_combo)
+        settings_layout.addRow("Scan mode", self.scanline_roi_combo)
         settings_layout.addRow("OCR boxes/frame", self.ocr_boxes_control)
         settings_layout.addRow("Source language", self.source_language_combo)
         settings_layout.addRow("Target language", self.target_language_combo)
@@ -209,6 +212,7 @@ class MainWindow(QMainWindow):
         self.source_language_combo.setEnabled(not locked)
         self.target_language_combo.setEnabled(not locked)
         self.text_detector_combo.setEnabled(not locked)
+        self.scanline_roi_combo.setEnabled(not locked)
         self.translation_mode_combo.setEnabled(not locked)
         self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
@@ -225,6 +229,11 @@ class MainWindow(QMainWindow):
         for option in text_detector_options():
             self.text_detector_combo.addItem(option.label, userData=option.code)
         self.text_detector_combo.setCurrentIndex(0)
+
+    def _populate_scanline_roi_control(self) -> None:
+        self.scanline_roi_combo.addItem("Full frame", userData=False)
+        self.scanline_roi_combo.addItem("Sliding bands (video/game)", userData=True)
+        self.scanline_roi_combo.setCurrentIndex(0)
 
     def _populate_translation_mode_control(self) -> None:
         self.translation_mode_combo.addItem("Argos Translate (Offline)", userData="argos")
@@ -281,6 +290,7 @@ class MainWindow(QMainWindow):
             detection_scale=self.detection_scale_spin.value(),
             min_contour_area=self.area_spin.value(),
             text_detector_mode=self.text_detector_combo.currentData(),
+            scanline_roi_enabled=bool(self.scanline_roi_combo.currentData()),
             max_ocr_boxes_per_frame=self.ocr_boxes_slider.value(),
             source_language_code=self.source_language_combo.currentData(),
             target_language_code=self.target_language_combo.currentData(),
