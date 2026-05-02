@@ -7,6 +7,7 @@ from screenlens_detection.text_detectors import (
     _boxes_from_polygons,
     _boxes_from_rapidocr_result,
     _iter_easyocr_horizontal_boxes,
+    _rapidocr_package_data_dir,
     RapidOCRTextDetector,
     normalize_text_detector_mode,
     text_detector_options,
@@ -51,7 +52,19 @@ def test_rapidocr_result_filters_low_confidence_boxes() -> None:
     assert _boxes_from_rapidocr_result(result, min_score=0.35) == [(10, 20, 100, 25)]
 
 
-def test_rapidocr_detector_uses_detection_only_mode(monkeypatch) -> None:
+def test_rapidocr_package_data_dir_uses_module_file(tmp_path) -> None:
+    package_dir = tmp_path / "rapidocr"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "config.yaml").write_text("Global: {}", encoding="utf-8")
+    (package_dir / "models").mkdir()
+
+    module = SimpleNamespace(__file__=str(package_dir / "__init__.py"))
+
+    assert _rapidocr_package_data_dir(module) == package_dir.resolve()
+
+
+def test_rapidocr_detector_uses_detection_only_mode(monkeypatch, tmp_path) -> None:
     calls: list[tuple[int, ...]] = []
     created: list[object] = []
 
@@ -103,8 +116,14 @@ def test_rapidocr_detector_uses_detection_only_mode(monkeypatch) -> None:
                 scores=[0.91],
             )
 
+    package_dir = tmp_path / "rapidocr"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "config.yaml").write_text("Global: {}", encoding="utf-8")
+    (package_dir / "models").mkdir()
+
     rapidocr_module = ModuleType("rapidocr")
-    rapidocr_module.__file__ = __file__
+    rapidocr_module.__file__ = str(package_dir / "__init__.py")
     rapidocr_module.__path__ = []
     rapidocr_module.EngineType = SimpleNamespace(ONNXRUNTIME=FakeEnum("onnxruntime"))
     rapidocr_module.LangDet = SimpleNamespace(EN=FakeEnum("en"), MULTI=FakeEnum("multi"))

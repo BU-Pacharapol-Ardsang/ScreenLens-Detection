@@ -10,6 +10,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .runtime import application_roots
+
 
 @dataclass(slots=True, frozen=True)
 class TextDetectorOption:
@@ -181,7 +183,7 @@ class RapidOCRTextDetector(TextDetectorBackend):
             "EngineConfig.onnxruntime.use_cuda": _should_use_rapidocr_cuda(device_preference),
         }
 
-        package_dir = Path(rapidocr.__file__).resolve().parent
+        package_dir = _rapidocr_package_data_dir(rapidocr)
         cfg = ParseParams.load(package_dir / "config.yaml")
         cfg = ParseParams.update_batch(cfg, params)
         if cfg.Global.model_root_dir is None:
@@ -296,6 +298,23 @@ def _rapidocr_detection_language(lang_det_enum: object, language: str) -> object
     if "tha" in normalized and "eng" not in normalized:
         return _enum_value(lang_det_enum, "MULTI", "multi")
     return _enum_value(lang_det_enum, "MULTI", "multi")
+
+
+def _rapidocr_package_data_dir(rapidocr_module: object) -> Path:
+    candidates: list[Path] = []
+    module_file = getattr(rapidocr_module, "__file__", None)
+    if module_file:
+        candidates.append(Path(module_file).resolve().parent)
+
+    candidates.extend(root / "rapidocr" for root in application_roots())
+
+    unique_candidates = _unique_paths(candidates)
+    for candidate in unique_candidates:
+        if (candidate / "config.yaml").is_file() and (candidate / "models").is_dir():
+            return candidate
+
+    checked = ", ".join(str(candidate) for candidate in unique_candidates)
+    raise FileNotFoundError(f"RapidOCR package data not found. Checked: {checked}")
 
 
 def _should_use_rapidocr_cuda(device_preference: str) -> bool:
@@ -441,3 +460,17 @@ def _is_numeric_sequence(data: object, *, length: int) -> bool:
         and len(data) == length
         and all(isinstance(value, Number) for value in data)
     )
+
+
+def _unique_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        unique.append(resolved)
+        seen.add(resolved)
+
+    return unique
