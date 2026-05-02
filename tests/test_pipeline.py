@@ -168,6 +168,20 @@ class BatchRecordingOCRBackend(RecordingOCRBackend):
         ]
 
 
+class CountingBatchOCRBackend(BatchRecordingOCRBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self._next_text_index = 1
+
+    def recognize_batch(self, images: list[object], *, language: str, psms: list[int]) -> list[OCRResult]:
+        self.batch_calls.append((len(images), language, list(psms)))
+        results = []
+        for _image in images:
+            results.append(OCRResult(text=f"demo {self._next_text_index}", confidence=95.0))
+            self._next_text_index += 1
+        return results
+
+
 def test_pipeline_limits_ocr_boxes_per_frame() -> None:
     backend = RecordingOCRBackend()
     pipeline = TextDetectionPipeline(
@@ -271,6 +285,66 @@ def test_pipeline_reuses_ocr_results_for_unchanged_crops() -> None:
     assert backend.batch_calls == [(2, "eng", [7, 7])]
     assert [box.text for box in first] == ["demo 1", "demo 2"]
     assert [box.text for box in second] == ["demo 1", "demo 2"]
+
+
+def test_pipeline_reused_ocr_cache_does_not_consume_per_frame_budget() -> None:
+    backend = CountingBatchOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=1,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+
+    gray = np.full((140, 260), 255, dtype=np.uint8)
+
+    first = pipeline._annotate_with_ocr([(10, 10, 120, 28)], gray, (140, 260, 3), 1.0)
+    second = pipeline._annotate_with_ocr(
+        [(10, 10, 120, 28), (20, 70, 160, 30)],
+        gray,
+        (140, 260, 3),
+        1.0,
+    )
+
+    assert [box.text for box in first] == ["demo 1"]
+    assert [box.text for box in second] == ["demo 1", "demo 2"]
+    assert backend.batch_calls == [(1, "eng", [7]), (1, "eng", [7])]
+    assert pipeline._last_ocr_candidate_count == 2
+    assert pipeline._last_ocr_reuse_count == 1
+    assert pipeline._last_ocr_submitted_count == 1
+
+
+def test_pipeline_reused_ocr_cache_keeps_translated_text() -> None:
+    ocr_backend = CountingBatchOCRBackend()
+    translation_backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=1,
+        ),
+        ocr_backend,
+        translation_backend,
+    )
+
+    gray = np.full((80, 220), 255, dtype=np.uint8)
+    first = pipeline._annotate_with_ocr([(10, 10, 120, 28)], gray, (80, 220, 3), 1.0)
+    first_translated = pipeline._apply_translations(first)
+    pipeline._remember_ocr_translations(first_translated)
+
+    second = pipeline._annotate_with_ocr([(10, 10, 120, 28)], gray, (80, 220, 3), 1.0)
+    second_translated = pipeline._apply_translations(second)
+
+    assert first_translated[0].translated_text == "translated:demo 1"
+    assert second[0].translated_text == first_translated[0].translated_text
+    assert second_translated[0].translated_text == first_translated[0].translated_text
+    assert ocr_backend.batch_calls == [(1, "eng", [7])]
+    assert translation_backend.calls == 1
 
 
 def test_pipeline_invalidates_cached_ocr_when_crop_changes() -> None:

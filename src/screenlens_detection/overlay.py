@@ -1233,12 +1233,20 @@ class TranslationOverlay(QWidget):
                 frame_width=frame_width,
                 frame_height=frame_height,
             )
-            self._paint_box(painter, QRect(*scaled), box.text)
+            anchor_rect = QRect(*scaled)
+            bubble_rect = self._expanded_bubble_rect(
+                anchor_rect,
+                box.text,
+                bounds_width=max(self.width(), 1),
+                bounds_height=max(self.height(), 1),
+            )
+            self._paint_box(painter, bubble_rect, box.text, anchor_height=anchor_rect.height())
 
-    def _paint_box(self, painter: QPainter, rect: QRect, text: str) -> None:
+    def _paint_box(self, painter: QPainter, rect: QRect, text: str, *, anchor_height: int | None = None) -> None:
         accent = QColor(48, 231, 149, 220)
         background = QColor(15, 23, 42, 212)
         text_color = QColor(248, 250, 252)
+        font_anchor_height = rect.height() if anchor_height is None else anchor_height
 
         bubble_rect = rect.adjusted(0, 0, -1, -1)
         radius = max(min(rect.height() // 4, 8), 2)
@@ -1262,7 +1270,7 @@ class TranslationOverlay(QWidget):
         if text_rect.width() <= 0 or text_rect.height() <= 0:
             text_rect = bubble_rect
 
-        font = self._font_for_text(text, text_rect, overlay_font_pixel_size(rect.height()))
+        font = self._font_for_text(text, text_rect, overlay_font_pixel_size(font_anchor_height))
         painter.setFont(font)
         painter.setPen(text_color)
         painter.drawText(
@@ -1270,6 +1278,56 @@ class TranslationOverlay(QWidget):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap,
             text,
         )
+
+    @staticmethod
+    def _expanded_bubble_rect(
+        anchor_rect: QRect,
+        text: str,
+        *,
+        bounds_width: int,
+        bounds_height: int,
+    ) -> QRect:
+        normalized = " ".join(text.split())
+        if not normalized or anchor_rect.width() <= 0 or anchor_rect.height() <= 0:
+            return anchor_rect
+
+        horizontal_padding = max(min(anchor_rect.height() // 4, 12), 2)
+        vertical_padding = max(min(anchor_rect.height() // 8, 6), 1)
+        base_pixel_size = overlay_font_pixel_size(anchor_rect.height())
+        if len(normalized) >= 18:
+            base_pixel_size = max(base_pixel_size, 10)
+
+        font = QFont("Segoe UI")
+        font.setWeight(QFont.Weight.DemiBold)
+        font.setPixelSize(max(base_pixel_size, 1))
+        metrics = QFontMetrics(font)
+        flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap
+
+        single_line_width = metrics.horizontalAdvance(normalized)
+        max_bubble_width = min(max(bounds_width - 8, anchor_rect.width()), max(260, int(bounds_width * 0.45)))
+        target_bubble_width = max(anchor_rect.width(), single_line_width + (horizontal_padding * 2) + 4)
+        if target_bubble_width > max_bubble_width:
+            target_bubble_width = max_bubble_width
+        if single_line_width > anchor_rect.width():
+            target_bubble_width = max(target_bubble_width, min(max_bubble_width, max(anchor_rect.width() * 2, 180)))
+
+        target_text_width = max(target_bubble_width - (horizontal_padding * 2), 1)
+        text_bounds = metrics.boundingRect(QRect(0, 0, target_text_width, 10_000), flags, normalized)
+        target_bubble_height = max(
+            anchor_rect.height(),
+            text_bounds.height() + (vertical_padding * 2) + 4,
+        )
+        max_bubble_height = max(anchor_rect.height(), int(bounds_height * 0.28))
+        target_bubble_height = min(target_bubble_height, max_bubble_height)
+
+        left = anchor_rect.x()
+        top = anchor_rect.y()
+        if left + target_bubble_width > bounds_width:
+            left = max(bounds_width - target_bubble_width - 4, 0)
+        if top + target_bubble_height > bounds_height:
+            top = max(bounds_height - target_bubble_height - 4, 0)
+
+        return QRect(left, top, target_bubble_width, target_bubble_height)
 
     @staticmethod
     def _font_for_text(text: str, rect: QRect, max_pixel_size: int) -> QFont:

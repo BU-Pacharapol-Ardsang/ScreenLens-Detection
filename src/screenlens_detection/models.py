@@ -26,6 +26,7 @@ class MonitorSpec:
 class PipelineSettings:
     capture_interval_ms: int = 40  # Run up to ~25 FPS
     upscale_factor: float = 1.0  # Full screen game/article is already large, 1.0 reduces lag massively
+    detection_scale: float = 0.66  # Run detection on a smaller image, then OCR high-res source crops.
     clahe_clip_limit: float = 2.0
     clahe_grid_size: int = 4
     gaussian_kernel_size: int = 3

@@ -36,6 +36,7 @@ class _TrackedTextBox:
 class _OCRCroppedBox:
     rect: tuple[int, int, int, int]
     crop: np.ndarray
+    fingerprint: np.ndarray
     psm: int
 
 
@@ -45,6 +46,16 @@ class _CachedOCRResult:
     fingerprint: np.ndarray
     text: str
     confidence: float | None = None
+    ocr_language: str = ""
+    psm: int = 7
+    translated_text: str = ""
+    source_language_code: str = "unknown"
+    source_language_label: str = "Unknown"
+    target_language_code: str = "tha"
+    target_language_label: str = "Thai"
+    last_seen_generation: int = 0
+    last_ocr_generation: int = 0
+    stable_hits: int = 1
 
 
 class TextDetectionPipeline:
@@ -63,10 +74,15 @@ class TextDetectionPipeline:
         self._recent_translation_lookup: dict[tuple[str, str, str], str] = {}
         self._recent_translation_candidates: list[tuple[DetectionBox, str]] = []
         self._recent_ocr_results: list[_CachedOCRResult] = []
+        self._ocr_cache_generation = 0
+        self._last_ocr_reuse_count = 0
+        self._last_ocr_candidate_count = 0
+        self._last_ocr_submitted_count = 0
         self._ocr_box_tracks: list[_TrackedTextBox] = []
         self._previous_motion_gray: np.ndarray | None = None
         self._current_motion_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._current_scaled_motion_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._active_detection_scale = 1.0
         self._blank_translation_frames = 0
         self._pending_translation_frames = 0
         self._deep_text_detector: TextDetectorBackend | None = None
@@ -80,33 +96,33 @@ class TextDetectionPipeline:
     def process(self, frame: np.ndarray, *, monitor_label: str = "") -> FrameAnalysis:
         started = perf_counter()
 
-        scaled_frame, scale = self._scale_frame(frame)
-        enhanced_gray = self._enhance_grayscale(scaled_frame)
-        mask = self._build_text_mask(scaled_frame, enhanced_gray)
+        detection_frame, detection_scale = self._scale_frame(frame)
+        self._active_detection_scale = detection_scale
+        detection_gray = self._enhance_grayscale(detection_frame)
+        mask = self._build_text_mask(detection_frame, detection_gray)
         line_mask = self._build_line_mask(mask)
-        working_boxes = self._detect_text_boxes(scaled_frame, line_mask, mask, enhanced_gray)
+        detection_boxes = self._detect_text_boxes(detection_frame, line_mask, mask, detection_gray)
+        working_boxes = self._map_boxes_to_source_frame(detection_boxes, frame.shape, detection_scale)
+        ocr_gray = self._source_ocr_grayscale(frame, detection_gray, detection_scale)
         stable_working_boxes = self._stabilize_ocr_boxes(working_boxes)
-        motion_filtered_boxes = self._filter_motion_ocr_boxes(stable_working_boxes, enhanced_gray)
+        motion_filtered_boxes = self._filter_motion_ocr_boxes(stable_working_boxes, ocr_gray)
         motion_offset_x, motion_offset_y, motion_confidence = self._estimate_frame_offset(
-            enhanced_gray,
-            scale,
+            ocr_gray,
+            1.0,
         )
         self._current_motion_offset = (motion_offset_x, motion_offset_y, motion_confidence)
-        self._current_scaled_motion_offset = (
-            motion_offset_x * scale,
-            motion_offset_y * scale,
-            motion_confidence,
-        )
-        boxes = self._annotate_with_ocr(motion_filtered_boxes, enhanced_gray, frame.shape, scale)
+        self._current_scaled_motion_offset = self._current_motion_offset
+        boxes = self._annotate_with_ocr(motion_filtered_boxes, ocr_gray, frame.shape, 1.0)
         boxes = self._apply_translations(boxes)
+        self._remember_ocr_translations(boxes)
         if self.settings.overlay_tracking_enabled:
             content_offset_x, content_offset_y, content_motion_confidence = self._current_motion_offset
         else:
             content_offset_x, content_offset_y, content_motion_confidence = 0.0, 0.0, 0.0
-        self._previous_motion_gray = enhanced_gray.copy()
+        self._previous_motion_gray = ocr_gray.copy()
 
         annotated = self._draw_annotations(frame.copy(), boxes)
-        processed_preview = self._draw_mask_preview(line_mask, working_boxes)
+        processed_preview = self._draw_mask_preview(line_mask, detection_boxes, output_shape=frame.shape)
 
         elapsed = max(perf_counter() - started, 1e-6)
         return FrameAnalysis(
@@ -125,11 +141,54 @@ class TextDetectionPipeline:
         )
 
     def _scale_frame(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
-        scale = max(self.settings.upscale_factor, 1.0)
+        scale = self._effective_detection_scale()
         if scale == 1.0:
             return frame.copy(), scale
-        scaled = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        scaled = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=interpolation)
         return scaled, scale
+
+    def _source_ocr_grayscale(
+        self,
+        frame: np.ndarray,
+        detection_gray: np.ndarray,
+        detection_scale: float,
+    ) -> np.ndarray:
+        if detection_scale == 1.0 and detection_gray.shape[:2] == frame.shape[:2]:
+            return detection_gray
+        return self._enhance_grayscale(frame)
+
+    @staticmethod
+    def _map_boxes_to_source_frame(
+        boxes: list[tuple[int, int, int, int]],
+        source_shape: tuple[int, int, int],
+        scale: float,
+    ) -> list[tuple[int, int, int, int]]:
+        if not boxes:
+            return []
+
+        source_height, source_width = source_shape[:2]
+        if scale == 1.0:
+            return [
+                (
+                    max(min(x, source_width - 1), 0),
+                    max(min(y, source_height - 1), 0),
+                    max(min(w, source_width - max(min(x, source_width - 1), 0)), 1),
+                    max(min(h, source_height - max(min(y, source_height - 1), 0)), 1),
+                )
+                for x, y, w, h in boxes
+            ]
+
+        mapped: list[tuple[int, int, int, int]] = []
+        pad_x = int(np.ceil(2.0 / scale)) if scale < 1.0 else 0
+        pad_y = int(np.ceil(6.0 / scale)) if scale < 1.0 else 0
+        for x, y, w, h in boxes:
+            left = max(int(np.floor(x / scale)) - pad_x, 0)
+            top = max(int(np.floor(y / scale)) - pad_y, 0)
+            right = min(max(int(np.ceil((x + w) / scale)) + pad_x, left + 1), source_width)
+            bottom = min(max(int(np.ceil((y + h) / scale)) + pad_y, top + 1), source_height)
+            mapped.append((left, top, right - left, bottom - top))
+        return mapped
 
     def _enhance_grayscale(self, frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -145,7 +204,7 @@ class TextDetectionPipeline:
         return enhanced
 
     def _build_text_mask(self, frame: np.ndarray, gray: np.ndarray) -> np.ndarray:
-        block_size = self._ensure_odd(self.settings.threshold_block_size)
+        block_size = self._ensure_odd(self._scaled_detection_length(self.settings.threshold_block_size, minimum=11))
         threshold_c = self.settings.threshold_c
 
         dark_text_mask = cv2.adaptiveThreshold(
@@ -175,7 +234,10 @@ class TextDetectionPipeline:
         adaptive_strokes = cv2.bitwise_and(polarity_mask, contrast_or_edge)
         feature_strokes = cv2.bitwise_and(feature_mask, cv2.bitwise_or(polarity_mask, local_contrast_mask))
         combined = cv2.bitwise_or(adaptive_strokes, feature_strokes)
-        if cv2.countNonZero(combined) < max(180, cv2.countNonZero(polarity_mask) // 16):
+        if cv2.countNonZero(combined) < max(
+            self._scaled_detection_area(180, minimum=60),
+            cv2.countNonZero(polarity_mask) // 16,
+        ):
             combined = cv2.bitwise_or(
                 cv2.bitwise_and(polarity_mask, local_contrast_mask),
                 stroke_mask,
@@ -228,11 +290,20 @@ class TextDetectionPipeline:
         return self._suppress_large_mask_components(overlay_mask)
 
     def _build_stroke_response_mask(self, gray: np.ndarray) -> np.ndarray:
+        horizontal_width = max(
+            self._scaled_detection_length(self.settings.morphology_width, minimum=5),
+            self._scaled_detection_length(9, minimum=5),
+        )
+        horizontal_height = max(
+            self._scaled_detection_length(self.settings.morphology_height, minimum=2),
+            2,
+        )
+        compact_size = self._scaled_detection_length(5, minimum=3)
         horizontal_kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT,
-            (max(self.settings.morphology_width, 9), max(self.settings.morphology_height, 3)),
+            (horizontal_width, horizontal_height),
         )
-        compact_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        compact_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (compact_size, compact_size))
         bright_response = cv2.max(
             cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, horizontal_kernel),
             cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, compact_kernel),
@@ -245,7 +316,7 @@ class TextDetectionPipeline:
         return self._threshold_response_mask(response, minimum_threshold=8, std_multiplier=0.45)
 
     def _build_local_contrast_mask(self, gray: np.ndarray, block_size: int) -> np.ndarray:
-        window = max(block_size, 15)
+        window = max(block_size, self._scaled_detection_length(15, minimum=9))
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (window, window))
         local_max = cv2.dilate(gray, kernel)
         local_min = cv2.erode(gray, kernel)
@@ -319,7 +390,13 @@ class TextDetectionPipeline:
         )
         horizontal_kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT,
-            (max(self.settings.morphology_width + 2, 13), max(self.settings.morphology_height, 3)),
+            (
+                max(
+                    self._scaled_detection_length(self.settings.morphology_width + 2, minimum=11),
+                    self._scaled_detection_length(13, minimum=11),
+                ),
+                max(self._scaled_detection_length(self.settings.morphology_height, minimum=2), 2),
+            ),
         )
 
         line_mask = cv2.morphologyEx(dense_mask, cv2.MORPH_CLOSE, horizontal_kernel)
@@ -389,6 +466,9 @@ class TextDetectionPipeline:
         frame_height, frame_width = frame_shape[:2]
         frame_area = max(frame_height * frame_width, 1)
         max_box_height = int(frame_height * self.settings.max_box_height_ratio)
+        min_contour_area = self._scaled_detection_area(self.settings.min_contour_area, minimum=24)
+        min_box_width = self._scaled_detection_length(self.settings.min_box_width, minimum=8)
+        min_box_height = self._scaled_detection_length(self.settings.min_box_height, minimum=4)
 
         candidates: list[tuple[int, int, int, int]] = []
         for x, y, w, h in boxes:
@@ -401,11 +481,11 @@ class TextDetectionPipeline:
             area = clipped_w * clipped_h
             aspect_ratio = clipped_w / max(clipped_h, 1)
 
-            if area < self.settings.min_contour_area:
+            if area < min_contour_area:
                 continue
             if area > int(frame_area * 0.20):
                 continue
-            if clipped_w < self.settings.min_box_width or clipped_h < self.settings.min_box_height:
+            if clipped_w < min_box_width or clipped_h < min_box_height:
                 continue
             if clipped_h > max_box_height:
                 continue
@@ -426,6 +506,10 @@ class TextDetectionPipeline:
         component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(line_mask, connectivity=8)
         max_box_height = int(frame_shape[0] * self.settings.max_box_height_ratio)
         frame_area = frame_shape[0] * frame_shape[1]
+        min_contour_area = self._scaled_detection_area(self.settings.min_contour_area, minimum=24)
+        min_box_width = self._scaled_detection_length(self.settings.min_box_width, minimum=8)
+        min_box_height = self._scaled_detection_length(self.settings.min_box_height, minimum=4)
+        tall_box_threshold = self._scaled_detection_length(120, minimum=40)
 
         candidates: list[tuple[int, int, int, int]] = []
         for component_index in range(1, component_count):
@@ -433,13 +517,13 @@ class TextDetectionPipeline:
             area = w * h
             aspect_ratio = w / max(h, 1)
 
-            if area < self.settings.min_contour_area:
+            if area < min_contour_area:
                 continue
             if area > int(frame_area * 0.08):
                 continue
-            if h > 120 and area > int(frame_area * 0.035):
+            if h > tall_box_threshold and area > int(frame_area * 0.035):
                 continue
-            if w < self.settings.min_box_width or h < self.settings.min_box_height:
+            if w < min_box_width or h < min_box_height:
                 continue
             if h > max_box_height:
                 continue
@@ -501,12 +585,132 @@ class TextDetectionPipeline:
         original_shape: tuple[int, int, int],
         scale: float,
     ) -> list[DetectionBox]:
-        detected_boxes: list[DetectionBox] = []
-        ocr_boxes = self._select_ocr_boxes(working_boxes)
+        self._ocr_cache_generation += 1
+        self._last_ocr_reuse_count = 0
+        self._last_ocr_candidate_count = 0
+        self._last_ocr_submitted_count = 0
         ocr_attempted = self.settings.ocr_enabled and self.ocr_backend.is_available()
-        ocr_candidates: list[_OCRCroppedBox] = []
 
-        for x, y, w, h in ocr_boxes:
+        if not ocr_attempted:
+            ocr_candidates = self._prepare_ocr_candidates(
+                self._select_ocr_boxes(working_boxes),
+                enhanced_gray,
+            )
+            self._last_ocr_candidate_count = len(ocr_candidates)
+            return [
+                self._detection_box_from_ocr_candidate(
+                    candidate,
+                    original_shape=original_shape,
+                    scale=scale,
+                    text="",
+                    confidence=None,
+                    cached_result=None,
+                )
+                for candidate in ocr_candidates
+            ]
+
+        ocr_candidates = self._prepare_ocr_candidates(working_boxes, enhanced_gray)
+        self._last_ocr_candidate_count = len(ocr_candidates)
+        cached_items: list[tuple[_OCRCroppedBox, _CachedOCRResult]] = []
+        pending_candidates: list[_OCRCroppedBox] = []
+        used_cache_ids: set[int] = set()
+
+        for candidate in ocr_candidates:
+            cached_result = self._find_cached_ocr_result(candidate, used_cache_ids)
+            if cached_result is None:
+                pending_candidates.append(candidate)
+                continue
+
+            used_cache_ids.add(id(cached_result))
+            self._touch_cached_ocr_result(cached_result, candidate)
+            cached_items.append((candidate, cached_result))
+
+        selected_pending_candidates = self._select_pending_ocr_candidates(pending_candidates)
+        selected_pending_candidates.sort(key=lambda candidate: (candidate.rect[1], candidate.rect[0]))
+        self._last_ocr_reuse_count = len(cached_items)
+        self._last_ocr_submitted_count = len(selected_pending_candidates)
+
+        pending_results: list[OCRResult] = []
+        if selected_pending_candidates:
+            pending_results = self.ocr_backend.recognize_batch(
+                [self.ocr_backend.prepare_image(candidate.crop) for candidate in selected_pending_candidates],
+                language=self.settings.ocr_language,
+                psms=[candidate.psm for candidate in selected_pending_candidates],
+            )
+
+        pending_result_by_id = {
+            id(candidate): result
+            for candidate, result in zip(selected_pending_candidates, pending_results, strict=False)
+        }
+        ocr_cache_updates: list[_CachedOCRResult] = []
+        detected_boxes: list[DetectionBox] = []
+
+        for candidate, cached_result in cached_items:
+            detected_boxes.append(
+                self._detection_box_from_ocr_candidate(
+                    candidate,
+                    original_shape=original_shape,
+                    scale=scale,
+                    text=cached_result.text,
+                    confidence=cached_result.confidence,
+                    cached_result=cached_result,
+                )
+            )
+
+        for candidate in selected_pending_candidates:
+            ocr_result = pending_result_by_id.get(id(candidate), OCRResult())
+            text = self._normalize_recognized_text(ocr_result.text)
+            confidence = ocr_result.confidence
+            if text and not self._is_usable_text(text, confidence):
+                text = ""
+                confidence = None
+
+            cached_result = None
+            if text:
+                source_language_code, source_language_label = self._resolve_source_language(text)
+                target_language = get_target_language_option(self.settings.target_language_code)
+                cached_result = _CachedOCRResult(
+                    rect=candidate.rect,
+                    fingerprint=candidate.fingerprint,
+                    text=text,
+                    confidence=confidence,
+                    ocr_language=self.settings.ocr_language,
+                    psm=candidate.psm,
+                    source_language_code=source_language_code,
+                    source_language_label=source_language_label,
+                    target_language_code=target_language.code,
+                    target_language_label=target_language.label,
+                    last_seen_generation=self._ocr_cache_generation,
+                    last_ocr_generation=self._ocr_cache_generation,
+                )
+                ocr_cache_updates.append(cached_result)
+
+            detected_boxes.append(
+                self._detection_box_from_ocr_candidate(
+                    candidate,
+                    original_shape=original_shape,
+                    scale=scale,
+                    text=text,
+                    confidence=confidence,
+                    cached_result=cached_result,
+                )
+            )
+
+        if ocr_cache_updates:
+            self._remember_ocr_results(ocr_cache_updates)
+        else:
+            self._prune_ocr_results()
+
+        detected_boxes.sort(key=lambda box: (box.y, box.x))
+        return detected_boxes
+
+    def _prepare_ocr_candidates(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        enhanced_gray: np.ndarray,
+    ) -> list[_OCRCroppedBox]:
+        candidates: list[_OCRCroppedBox] = []
+        for x, y, w, h in boxes:
             if self._should_skip_ocr_candidate((x, y, w, h), enhanced_gray.shape):
                 continue
 
@@ -516,101 +720,75 @@ class TextDetectionPipeline:
             crop_y1 = max(y - pad_y, 0)
             crop_x2 = min(x + w + pad_x, enhanced_gray.shape[1])
             crop_y2 = min(y + h + pad_y, enhanced_gray.shape[0])
-
             crop = enhanced_gray[crop_y1:crop_y2, crop_x1:crop_x2]
-            ocr_candidates.append(
+            candidates.append(
                 _OCRCroppedBox(
                     rect=(x, y, w, h),
                     crop=crop,
+                    fingerprint=self._ocr_crop_fingerprint(crop),
                     psm=self._resolve_psm(w, h),
                 )
             )
+        return candidates
 
-        ocr_results: list[OCRResult | None] = [None] * len(ocr_candidates)
-        candidate_fingerprints: list[np.ndarray] = []
-        if ocr_attempted and ocr_candidates:
-            pending_indices: list[int] = []
-            pending_candidates: list[_OCRCroppedBox] = []
+    def _select_pending_ocr_candidates(self, candidates: list[_OCRCroppedBox]) -> list[_OCRCroppedBox]:
+        limit = max(self.settings.max_ocr_boxes_per_frame, 1)
+        if len(candidates) <= limit:
+            return list(candidates)
 
-            for index, candidate in enumerate(ocr_candidates):
-                fingerprint = self._ocr_crop_fingerprint(candidate.crop)
-                candidate_fingerprints.append(fingerprint)
-                cached_result = self._find_cached_ocr_result(candidate.rect, fingerprint)
-                if cached_result is not None:
-                    ocr_results[index] = cached_result
-                    continue
+        return sorted(
+            candidates,
+            key=lambda candidate: self._ocr_candidate_priority(candidate.rect),
+            reverse=True,
+        )[:limit]
 
-                pending_indices.append(index)
-                pending_candidates.append(candidate)
+    def _detection_box_from_ocr_candidate(
+        self,
+        candidate: _OCRCroppedBox,
+        *,
+        original_shape: tuple[int, int, int],
+        scale: float,
+        text: str,
+        confidence: float | None,
+        cached_result: _CachedOCRResult | None,
+    ) -> DetectionBox:
+        x, y, w, h = candidate.rect
+        mapped_x = int(x / scale)
+        mapped_y = int(y / scale)
+        mapped_w = int(w / scale)
+        mapped_h = int(h / scale)
 
-            pending_results = []
-            if pending_candidates:
-                pending_results = self.ocr_backend.recognize_batch(
-                    [self.ocr_backend.prepare_image(candidate.crop) for candidate in pending_candidates],
-                    language=self.settings.ocr_language,
-                    psms=[candidate.psm for candidate in pending_candidates],
-                )
+        mapped_w = min(mapped_w, original_shape[1] - mapped_x)
+        mapped_h = min(mapped_h, original_shape[0] - mapped_y)
+        target_language = get_target_language_option(self.settings.target_language_code)
 
-            for index, ocr_result in zip(pending_indices, pending_results, strict=False):
-                ocr_results[index] = ocr_result
-
-        elif ocr_candidates:
-            candidate_fingerprints = [self._ocr_crop_fingerprint(candidate.crop) for candidate in ocr_candidates]
-
-        ocr_cache_updates: list[_CachedOCRResult] = []
-        for candidate_index, (candidate, ocr_result) in enumerate(zip(ocr_candidates, ocr_results, strict=False)):
-            x, y, w, h = candidate.rect
-            text = ""
-            confidence = None
-            if ocr_result is not None:
-                text = ocr_result.text
-                confidence = ocr_result.confidence
-
-            text = self._normalize_recognized_text(text)
-            if ocr_attempted and text and not self._is_usable_text(text, confidence):
-                text = ""
-                confidence = None
-
-            if ocr_attempted and text:
-                if candidate_index < len(candidate_fingerprints):
-                    ocr_cache_updates.append(
-                        _CachedOCRResult(
-                            rect=candidate.rect,
-                            fingerprint=candidate_fingerprints[candidate_index],
-                            text=text,
-                            confidence=confidence,
-                        )
-                    )
-
-            mapped_x = int(x / scale)
-            mapped_y = int(y / scale)
-            mapped_w = int(w / scale)
-            mapped_h = int(h / scale)
-
-            mapped_w = min(mapped_w, original_shape[1] - mapped_x)
-            mapped_h = min(mapped_h, original_shape[0] - mapped_y)
+        if cached_result is not None and cached_result.text == text and cached_result.source_language_code != "unknown":
+            source_language_code = cached_result.source_language_code
+            source_language_label = cached_result.source_language_label
+        else:
             source_language_code, source_language_label = self._resolve_source_language(text)
-            target_language = get_target_language_option(self.settings.target_language_code)
 
-            detected_boxes.append(
-                DetectionBox(
-                    x=max(mapped_x, 0),
-                    y=max(mapped_y, 0),
-                    w=max(mapped_w, 1),
-                    h=max(mapped_h, 1),
-                    text=text,
-                    source_language_code=source_language_code,
-                    source_language_label=source_language_label,
-                    target_language_code=target_language.code,
-                    target_language_label=target_language.label,
-                    confidence=confidence,
-                )
-            )
+        translated_text = ""
+        if (
+            cached_result is not None
+            and cached_result.text == text
+            and cached_result.target_language_code == target_language.code
+        ):
+            translated_text = cached_result.translated_text
 
-        if ocr_attempted:
-            self._remember_ocr_results(ocr_cache_updates)
-
-        return detected_boxes
+        return DetectionBox(
+            x=max(mapped_x, 0),
+            y=max(mapped_y, 0),
+            w=max(mapped_w, 1),
+            h=max(mapped_h, 1),
+            text=text,
+            translated_text=translated_text,
+            source_language_code=source_language_code,
+            source_language_label=source_language_label,
+            target_language_code=target_language.code,
+            target_language_label=target_language.label,
+            confidence=confidence,
+        )
 
     @staticmethod
     def _should_skip_ocr_candidate(
@@ -636,48 +814,148 @@ class TextDetectionPipeline:
 
         return False
 
-    def _find_cached_ocr_result(self, rect: tuple[int, int, int, int], fingerprint: np.ndarray) -> OCRResult | None:
+    def _find_cached_ocr_result(
+        self,
+        candidate: _OCRCroppedBox,
+        used_cache_ids: set[int],
+    ) -> _CachedOCRResult | None:
         best_match: _CachedOCRResult | None = None
-        best_overlap = 0.0
+        best_score = 0.0
 
         for cached in self._recent_ocr_results:
-            for cached_rect, motion_adjusted in self._iter_motion_adjusted_rects(cached.rect, scaled=True):
-                overlap = self._intersection_over_union(rect, cached_rect)
+            if id(cached) in used_cache_ids:
+                continue
+            if cached.ocr_language and cached.ocr_language != self.settings.ocr_language:
+                continue
+            if cached.psm != candidate.psm:
+                continue
+
+            for cached_rect, motion_adjusted in self._iter_ocr_cache_rects(cached.rect):
+                overlap = self._intersection_over_union(candidate.rect, cached_rect)
                 minimum_overlap = 0.68 if motion_adjusted else 0.82
-                if overlap < minimum_overlap or overlap <= best_overlap:
+                if overlap < minimum_overlap:
                     continue
 
-                difference = self._ocr_fingerprint_difference(fingerprint, cached.fingerprint)
+                difference = self._ocr_fingerprint_difference(candidate.fingerprint, cached.fingerprint)
                 difference_limit = 8.5 if motion_adjusted else 5.5
                 if difference > difference_limit:
                     continue
 
-                best_match = cached
-                best_overlap = overlap
+                proximity = self._rect_center_proximity(candidate.rect, cached_rect)
+                size_similarity = self._rect_size_similarity(candidate.rect, cached_rect)
+                fingerprint_score = max(1.0 - (difference / max(difference_limit, 1e-6)), 0.0)
+                score = (
+                    (overlap * 0.48)
+                    + (fingerprint_score * 0.34)
+                    + (proximity * 0.10)
+                    + (size_similarity * 0.08)
+                    + min(cached.stable_hits * 0.01, 0.08)
+                )
+                if motion_adjusted:
+                    score += 0.04
+                if score > best_score:
+                    best_match = cached
+                    best_score = score
 
-        if best_match is None:
-            return None
-        return OCRResult(text=best_match.text, confidence=best_match.confidence)
+        return best_match
+
+    def _iter_ocr_cache_rects(
+        self,
+        rect: tuple[int, int, int, int],
+    ) -> list[tuple[tuple[int, int, int, int], bool]]:
+        variants = self._iter_motion_adjusted_rects(rect, scaled=False)
+        if self._current_motion_offset[2] >= 0.06 or self._current_scaled_motion_offset[2] < 0.06:
+            return variants
+
+        seen = {candidate for candidate, _motion_adjusted in variants}
+        for candidate, motion_adjusted in self._iter_motion_adjusted_rects(rect, scaled=True):
+            if candidate in seen:
+                continue
+            variants.append((candidate, motion_adjusted))
+            seen.add(candidate)
+        return variants
+
+    def _touch_cached_ocr_result(self, cached: _CachedOCRResult, candidate: _OCRCroppedBox) -> None:
+        cached.rect = candidate.rect
+        cached.fingerprint = candidate.fingerprint
+        cached.last_seen_generation = self._ocr_cache_generation
+        cached.stable_hits += 1
 
     def _remember_ocr_results(self, updates: list[_CachedOCRResult]) -> None:
         if not updates:
             return
+
+        for update in updates:
+            update.last_seen_generation = self._ocr_cache_generation
+            update.last_ocr_generation = self._ocr_cache_generation
 
         remembered = [*updates, *self._recent_ocr_results]
         deduped: list[_CachedOCRResult] = []
         for candidate in remembered:
             if not candidate.text:
                 continue
+            if self._ocr_cache_generation - candidate.last_seen_generation > self._max_ocr_cache_age_frames():
+                continue
             if any(
                 existing.text == candidate.text
+                and existing.ocr_language == candidate.ocr_language
+                and existing.psm == candidate.psm
                 and self._intersection_over_union(existing.rect, candidate.rect) >= 0.92
                 for existing in deduped
             ):
                 continue
             deduped.append(candidate)
 
-        limit = max(self.settings.max_ocr_boxes_per_frame * 4, 32)
+        limit = self._max_ocr_cache_entries()
         self._recent_ocr_results = deduped[:limit]
+
+    def _prune_ocr_results(self) -> None:
+        max_age = self._max_ocr_cache_age_frames()
+        self._recent_ocr_results = [
+            cached
+            for cached in self._recent_ocr_results
+            if self._ocr_cache_generation - cached.last_seen_generation <= max_age
+        ][: self._max_ocr_cache_entries()]
+
+    def _remember_ocr_translations(self, boxes: list[DetectionBox]) -> None:
+        if not boxes or not self._recent_ocr_results:
+            return
+
+        for box in boxes:
+            normalized_text = self._normalize_text_for_matching(box.text)
+            if not normalized_text:
+                continue
+
+            rect = (box.x, box.y, box.w, box.h)
+            best_match: _CachedOCRResult | None = None
+            best_score = 0.0
+            for cached in self._recent_ocr_results:
+                if self._normalize_text_for_matching(cached.text) != normalized_text:
+                    continue
+
+                score = self._intersection_over_union(rect, cached.rect)
+                if score <= best_score:
+                    continue
+                best_match = cached
+                best_score = score
+
+            if best_match is None or best_score < 0.45:
+                continue
+
+            best_match.source_language_code = box.source_language_code
+            best_match.source_language_label = box.source_language_label
+            if box.translated_text:
+                best_match.target_language_code = box.target_language_code
+                best_match.target_language_label = box.target_language_label
+                best_match.translated_text = box.translated_text
+            best_match.confidence = box.confidence
+            best_match.last_seen_generation = self._ocr_cache_generation
+
+    def _max_ocr_cache_entries(self) -> int:
+        return max(self.settings.max_boxes * 4, self.settings.max_ocr_boxes_per_frame * 8, 128)
+
+    def _max_ocr_cache_age_frames(self) -> int:
+        return 150 if self.settings.overlay_tracking_enabled else 90
 
     @staticmethod
     def _ocr_crop_fingerprint(crop: np.ndarray) -> np.ndarray:
@@ -1350,10 +1628,18 @@ class TextDetectionPipeline:
         self,
         mask: np.ndarray,
         working_boxes: list[tuple[int, int, int, int]],
+        *,
+        output_shape: tuple[int, int, int] | None = None,
     ) -> np.ndarray:
         preview = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         for x, y, w, h in working_boxes:
             cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 215, 255), 2)
+        if output_shape is not None and preview.shape[:2] != output_shape[:2]:
+            preview = cv2.resize(
+                preview,
+                (output_shape[1], output_shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
         return preview
 
     def _status_message(self) -> str:
@@ -1364,6 +1650,11 @@ class TextDetectionPipeline:
         translation_status = self.translation_backend.describe()
         if self.settings.ocr_enabled and self.ocr_backend.is_available():
             ocr_status = f"{self.ocr_backend.describe()} | {self.settings.max_ocr_boxes_per_frame} boxes/frame"
+            if self._last_ocr_candidate_count:
+                ocr_status = (
+                    f"{ocr_status} | submitted {self._last_ocr_submitted_count}, "
+                    f"reused {self._last_ocr_reuse_count}/{self._last_ocr_candidate_count}"
+                )
             return f"{route} | {detector_status} | {ocr_status} | {translation_status}"
         if self.settings.ocr_enabled:
             return f"{route} | {detector_status} | {self.ocr_backend.describe()} | {translation_status}"
@@ -1371,11 +1662,17 @@ class TextDetectionPipeline:
 
     def _detector_status_message(self) -> str:
         mode = normalize_text_detector_mode(self.settings.text_detector_mode)
+        scale = self._effective_detection_scale()
+        scale_suffix = f" @ {scale:.2f}x" if abs(scale - 1.0) >= 0.01 else ""
         if mode == "opencv":
-            return "OpenCV morphology detector"
+            return f"OpenCV morphology detector{scale_suffix}"
 
         detector = self._ensure_deep_text_detector(mode)
-        return detector.describe()
+        return f"{detector.describe()}{scale_suffix}"
+
+    def _effective_detection_scale(self) -> float:
+        detector_scale = min(max(self.settings.detection_scale, 0.25), 1.0)
+        return max(self.settings.upscale_factor, 1.0) * detector_scale
 
     def _resolve_source_language(self, text: str) -> tuple[str, str]:
         if self.settings.source_language_code not in {"auto", "tha+eng"}:
@@ -1391,3 +1688,13 @@ class TextDetectionPipeline:
     @staticmethod
     def _ensure_odd(value: int) -> int:
         return value if value % 2 == 1 else value + 1
+
+    def _detection_threshold_scale(self) -> float:
+        return min(max(self._active_detection_scale, 0.25), 1.0)
+
+    def _scaled_detection_length(self, value: int, *, minimum: int) -> int:
+        return max(int(round(value * self._detection_threshold_scale())), minimum)
+
+    def _scaled_detection_area(self, value: int, *, minimum: int) -> int:
+        scale = self._detection_threshold_scale()
+        return max(int(round(value * scale * scale)), minimum)

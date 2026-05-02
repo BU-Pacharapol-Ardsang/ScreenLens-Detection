@@ -4,6 +4,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import cv2
 import numpy as np
+from PySide6.QtCore import QRect
 from PySide6.QtWidgets import QApplication
 
 from screenlens_detection.models import DetectionBox, FrameAnalysis, MonitorSpec
@@ -59,6 +60,29 @@ def test_overlay_font_size_tracks_detected_box_height() -> None:
     assert overlay_font_pixel_size(14) < overlay_font_pixel_size(30)
     assert overlay_font_pixel_size(30) < overlay_font_pixel_size(60)
     assert overlay_font_pixel_size(14) <= 10
+
+
+def test_overlay_expands_bubble_for_long_translated_text() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    anchor_rect = QRect(260, 120, 72, 18)
+    text = "Translated quest objective with enough words to overflow"
+    expanded = TranslationOverlay._expanded_bubble_rect(
+        anchor_rect,
+        text,
+        bounds_width=320,
+        bounds_height=180,
+    )
+
+    assert expanded.width() > anchor_rect.width()
+    assert expanded.height() >= anchor_rect.height()
+    assert expanded.right() <= 320
+
+    text_rect = expanded.adjusted(4, 2, -4, -2)
+    font = TranslationOverlay._font_for_text(text, text_rect, overlay_font_pixel_size(anchor_rect.height()))
+
+    assert font.pixelSize() > 1
 
 
 def test_overlay_tracks_existing_boxes_during_blank_scroll_frame() -> None:

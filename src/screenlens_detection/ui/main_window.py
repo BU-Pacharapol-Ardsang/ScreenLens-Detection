@@ -71,6 +71,12 @@ class MainWindow(QMainWindow):
         self.scale_spin.setSingleStep(0.25)
         self.scale_spin.setValue(defaults.upscale_factor)
 
+        self.detection_scale_spin = QDoubleSpinBox()
+        self.detection_scale_spin.setRange(0.40, 1.00)
+        self.detection_scale_spin.setDecimals(2)
+        self.detection_scale_spin.setSingleStep(0.05)
+        self.detection_scale_spin.setValue(defaults.detection_scale)
+
         self.area_spin = QSpinBox()
         self.area_spin.setRange(50, 10000)
         self.area_spin.setValue(defaults.min_contour_area)
@@ -144,6 +150,7 @@ class MainWindow(QMainWindow):
         settings_layout = QFormLayout(settings_box)
         settings_layout.addRow("Capture interval", self.interval_spin)
         settings_layout.addRow("Upscale factor", self.scale_spin)
+        settings_layout.addRow("Detector scale", self.detection_scale_spin)
         settings_layout.addRow("Min contour area", self.area_spin)
         settings_layout.addRow("Text detector", self.text_detector_combo)
         settings_layout.addRow("OCR boxes/frame", self.ocr_boxes_control)
@@ -196,6 +203,7 @@ class MainWindow(QMainWindow):
         self.refresh_button.setEnabled(not locked)
         self.interval_spin.setEnabled(not locked)
         self.scale_spin.setEnabled(not locked)
+        self.detection_scale_spin.setEnabled(not locked)
         self.area_spin.setEnabled(not locked)
         self.ocr_boxes_slider.setEnabled(not locked)
         self.source_language_combo.setEnabled(not locked)
@@ -270,6 +278,7 @@ class MainWindow(QMainWindow):
         settings = PipelineSettings(
             capture_interval_ms=self.interval_spin.value(),
             upscale_factor=self.scale_spin.value(),
+            detection_scale=self.detection_scale_spin.value(),
             min_contour_area=self.area_spin.value(),
             text_detector_mode=self.text_detector_combo.currentData(),
             max_ocr_boxes_per_frame=self.ocr_boxes_slider.value(),
@@ -560,7 +569,19 @@ class MainWindow(QMainWindow):
                 text = overlay_text_for_box(box)
                 if not text:
                     continue
-                MainWindow._paint_translated_preview_box(painter, QRect(box.x, box.y, box.w, box.h), text)
+                anchor_rect = QRect(box.x, box.y, box.w, box.h)
+                bubble_rect = TranslationOverlay._expanded_bubble_rect(
+                    anchor_rect,
+                    text,
+                    bounds_width=width,
+                    bounds_height=height,
+                )
+                MainWindow._paint_translated_preview_box(
+                    painter,
+                    bubble_rect,
+                    text,
+                    anchor_height=anchor_rect.height(),
+                )
         finally:
             painter.end()
 
@@ -570,10 +591,17 @@ class MainWindow(QMainWindow):
         return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
 
     @staticmethod
-    def _paint_translated_preview_box(painter: QPainter, rect: QRect, text: str) -> None:
+    def _paint_translated_preview_box(
+        painter: QPainter,
+        rect: QRect,
+        text: str,
+        *,
+        anchor_height: int | None = None,
+    ) -> None:
         accent = QColor(48, 231, 149, 220)
         background = QColor(15, 23, 42, 212)
         text_color = QColor(248, 250, 252)
+        font_anchor_height = rect.height() if anchor_height is None else anchor_height
 
         bubble_rect = rect.adjusted(0, 0, -1, -1)
         radius = max(min(rect.height() // 4, 8), 2)
@@ -591,7 +619,7 @@ class MainWindow(QMainWindow):
         if text_rect.width() <= 0 or text_rect.height() <= 0:
             text_rect = bubble_rect
 
-        painter.setFont(TranslationOverlay._font_for_text(text, text_rect, overlay_font_pixel_size(rect.height())))
+        painter.setFont(TranslationOverlay._font_for_text(text, text_rect, overlay_font_pixel_size(font_anchor_height)))
         painter.setPen(text_color)
         painter.drawText(
             text_rect,
