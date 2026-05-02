@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
+import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +37,20 @@ class OCRResult:
     confidence: float | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class _OCRCacheKey:
+    digest: bytes
+    shape: tuple[int, ...]
+    language: str
+    psm: int
+
+
+@dataclass(slots=True)
+class _QueuedOCRItem:
+    key: _OCRCacheKey
+    image: np.ndarray
+
+
 class OCRBackend:
     name = "disabled"
 
@@ -58,12 +75,241 @@ class OCRBackend:
             for image, psm in zip(images, psms, strict=False)
         ]
 
+    def close(self) -> None:
+        return None
+
 
 class NoOpOCRBackend(OCRBackend):
     name = "disabled"
 
     def describe(self) -> str:
         return "Detection-only mode"
+
+
+class QueuedOCRBackend(OCRBackend):
+    name = "queued-ocr"
+
+    def __init__(
+        self,
+        underlying: OCRBackend,
+        *,
+        max_batch_size: int = 32,
+        synchronous_batch_size: int = 4,
+        max_queue_size: int = 96,
+    ) -> None:
+        self._underlying = underlying
+        self._max_batch_size = max(max_batch_size, 1)
+        self._synchronous_batch_size = max(synchronous_batch_size, 0)
+        self._max_queue_size = max(max_queue_size, self._max_batch_size)
+        self._cache: dict[_OCRCacheKey, OCRResult] = {}
+        self._queue: deque[_QueuedOCRItem] = deque()
+        self._queued_keys: set[_OCRCacheKey] = set()
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._closed = False
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"{underlying.name}-ocr-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def is_available(self) -> bool:
+        return self._underlying.is_available()
+
+    def describe(self) -> str:
+        return f"{self._underlying.describe()} (queued)"
+
+    def runtime_diagnostics(self) -> str:
+        if self._synchronous_batch_size > 0:
+            return (
+                f"{self._underlying.runtime_diagnostics()} | "
+                f"hybrid OCR queue, sync first {self._synchronous_batch_size}"
+            )
+        return f"{self._underlying.runtime_diagnostics()} | async OCR queue"
+
+    def prepare_image(self, image: np.ndarray) -> np.ndarray:
+        return self._underlying.prepare_image(image)
+
+    def recognize(self, image: object, *, language: str, psm: int) -> OCRResult:
+        return self.recognize_batch([image], language=language, psms=[psm])[0]
+
+    def recognize_batch(self, images: list[object], *, language: str, psms: list[int]) -> list[OCRResult]:
+        if not images:
+            return []
+        if not self._underlying.is_available():
+            return [OCRResult() for _image in images]
+
+        results = [OCRResult() for _image in images]
+        arrays: list[np.ndarray] = []
+        keys: list[_OCRCacheKey] = []
+        missing_indices: list[int] = []
+
+        for index, image in enumerate(images):
+            psm = psms[index] if index < len(psms) else 7
+            array = self._normalize_queued_image(image)
+            arrays.append(array)
+            keys.append(self._cache_key(array, language=language, psm=psm))
+
+        with self._condition:
+            for index, key in enumerate(keys):
+                cached = self._cache.get(key)
+                if cached is not None:
+                    results[index] = cached
+                    continue
+                missing_indices.append(index)
+
+        sync_indices = []
+        if missing_indices and self._synchronous_batch_size > 0:
+            if len(missing_indices) <= self._synchronous_batch_size:
+                sync_indices = list(missing_indices)
+            else:
+                sync_indices = sorted(
+                    missing_indices,
+                    key=lambda index: self._sync_priority(arrays[index]),
+                    reverse=True,
+                )[: self._synchronous_batch_size]
+
+        if sync_indices:
+            sync_keys = {keys[index] for index in sync_indices}
+            with self._condition:
+                self._remove_queued_keys_locked(sync_keys)
+
+            missing_images = [arrays[index] for index in sync_indices]
+            missing_psms = [keys[index].psm for index in sync_indices]
+            try:
+                recognized_batch = self._underlying.recognize_batch(
+                    missing_images,
+                    language=language,
+                    psms=missing_psms,
+                )
+            except Exception:
+                recognized_batch = [OCRResult() for _index in sync_indices]
+
+            with self._condition:
+                for index, result in zip(sync_indices, recognized_batch, strict=False):
+                    if result.text:
+                        self._cache[keys[index]] = result
+                    self._queued_keys.discard(keys[index])
+                    results[index] = result
+
+        queued_any = False
+        sync_index_set = set(sync_indices)
+
+        with self._condition:
+            for index in missing_indices:
+                if index in sync_index_set:
+                    continue
+                key = keys[index]
+                if key in self._queued_keys:
+                    continue
+
+                self._trim_queue_locked()
+                self._queue.append(_QueuedOCRItem(key=key, image=arrays[index]))
+                self._queued_keys.add(key)
+                queued_any = True
+
+            if queued_any:
+                self._condition.notify()
+
+        return results
+
+    def _trim_queue_locked(self) -> None:
+        while len(self._queue) >= self._max_queue_size:
+            dropped = self._queue.popleft()
+            self._queued_keys.discard(dropped.key)
+
+    def _remove_queued_keys_locked(self, keys: set[_OCRCacheKey]) -> None:
+        if not keys or not self._queue:
+            return
+
+        self._queue = deque(item for item in self._queue if item.key not in keys)
+        self._queued_keys.difference_update(keys)
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify_all()
+
+        self._worker.join(timeout=5.0)
+        self._underlying.close()
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._condition:
+                while not self._closed and not self._queue:
+                    self._condition.wait()
+
+                if self._closed and not self._queue:
+                    return
+
+                batch = self._pop_next_batch_locked()
+
+            language = batch[0].key.language
+            images = [item.image for item in batch]
+            psms = [item.key.psm for item in batch]
+
+            try:
+                recognized_batch = self._underlying.recognize_batch(images, language=language, psms=psms)
+            except Exception:
+                recognized_batch = [OCRResult() for _item in batch]
+
+            with self._condition:
+                for item, result in zip(batch, recognized_batch, strict=False):
+                    self._queued_keys.discard(item.key)
+                    if result.text:
+                        self._cache[item.key] = result
+
+                for item in batch[len(recognized_batch) :]:
+                    self._queued_keys.discard(item.key)
+
+    def _pop_next_batch_locked(self) -> list[_QueuedOCRItem]:
+        first = self._queue.popleft()
+        batch = [first]
+        deferred: deque[_QueuedOCRItem] = deque()
+
+        while self._queue:
+            candidate = self._queue.popleft()
+            if candidate.key.language == first.key.language and len(batch) < self._max_batch_size:
+                batch.append(candidate)
+            else:
+                deferred.append(candidate)
+
+        self._queue = deferred
+        return batch
+
+    @staticmethod
+    def _normalize_queued_image(image: object) -> np.ndarray:
+        array = np.asarray(image)
+        if array.dtype != np.uint8:
+            array = np.clip(array, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(array).copy()
+
+    @staticmethod
+    def _cache_key(image: np.ndarray, *, language: str, psm: int) -> _OCRCacheKey:
+        hasher = hashlib.blake2b(digest_size=16)
+        hasher.update(str(image.dtype).encode("ascii"))
+        hasher.update(np.asarray(image.shape, dtype=np.int64).tobytes())
+        hasher.update(image.tobytes())
+        return _OCRCacheKey(
+            digest=hasher.digest(),
+            shape=tuple(int(dimension) for dimension in image.shape),
+            language=language,
+            psm=psm,
+        )
+
+    @staticmethod
+    def _sync_priority(image: np.ndarray) -> float:
+        height, width = image.shape[:2]
+        area = width * height
+        aspect_ratio = width / max(height, 1)
+        return (
+            min(width / 8.0, 160.0)
+            + min(area / 1000.0, 100.0)
+            + min(aspect_ratio, 24.0) * 5.0
+        )
 
 
 class EasyOCRBackend(OCRBackend):
@@ -309,6 +555,7 @@ class TesseractOCRBackend(OCRBackend):
     def __init__(self) -> None:
         self._binary = self._resolve_binary()
         self._tessdata_dir = self._resolve_tessdata_dir(self._binary)
+        self._available_languages = self._resolve_available_languages(self._tessdata_dir)
         if self._binary and pytesseract is not None:
             pytesseract.pytesseract.tesseract_cmd = self._binary
         if self._tessdata_dir:
@@ -366,6 +613,16 @@ class TesseractOCRBackend(OCRBackend):
                 return str(candidate)
         return None
 
+    @staticmethod
+    def _resolve_available_languages(tessdata_dir: str | None) -> set[str]:
+        if not tessdata_dir:
+            return set()
+
+        try:
+            return {path.stem for path in Path(tessdata_dir).glob("*.traineddata")}
+        except OSError:
+            return set()
+
     def is_available(self) -> bool:
         return self._binary is not None and pytesseract is not None
 
@@ -401,6 +658,7 @@ class TesseractOCRBackend(OCRBackend):
         if not self.is_available():
             return OCRResult()
 
+        language = self._resolve_requested_language(language)
         config = f"--oem 3 --psm {psm}"
         candidates = self._build_candidates(np.asarray(image))
         best = OCRResult()
@@ -414,6 +672,20 @@ class TesseractOCRBackend(OCRBackend):
                 best_score = score
 
         return best
+
+    def _resolve_requested_language(self, language: str) -> str:
+        requested = [token.strip() for token in language.split("+") if token.strip()]
+        if not requested or not self._available_languages:
+            return language
+
+        available = [token for token in requested if token in self._available_languages]
+        if available:
+            return "+".join(available)
+
+        fallback = [token for token in ("eng", "tha") if token in self._available_languages]
+        if fallback:
+            return "+".join(fallback)
+        return language
 
     def _build_candidates(self, image: np.ndarray) -> list[np.ndarray]:
         normalized = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -488,7 +760,7 @@ def create_default_ocr_backend(*, device_preference: str | None = None) -> OCRBa
     if preference == "easyocr":
         backend = EasyOCRBackend(device_preference=resolved_device_preference)
         if backend.is_available():
-            return backend
+            return _maybe_queue_ocr_backend(backend)
         return NoOpOCRBackend()
 
     for backend_cls in (EasyOCRBackend, TesseractOCRBackend):
@@ -497,8 +769,25 @@ def create_default_ocr_backend(*, device_preference: str | None = None) -> OCRBa
         else:
             backend = backend_cls()
         if backend.is_available():
+            if backend_cls is EasyOCRBackend:
+                return _maybe_queue_ocr_backend(backend)
             return backend
     return NoOpOCRBackend()
+
+
+def _maybe_queue_ocr_backend(backend: OCRBackend) -> OCRBackend:
+    async_setting = os.getenv("SCREENLENS_OCR_ASYNC", "1").strip().lower()
+    if async_setting in {"0", "false", "no", "off", "disabled"}:
+        return backend
+    sync_batch_size = _parse_non_negative_int(os.getenv("SCREENLENS_OCR_SYNC_BATCH_SIZE"), default=2)
+    return QueuedOCRBackend(backend, synchronous_batch_size=sync_batch_size)
+
+
+def _parse_non_negative_int(value: str | None, *, default: int) -> int:
+    try:
+        return max(int(value), 0) if value is not None else default
+    except ValueError:
+        return default
 
 
 def normalize_ocr_device_preference(value: str | None) -> str:

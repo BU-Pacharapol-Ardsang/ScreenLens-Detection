@@ -109,6 +109,24 @@ def test_queued_translation_backend_returns_cached_results_after_background_batc
         queued.close()
 
 
+def test_queued_translation_backend_processes_priority_item_synchronously() -> None:
+    backend = RecordingBatchTranslationBackend()
+    queued = QueuedTranslationBackend(backend, max_batch_size=8, synchronous_batch_size=1)
+
+    try:
+        first = queued.translate_batch(
+            ["one", "two"],
+            source_language_code="eng",
+            target_language_code="tha",
+        )
+
+        assert first[0] == "translated:one"
+        assert first[1] == ""
+        assert backend.calls[0] == ["one"]
+    finally:
+        queued.close()
+
+
 def test_create_default_translation_backend_auto_prefers_argos_without_initializing_google(monkeypatch) -> None:
     init_counts = {"argos": 0, "google": 0}
 

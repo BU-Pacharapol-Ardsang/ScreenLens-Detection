@@ -137,6 +137,20 @@ function Install-EasyOCR {
     Invoke-PipInstall -PythonPath $PythonPath -Arguments @("install", "--upgrade", "easyocr>=1.7.2")
 }
 
+function Install-RapidOCR {
+    param(
+        [string]$PythonPath
+    )
+
+    Write-Host "Installing RapidOCR dependencies" -ForegroundColor Cyan
+    Invoke-PipInstall -PythonPath $PythonPath -Arguments @(
+        "install",
+        "--upgrade",
+        "rapidocr>=3.0.0",
+        "onnxruntime>=1.20.0"
+    )
+}
+
 function Install-TorchRuntime {
     param(
         [string]$PythonPath,
@@ -227,6 +241,7 @@ Write-Host "Resolved torch runtime: $resolvedTorchRuntime" -ForegroundColor Cyan
 
 Install-BaseDependencies -PythonPath $pythonPath -WithBuildTools:$IncludeBuildTools
 Install-EasyOCR -PythonPath $pythonPath
+Install-RapidOCR -PythonPath $pythonPath
 Install-TorchRuntime -PythonPath $pythonPath -Runtime $resolvedTorchRuntime
 Sync-ArgosModels -PythonPath $pythonPath
 

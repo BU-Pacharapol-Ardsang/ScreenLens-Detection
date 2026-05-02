@@ -24,18 +24,18 @@ class MonitorSpec:
 
 @dataclass(slots=True)
 class PipelineSettings:
-    capture_interval_ms: int = 250
-    upscale_factor: float = 1.5
-    clahe_clip_limit: float = 2.5
-    clahe_grid_size: int = 8
+    capture_interval_ms: int = 40  # Run up to ~25 FPS
+    upscale_factor: float = 1.0  # Full screen game/article is already large, 1.0 reduces lag massively
+    clahe_clip_limit: float = 2.0
+    clahe_grid_size: int = 4
     gaussian_kernel_size: int = 3
-    threshold_block_size: int = 31
-    threshold_c: int = 12
+    threshold_block_size: int = 21  # Smaller block size runs faster
+    threshold_c: int = 8
     morphology_width: int = 11
     morphology_height: int = 3
-    min_contour_area: int = 250
-    min_box_width: int = 24
-    min_box_height: int = 14
+    min_contour_area: int = 150
+    min_box_width: int = 20
+    min_box_height: int = 10
     max_box_height_ratio: float = 0.22
     max_boxes: int = 60
     text_detector_mode: str = "opencv"
@@ -44,12 +44,12 @@ class PipelineSettings:
     translation_mode: str = "argos"
     ocr_enabled: bool = True
     ocr_device_preference: str = "auto"
-    ocr_language: str = "tha+eng"
+    ocr_language: str = "tha+eng+jpn"
     ocr_psm: int = 7
-    max_ocr_boxes_per_frame: int = 8
-    stable_ocr_frames: int = 2
+    max_ocr_boxes_per_frame: int = 12
+    stable_ocr_frames: int = 1
     stable_box_iou_threshold: float = 0.45
-    motion_filter_enabled: bool = True
+    motion_filter_enabled: bool = False
     motion_mean_threshold: float = 18.0
     motion_changed_ratio_threshold: float = 0.20
     overlay_tracking_enabled: bool = False

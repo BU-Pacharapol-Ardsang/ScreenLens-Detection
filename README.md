@@ -237,7 +237,7 @@ Notes:
 - If `vendor/argos/*.argosmodel` exists, the build bundles the offline translation models and installs them automatically at runtime.
 - If no bundled or installed Tesseract is found, the app still opens in detection-only mode.
 - Optional deep detector packages are not required for the classic OpenCV detector.
-- `scripts/setup_windows.ps1` installs EasyOCR and then pins `torch`/`torchvision` from the official PyTorch CPU or CUDA wheel index so the runtime matches your chosen device.
+- `scripts/setup_windows.ps1` installs EasyOCR, RapidOCR/ONNXRuntime, and then pins `torch`/`torchvision` from the official PyTorch CPU or CUDA wheel index so the runtime matches your chosen device.
 - `screenlens.py` and `screenlens.pyw` are still useful for local development, but the built `.exe` is the correct path for blank Windows VMs.
 - `build_screenlens_exe.bat` is the simplest build entrypoint. It creates `.venv` automatically when missing, installs build tools, and then produces `dist\ScreenLens\ScreenLens.exe`.
 

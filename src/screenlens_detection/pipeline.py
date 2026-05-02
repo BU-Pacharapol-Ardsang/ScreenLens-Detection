@@ -16,7 +16,7 @@ from .languages import (
 )
 from .models import DetectionBox, FrameAnalysis, PipelineSettings
 from .motion import estimate_grayscale_offset
-from .ocr import OCRBackend
+from .ocr import OCRBackend, OCRResult
 from .text_detectors import (
     TextDetectorBackend,
     create_deep_text_detector_backend,
@@ -39,6 +39,14 @@ class _OCRCroppedBox:
     psm: int
 
 
+@dataclass(slots=True)
+class _CachedOCRResult:
+    rect: tuple[int, int, int, int]
+    fingerprint: np.ndarray
+    text: str
+    confidence: float | None = None
+
+
 class TextDetectionPipeline:
     """Realtime screen-text pipeline using traditional CV and optional OCR."""
 
@@ -52,11 +60,19 @@ class TextDetectionPipeline:
         self.ocr_backend = ocr_backend
         self.translation_backend = translation_backend
         self._recent_translations: list[DetectionBox] = []
+        self._recent_translation_lookup: dict[tuple[str, str, str], str] = {}
+        self._recent_translation_candidates: list[tuple[DetectionBox, str]] = []
+        self._recent_ocr_results: list[_CachedOCRResult] = []
         self._ocr_box_tracks: list[_TrackedTextBox] = []
         self._previous_motion_gray: np.ndarray | None = None
+        self._current_motion_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._current_scaled_motion_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._blank_translation_frames = 0
+        self._pending_translation_frames = 0
         self._deep_text_detector: TextDetectorBackend | None = None
 
     def close(self) -> None:
+        self.ocr_backend.close()
         self.translation_backend.close()
         if self._deep_text_detector is not None:
             self._deep_text_detector.close()
@@ -66,17 +82,27 @@ class TextDetectionPipeline:
 
         scaled_frame, scale = self._scale_frame(frame)
         enhanced_gray = self._enhance_grayscale(scaled_frame)
-        mask = self._build_text_mask(enhanced_gray)
+        mask = self._build_text_mask(scaled_frame, enhanced_gray)
         line_mask = self._build_line_mask(mask)
         working_boxes = self._detect_text_boxes(scaled_frame, line_mask, mask, enhanced_gray)
         stable_working_boxes = self._stabilize_ocr_boxes(working_boxes)
         motion_filtered_boxes = self._filter_motion_ocr_boxes(stable_working_boxes, enhanced_gray)
-        boxes = self._annotate_with_ocr(motion_filtered_boxes, enhanced_gray, frame.shape, scale)
-        boxes = self._apply_translations(boxes)
-        content_offset_x, content_offset_y, content_motion_confidence = self._estimate_content_offset(
+        motion_offset_x, motion_offset_y, motion_confidence = self._estimate_frame_offset(
             enhanced_gray,
             scale,
         )
+        self._current_motion_offset = (motion_offset_x, motion_offset_y, motion_confidence)
+        self._current_scaled_motion_offset = (
+            motion_offset_x * scale,
+            motion_offset_y * scale,
+            motion_confidence,
+        )
+        boxes = self._annotate_with_ocr(motion_filtered_boxes, enhanced_gray, frame.shape, scale)
+        boxes = self._apply_translations(boxes)
+        if self.settings.overlay_tracking_enabled:
+            content_offset_x, content_offset_y, content_motion_confidence = self._current_motion_offset
+        else:
+            content_offset_x, content_offset_y, content_motion_confidence = 0.0, 0.0, 0.0
         self._previous_motion_gray = enhanced_gray.copy()
 
         annotated = self._draw_annotations(frame.copy(), boxes)
@@ -118,7 +144,7 @@ class TextDetectionPipeline:
             enhanced = cv2.GaussianBlur(enhanced, (kernel_size, kernel_size), 0)
         return enhanced
 
-    def _build_text_mask(self, gray: np.ndarray) -> np.ndarray:
+    def _build_text_mask(self, frame: np.ndarray, gray: np.ndarray) -> np.ndarray:
         block_size = self._ensure_odd(self.settings.threshold_block_size)
         threshold_c = self.settings.threshold_c
 
@@ -140,50 +166,193 @@ class TextDetectionPipeline:
         )
         polarity_mask = cv2.bitwise_or(dark_text_mask, light_text_mask)
 
+        stroke_mask = self._build_stroke_response_mask(gray)
+        local_contrast_mask = self._build_local_contrast_mask(gray, block_size)
+        edge_mask = self._build_edge_response_mask(gray)
+        feature_mask = cv2.bitwise_or(stroke_mask, edge_mask)
+        contrast_or_edge = cv2.bitwise_or(local_contrast_mask, edge_mask)
+
+        adaptive_strokes = cv2.bitwise_and(polarity_mask, contrast_or_edge)
+        feature_strokes = cv2.bitwise_and(feature_mask, cv2.bitwise_or(polarity_mask, local_contrast_mask))
+        combined = cv2.bitwise_or(adaptive_strokes, feature_strokes)
+        if cv2.countNonZero(combined) < max(180, cv2.countNonZero(polarity_mask) // 16):
+            combined = cv2.bitwise_or(
+                cv2.bitwise_and(polarity_mask, local_contrast_mask),
+                stroke_mask,
+            )
+
+        cleaned = cv2.morphologyEx(
+            combined,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+        )
+        overlay_mask = self._build_overlay_text_mask(
+            frame,
+            gray,
+            edge_mask=edge_mask,
+            local_contrast_mask=local_contrast_mask,
+        )
+        return cv2.bitwise_or(self._suppress_large_mask_components(cleaned), overlay_mask)
+
+    def _build_overlay_text_mask(
+        self,
+        frame: np.ndarray,
+        gray: np.ndarray,
+        *,
+        edge_mask: np.ndarray,
+        local_contrast_mask: np.ndarray,
+    ) -> np.ndarray:
+        if frame.ndim != 3 or frame.shape[:2] != gray.shape[:2]:
+            return np.zeros_like(gray)
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        _hue, saturation, value = cv2.split(hsv)
+        bright_mask = cv2.inRange(value, 150, 255)
+        low_saturation_mask = cv2.inRange(saturation, 0, 130)
+        white_ui_mask = cv2.bitwise_and(bright_mask, low_saturation_mask)
+
+        saturated_mask = cv2.bitwise_and(cv2.inRange(value, 120, 255), cv2.inRange(saturation, 80, 255))
+        color_ui_mask = cv2.bitwise_and(saturated_mask, local_contrast_mask)
+        overlay_mask = cv2.bitwise_or(white_ui_mask, color_ui_mask)
+        overlay_mask = cv2.bitwise_and(overlay_mask, edge_mask)
+        overlay_mask = cv2.morphologyEx(
+            overlay_mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2)),
+        )
+        overlay_mask = cv2.morphologyEx(
+            overlay_mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+        )
+        return self._suppress_large_mask_components(overlay_mask)
+
+    def _build_stroke_response_mask(self, gray: np.ndarray) -> np.ndarray:
+        horizontal_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (max(self.settings.morphology_width, 9), max(self.settings.morphology_height, 3)),
+        )
+        compact_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        bright_response = cv2.max(
+            cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, horizontal_kernel),
+            cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, compact_kernel),
+        )
+        dark_response = cv2.max(
+            cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, horizontal_kernel),
+            cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, compact_kernel),
+        )
+        response = cv2.max(bright_response, dark_response)
+        return self._threshold_response_mask(response, minimum_threshold=8, std_multiplier=0.45)
+
+    def _build_local_contrast_mask(self, gray: np.ndarray, block_size: int) -> np.ndarray:
+        window = max(block_size, 15)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (window, window))
+        local_max = cv2.dilate(gray, kernel)
+        local_min = cv2.erode(gray, kernel)
+        contrast = cv2.absdiff(local_max, local_min)
+        return self._threshold_response_mask(contrast, minimum_threshold=16, std_multiplier=0.35)
+
+    def _build_edge_response_mask(self, gray: np.ndarray) -> np.ndarray:
         gradient = cv2.morphologyEx(
             gray,
             cv2.MORPH_GRADIENT,
             cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
         )
-        _, gradient_mask = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        gradient_mask = cv2.dilate(
-            gradient_mask,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        gradient_mask = self._threshold_response_mask(gradient, minimum_threshold=10, std_multiplier=0.50)
+        edges = cv2.Canny(gray, 40, 130)
+        edges = cv2.dilate(
+            edges,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
             iterations=1,
         )
+        return cv2.bitwise_or(gradient_mask, edges)
 
-        combined = cv2.bitwise_and(polarity_mask, gradient_mask)
-        if cv2.countNonZero(combined) < max(250, cv2.countNonZero(polarity_mask) // 10):
-            combined = polarity_mask
+    @staticmethod
+    def _threshold_response_mask(
+        response: np.ndarray,
+        *,
+        minimum_threshold: int,
+        std_multiplier: float,
+    ) -> np.ndarray:
+        if response.size == 0:
+            return np.zeros_like(response)
 
-        return cv2.morphologyEx(
-            combined,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        )
+        mean, stddev = cv2.meanStdDev(response)
+        adaptive_threshold = int(float(mean[0][0]) + (float(stddev[0][0]) * std_multiplier))
+        threshold = max(minimum_threshold, adaptive_threshold)
+        _, statistical_mask = cv2.threshold(response, threshold, 255, cv2.THRESH_BINARY)
+        _, otsu_mask = cv2.threshold(response, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        if cv2.countNonZero(otsu_mask) <= response.size * 0.30:
+            return cv2.bitwise_or(statistical_mask, otsu_mask)
+        return statistical_mask
+
+    @staticmethod
+    def _suppress_large_mask_components(mask: np.ndarray) -> np.ndarray:
+        if mask.size == 0:
+            return mask
+
+        component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if component_count <= 1:
+            return mask
+
+        frame_area = mask.shape[0] * mask.shape[1]
+        max_component_area = max(int(frame_area * 0.025), 12_000)
+        keep_values = np.zeros(component_count, dtype=np.uint8)
+        for component_index in range(1, component_count):
+            x, y, w, h, area = stats[component_index]
+            bounding_area = max(w * h, 1)
+            fill_ratio = area / bounding_area
+            aspect_ratio = w / max(h, 1)
+            text_sized_component = h <= 96 and aspect_ratio >= 1.1
+            if area > max_component_area and fill_ratio > 0.16 and not text_sized_component:
+                continue
+            if h > mask.shape[0] * 0.35 and w > mask.shape[1] * 0.06:
+                continue
+            keep_values[component_index] = 255
+        return keep_values[labels]
 
     def _build_line_mask(self, mask: np.ndarray) -> np.ndarray:
         dense_mask = cv2.dilate(
             mask,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
             iterations=1,
         )
         horizontal_kernel = cv2.getStructuringElement(
             cv2.MORPH_RECT,
-            (max(self.settings.morphology_width * 2 + 1, 17), max(self.settings.morphology_height, 3)),
-        )
-        vertical_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (3, max(self.settings.morphology_height, 3)),
+            (max(self.settings.morphology_width + 2, 13), max(self.settings.morphology_height, 3)),
         )
 
         line_mask = cv2.morphologyEx(dense_mask, cv2.MORPH_CLOSE, horizontal_kernel)
-        line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, vertical_kernel)
-        return cv2.morphologyEx(
+        line_mask = cv2.morphologyEx(
             line_mask,
             cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
         )
+        return self._suppress_large_line_components(line_mask)
+
+    @staticmethod
+    def _suppress_large_line_components(mask: np.ndarray) -> np.ndarray:
+        if mask.size == 0:
+            return mask
+
+        component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if component_count <= 1:
+            return mask
+
+        height, width = mask.shape[:2]
+        frame_area = height * width
+        keep_values = np.zeros(component_count, dtype=np.uint8)
+        for component_index in range(1, component_count):
+            x, y, w, h, area = stats[component_index]
+            aspect_ratio = w / max(h, 1)
+            if area > frame_area * 0.12:
+                continue
+            if w > width * 0.85 and h > height * 0.08:
+                continue
+            if h > height * 0.30 and aspect_ratio < 4.0:
+                continue
+            keep_values[component_index] = 255
+        return keep_values[labels]
 
     def _detect_text_boxes(
         self,
@@ -245,9 +414,7 @@ class TextDetectionPipeline:
 
             candidates.append((left, top, clipped_w, clipped_h))
 
-        merged = self._merge_text_boxes(candidates)
-        merged.sort(key=lambda box: (box[1], box[0]))
-        return merged[: self.settings.max_boxes]
+        return self._limit_detected_boxes(self._merge_text_boxes(candidates))
 
     def _extract_text_boxes(
         self,
@@ -268,7 +435,9 @@ class TextDetectionPipeline:
 
             if area < self.settings.min_contour_area:
                 continue
-            if area > int(frame_area * 0.18):
+            if area > int(frame_area * 0.08):
+                continue
+            if h > 120 and area > int(frame_area * 0.035):
                 continue
             if w < self.settings.min_box_width or h < self.settings.min_box_height:
                 continue
@@ -282,23 +451,48 @@ class TextDetectionPipeline:
                 continue
 
             foreground_ratio = cv2.countNonZero(text_roi) / max(area, 1)
-            if not 0.03 <= foreground_ratio <= 0.60:
+            if not 0.03 <= foreground_ratio <= 0.82:
                 continue
 
             gray_roi = enhanced_gray[y : y + h, x : x + w]
             edge_density = cv2.countNonZero(cv2.Canny(gray_roi, 50, 150)) / max(area, 1)
             if edge_density < 0.025:
                 continue
+            if edge_density > 0.48 and foreground_ratio > 0.22:
+                continue
 
-            sub_component_count = cv2.connectedComponents(text_roi, connectivity=8)[0] - 1
-            if sub_component_count < 3 and aspect_ratio > 3.5:
+            sub_component_count, _sub_labels, sub_stats, _sub_centroids = cv2.connectedComponentsWithStats(
+                text_roi,
+                connectivity=8,
+            )
+            text_component_count = sub_component_count - 1
+            foreground_pixels = max(cv2.countNonZero(text_roi), 1)
+            largest_component_area = int(np.max(sub_stats[1:, cv2.CC_STAT_AREA])) if text_component_count > 0 else 0
+            largest_component_ratio = largest_component_area / foreground_pixels
+            if largest_component_ratio > 0.82 and aspect_ratio > 2.0:
+                continue
+
+            active_columns = int(np.count_nonzero(np.any(text_roi > 0, axis=0)))
+            active_rows = int(np.count_nonzero(np.any(text_roi > 0, axis=1)))
+            column_coverage = active_columns / max(w, 1)
+            row_coverage = active_rows / max(h, 1)
+            if aspect_ratio > 3.0 and column_coverage < 0.18:
+                continue
+            if row_coverage < 0.22:
+                continue
+
+            if text_component_count < 3 and aspect_ratio > 3.5:
                 continue
 
             candidates.append((x, y, w, h))
 
-        merged = self._merge_text_boxes(candidates)
-        merged.sort(key=lambda box: (box[1], box[0]))
-        return merged[: self.settings.max_boxes]
+        return self._limit_detected_boxes(self._merge_text_boxes(candidates))
+
+    def _limit_detected_boxes(self, boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+        if len(boxes) > self.settings.max_boxes:
+            boxes = sorted(boxes, key=self._ocr_candidate_priority, reverse=True)[: self.settings.max_boxes]
+        boxes.sort(key=lambda box: (box[1], box[0]))
+        return boxes
 
     def _annotate_with_ocr(
         self,
@@ -313,6 +507,9 @@ class TextDetectionPipeline:
         ocr_candidates: list[_OCRCroppedBox] = []
 
         for x, y, w, h in ocr_boxes:
+            if self._should_skip_ocr_candidate((x, y, w, h), enhanced_gray.shape):
+                continue
+
             pad_x = max(int(w * 0.04), 4)
             pad_y = max(int(h * 0.25), 4)
             crop_x1 = max(x - pad_x, 0)
@@ -329,18 +526,39 @@ class TextDetectionPipeline:
                 )
             )
 
-        ocr_results = []
+        ocr_results: list[OCRResult | None] = [None] * len(ocr_candidates)
+        candidate_fingerprints: list[np.ndarray] = []
         if ocr_attempted and ocr_candidates:
-            ocr_results = self.ocr_backend.recognize_batch(
-                [self.ocr_backend.prepare_image(candidate.crop) for candidate in ocr_candidates],
-                language=self.settings.ocr_language,
-                psms=[candidate.psm for candidate in ocr_candidates],
-            )
+            pending_indices: list[int] = []
+            pending_candidates: list[_OCRCroppedBox] = []
 
-        if len(ocr_results) < len(ocr_candidates):
-            ocr_results.extend([None] * (len(ocr_candidates) - len(ocr_results)))
+            for index, candidate in enumerate(ocr_candidates):
+                fingerprint = self._ocr_crop_fingerprint(candidate.crop)
+                candidate_fingerprints.append(fingerprint)
+                cached_result = self._find_cached_ocr_result(candidate.rect, fingerprint)
+                if cached_result is not None:
+                    ocr_results[index] = cached_result
+                    continue
 
-        for candidate, ocr_result in zip(ocr_candidates, ocr_results, strict=False):
+                pending_indices.append(index)
+                pending_candidates.append(candidate)
+
+            pending_results = []
+            if pending_candidates:
+                pending_results = self.ocr_backend.recognize_batch(
+                    [self.ocr_backend.prepare_image(candidate.crop) for candidate in pending_candidates],
+                    language=self.settings.ocr_language,
+                    psms=[candidate.psm for candidate in pending_candidates],
+                )
+
+            for index, ocr_result in zip(pending_indices, pending_results, strict=False):
+                ocr_results[index] = ocr_result
+
+        elif ocr_candidates:
+            candidate_fingerprints = [self._ocr_crop_fingerprint(candidate.crop) for candidate in ocr_candidates]
+
+        ocr_cache_updates: list[_CachedOCRResult] = []
+        for candidate_index, (candidate, ocr_result) in enumerate(zip(ocr_candidates, ocr_results, strict=False)):
             x, y, w, h = candidate.rect
             text = ""
             confidence = None
@@ -349,8 +567,20 @@ class TextDetectionPipeline:
                 confidence = ocr_result.confidence
 
             text = self._normalize_recognized_text(text)
-            if ocr_attempted and not self._is_usable_text(text, confidence):
-                continue
+            if ocr_attempted and text and not self._is_usable_text(text, confidence):
+                text = ""
+                confidence = None
+
+            if ocr_attempted and text:
+                if candidate_index < len(candidate_fingerprints):
+                    ocr_cache_updates.append(
+                        _CachedOCRResult(
+                            rect=candidate.rect,
+                            fingerprint=candidate_fingerprints[candidate_index],
+                            text=text,
+                            confidence=confidence,
+                        )
+                    )
 
             mapped_x = int(x / scale)
             mapped_y = int(y / scale)
@@ -377,7 +607,95 @@ class TextDetectionPipeline:
                 )
             )
 
+        if ocr_attempted:
+            self._remember_ocr_results(ocr_cache_updates)
+
         return detected_boxes
+
+    @staticmethod
+    def _should_skip_ocr_candidate(
+        box: tuple[int, int, int, int],
+        frame_shape: tuple[int, ...],
+    ) -> bool:
+        frame_height, frame_width = frame_shape[:2]
+        if frame_height <= 0 or frame_width <= 0:
+            return False
+
+        x, y, w, h = box
+        area = w * h
+        frame_area = frame_width * frame_height
+        aspect_ratio = w / max(h, 1)
+        near_top = y <= int(frame_height * 0.12)
+        broad_strip = w >= int(frame_width * 0.55) and h <= int(frame_height * 0.12)
+        toolbar_sized = 26 <= h <= int(frame_height * 0.11) and aspect_ratio >= 9.0
+        if near_top and broad_strip and toolbar_sized:
+            return True
+
+        if y <= int(frame_height * 0.16) and area >= int(frame_area * 0.045) and aspect_ratio >= 10.0:
+            return True
+
+        return False
+
+    def _find_cached_ocr_result(self, rect: tuple[int, int, int, int], fingerprint: np.ndarray) -> OCRResult | None:
+        best_match: _CachedOCRResult | None = None
+        best_overlap = 0.0
+
+        for cached in self._recent_ocr_results:
+            for cached_rect, motion_adjusted in self._iter_motion_adjusted_rects(cached.rect, scaled=True):
+                overlap = self._intersection_over_union(rect, cached_rect)
+                minimum_overlap = 0.68 if motion_adjusted else 0.82
+                if overlap < minimum_overlap or overlap <= best_overlap:
+                    continue
+
+                difference = self._ocr_fingerprint_difference(fingerprint, cached.fingerprint)
+                difference_limit = 8.5 if motion_adjusted else 5.5
+                if difference > difference_limit:
+                    continue
+
+                best_match = cached
+                best_overlap = overlap
+
+        if best_match is None:
+            return None
+        return OCRResult(text=best_match.text, confidence=best_match.confidence)
+
+    def _remember_ocr_results(self, updates: list[_CachedOCRResult]) -> None:
+        if not updates:
+            return
+
+        remembered = [*updates, *self._recent_ocr_results]
+        deduped: list[_CachedOCRResult] = []
+        for candidate in remembered:
+            if not candidate.text:
+                continue
+            if any(
+                existing.text == candidate.text
+                and self._intersection_over_union(existing.rect, candidate.rect) >= 0.92
+                for existing in deduped
+            ):
+                continue
+            deduped.append(candidate)
+
+        limit = max(self.settings.max_ocr_boxes_per_frame * 4, 32)
+        self._recent_ocr_results = deduped[:limit]
+
+    @staticmethod
+    def _ocr_crop_fingerprint(crop: np.ndarray) -> np.ndarray:
+        if crop.size == 0:
+            return np.zeros((12, 32), dtype=np.uint8)
+
+        gray = crop if crop.ndim == 2 else cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        if gray.dtype != np.uint8:
+            gray = np.clip(gray, 0, 255).astype(np.uint8)
+
+        resized = cv2.resize(gray, (32, 12), interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(resized)
+
+    @staticmethod
+    def _ocr_fingerprint_difference(first: np.ndarray, second: np.ndarray) -> float:
+        if first.shape != second.shape:
+            return float("inf")
+        return float(np.mean(cv2.absdiff(first, second)))
 
     def _select_ocr_boxes(
         self,
@@ -410,10 +728,14 @@ class TextDetectionPipeline:
             score -= 80.0
         if aspect_ratio > 28.0:
             score -= 35.0
-        if h > 90:
-            score -= min((h - 90) * 1.4, 90.0)
-        if area > 140_000:
-            score -= min((area - 140_000) / 1200.0, 120.0)
+        if w >= 280 and 16 <= h <= 64:
+            score += 80.0
+        if aspect_ratio >= 8.0 and h <= 70:
+            score += 40.0
+        if h > 72:
+            score -= min((h - 72) * 3.0, 140.0)
+        if area > 60_000:
+            score -= min((area - 60_000) / 700.0, 130.0)
         return score
 
     def _stabilize_ocr_boxes(
@@ -527,9 +849,7 @@ class TextDetectionPipeline:
             and changed_ratio >= self.settings.motion_changed_ratio_threshold
         )
 
-    def _estimate_content_offset(self, enhanced_gray: np.ndarray, scale: float) -> tuple[float, float, float]:
-        if not self.settings.overlay_tracking_enabled:
-            return 0.0, 0.0, 0.0
+    def _estimate_frame_offset(self, enhanced_gray: np.ndarray, scale: float) -> tuple[float, float, float]:
         if self._previous_motion_gray is None or self._previous_motion_gray.shape != enhanced_gray.shape:
             return 0.0, 0.0, 0.0
         return estimate_grayscale_offset(
@@ -555,12 +875,63 @@ class TextDetectionPipeline:
         union = max(first_area + second_area - intersection, 1)
         return intersection / union
 
+    def _iter_motion_adjusted_rects(
+        self,
+        rect: tuple[int, int, int, int],
+        *,
+        scaled: bool,
+    ) -> list[tuple[tuple[int, int, int, int], bool]]:
+        variants = [(rect, False)]
+        offset_x, offset_y, confidence = (
+            self._current_scaled_motion_offset if scaled else self._current_motion_offset
+        )
+        if confidence < 0.06:
+            return variants
+
+        rounded_x = int(round(offset_x))
+        rounded_y = int(round(offset_y))
+        if abs(rounded_x) < 2 and abs(rounded_y) < 2:
+            return variants
+
+        x, y, w, h = rect
+        variants.append(((x + rounded_x, y + rounded_y, w, h), True))
+        return variants
+
+    @staticmethod
+    def _rect_center_proximity(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> float:
+        first_center_x = first[0] + (first[2] / 2.0)
+        first_center_y = first[1] + (first[3] / 2.0)
+        second_center_x = second[0] + (second[2] / 2.0)
+        second_center_y = second[1] + (second[3] / 2.0)
+        distance = max(abs(first_center_x - second_center_x), abs(first_center_y - second_center_y))
+        tolerance = max(first[2], first[3], second[2], second[3], 1) * 5.0
+        return max(1.0 - (distance / tolerance), 0.0)
+
+    @staticmethod
+    def _rect_size_similarity(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> float:
+        first_area = max(first[2] * first[3], 1)
+        second_area = max(second[2] * second[3], 1)
+        return min(first_area, second_area) / max(first_area, second_area)
+
     def _apply_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
         if not boxes:
+            self._blank_translation_frames += 1
+            if not self.settings.overlay_tracking_enabled and self._blank_translation_frames <= 2:
+                return boxes
             if not self.settings.overlay_tracking_enabled:
                 self._recent_translations = []
+                self._recent_translation_lookup = {}
+                self._recent_translation_candidates = []
+                self._pending_translation_frames = 0
             return boxes
 
+        self._blank_translation_frames = 0
         translated_boxes = self._reuse_recent_translations(boxes)
         grouped_indices: dict[tuple[str, str], list[int]] = {}
         for index, box in enumerate(translated_boxes):
@@ -570,69 +941,140 @@ class TextDetectionPipeline:
 
         for (source_language_code, target_language_code), indices in grouped_indices.items():
             prioritized_indices = self._prioritize_translation_indices(translated_boxes, indices)
-            texts = [translated_boxes[index].text for index in prioritized_indices]
+            unique_text_order: list[str] = []
+            text_to_indices: dict[str, list[int]] = {}
+
+            for index in prioritized_indices:
+                text = translated_boxes[index].text
+                normalized_text = self._normalize_text_for_matching(text)
+                if not normalized_text:
+                    continue
+                if normalized_text not in text_to_indices:
+                    unique_text_order.append(text)
+                    text_to_indices[normalized_text] = [index]
+                else:
+                    text_to_indices[normalized_text].append(index)
+
+            if not unique_text_order:
+                continue
+
             translated_batch = self.translation_backend.translate_batch(
-                texts,
+                unique_text_order,
                 source_language_code=source_language_code,
                 target_language_code=target_language_code,
             )
-            for index, translated_text in zip(prioritized_indices, translated_batch, strict=False):
-                translated_boxes[index] = replace(translated_boxes[index], translated_text=translated_text)
+            for text, translated_text in zip(unique_text_order, translated_batch, strict=False):
+                normalized_text = self._normalize_text_for_matching(text)
+                for index in text_to_indices.get(normalized_text, []):
+                    translated_boxes[index] = replace(translated_boxes[index], translated_text=translated_text)
 
         self._remember_translations(translated_boxes)
         return translated_boxes
 
     def _reuse_recent_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
-        if not self._recent_translations:
+        if not self._recent_translation_candidates:
             return list(boxes)
 
         reused_boxes: list[DetectionBox] = []
         for box in boxes:
-            translated_text = self._find_recent_translation(box)
-            if translated_text:
-                reused_boxes.append(replace(box, translated_text=translated_text))
+            recent = self._find_recent_translation_match(box)
+            if recent is None:
+                reused_boxes.append(box)
                 continue
-            reused_boxes.append(box)
+
+            if box.text:
+                reused_boxes.append(replace(box, translated_text=recent.translated_text))
+                continue
+
+            reused_boxes.append(
+                replace(
+                    box,
+                    text=recent.text,
+                    translated_text=recent.translated_text,
+                    source_language_code=recent.source_language_code,
+                    source_language_label=recent.source_language_label,
+                    target_language_code=recent.target_language_code,
+                    target_language_label=recent.target_language_label,
+                    confidence=recent.confidence,
+                )
+            )
         return reused_boxes
 
-    def _find_recent_translation(self, box: DetectionBox) -> str:
-        if not box.text:
-            return ""
+    def _find_recent_translation_match(self, box: DetectionBox) -> DetectionBox | None:
+        current_text = self._normalize_text_for_matching(box.text)
+        if current_text:
+            direct_match = self._recent_translation_lookup.get(
+                (box.source_language_code, box.target_language_code, current_text),
+            )
+            if direct_match:
+                for recent, recent_text in self._recent_translation_candidates:
+                    if (
+                        recent_text == current_text
+                        and recent.source_language_code == box.source_language_code
+                        and recent.target_language_code == box.target_language_code
+                        and recent.translated_text == direct_match
+                    ):
+                        return recent
 
         current_rect = (box.x, box.y, box.w, box.h)
         current_area = max(box.w * box.h, 1)
-        current_text = self._normalize_text_for_matching(box.text)
-        if not current_text:
-            return ""
-
         best_score = 0.0
-        best_translation = ""
-        for recent in self._recent_translations:
-            if not recent.translated_text:
-                continue
-            if recent.source_language_code != box.source_language_code:
-                continue
+        best_recent: DetectionBox | None = None
+        for recent, recent_text in self._recent_translation_candidates:
             if recent.target_language_code != box.target_language_code:
                 continue
-
-            recent_text = self._normalize_text_for_matching(recent.text)
-            if not recent_text:
+            if current_text and recent.source_language_code != box.source_language_code:
                 continue
 
-            similarity = SequenceMatcher(None, current_text, recent_text).ratio()
-            overlap = self._intersection_area(current_rect, (recent.x, recent.y, recent.w, recent.h)) / current_area
-            if overlap < 0.35:
-                if not self.settings.overlay_tracking_enabled or similarity < 0.88:
+            recent_rect = (recent.x, recent.y, recent.w, recent.h)
+            geometry_score, overlap = self._recent_geometry_score(current_rect, recent_rect, current_area)
+            if not current_text:
+                if geometry_score < 0.58:
                     continue
-                score = similarity * 0.90
+                score = geometry_score
             else:
-                score = (overlap * 0.55) + (similarity * 0.45)
+                similarity = SequenceMatcher(None, current_text, recent_text).ratio()
+                if overlap < 0.35:
+                    if (
+                        not self.settings.overlay_tracking_enabled
+                        and self._current_motion_offset[2] < 0.06
+                    ) or similarity < 0.88:
+                        continue
+                    score = (similarity * 0.82) + (geometry_score * 0.18)
+                else:
+                    score = (overlap * 0.50) + (similarity * 0.42) + (geometry_score * 0.08)
 
-            if similarity >= 0.45 and score > best_score:
+                if similarity < 0.45:
+                    continue
+
+            if score > best_score:
                 best_score = score
-                best_translation = recent.translated_text
+                best_recent = recent
 
-        return best_translation
+        return best_recent
+
+    def _recent_geometry_score(
+        self,
+        current_rect: tuple[int, int, int, int],
+        recent_rect: tuple[int, int, int, int],
+        current_area: int,
+    ) -> tuple[float, float]:
+        best_score = 0.0
+        best_overlap = 0.0
+        for candidate_rect, motion_adjusted in self._iter_motion_adjusted_rects(recent_rect, scaled=False):
+            intersection = self._intersection_area(current_rect, candidate_rect)
+            overlap = intersection / current_area
+            recent_area = max(candidate_rect[2] * candidate_rect[3], 1)
+            mutual_overlap = max(overlap, intersection / recent_area)
+            proximity = self._rect_center_proximity(current_rect, candidate_rect)
+            size_similarity = self._rect_size_similarity(current_rect, candidate_rect)
+            score = (mutual_overlap * 0.62) + (proximity * 0.24) + (size_similarity * 0.14)
+            if motion_adjusted:
+                score += 0.08
+            if score > best_score:
+                best_score = score
+                best_overlap = overlap
+        return min(best_score, 1.0), best_overlap
 
     def _prioritize_translation_indices(
         self,
@@ -665,6 +1107,17 @@ class TextDetectionPipeline:
 
     def _remember_translations(self, boxes: list[DetectionBox]) -> None:
         remembered = [box for box in boxes if box.translated_text]
+        if not remembered:
+            self._pending_translation_frames += 1
+            if (
+                not self.settings.overlay_tracking_enabled
+                and self._recent_translations
+                and self._pending_translation_frames <= 2
+            ):
+                return
+        else:
+            self._pending_translation_frames = 0
+
         if self.settings.overlay_tracking_enabled:
             remembered.extend(recent for recent in self._recent_translations if recent.translated_text)
 
@@ -689,6 +1142,15 @@ class TextDetectionPipeline:
         multiplier = 6 if self.settings.overlay_tracking_enabled else 3
         minimum = 60 if self.settings.overlay_tracking_enabled else 24
         self._recent_translations = deduped[: max(self.settings.max_ocr_boxes_per_frame * multiplier, minimum)]
+        self._recent_translation_lookup = {}
+        self._recent_translation_candidates = []
+        for box in self._recent_translations:
+            normalized_text = self._normalize_text_for_matching(box.text)
+            if normalized_text and box.translated_text:
+                self._recent_translation_lookup[
+                    (box.source_language_code, box.target_language_code, normalized_text)
+                ] = box.translated_text
+                self._recent_translation_candidates.append((box, normalized_text))
 
     def _merge_text_boxes(
         self,
@@ -799,7 +1261,8 @@ class TextDetectionPipeline:
     @staticmethod
     def _normalize_text_for_matching(text: str) -> str:
         normalized = text.casefold()
-        normalized = re.sub(r"[^0-9a-z\u0E00-\u0E7F]+", " ", normalized)
+        # Keep alphanumerics, Thai, and common Japanese (Hiragana/Katakana/Kanji)
+        normalized = re.sub(r"[^0-9a-z\u0E00-\u0E7F\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+", " ", normalized)
         return " ".join(normalized.split())
 
     @staticmethod
@@ -836,6 +1299,18 @@ class TextDetectionPipeline:
         alpha_numeric_count = sum(character.isalnum() for character in text)
         thai_count = sum("\u0E00" <= character <= "\u0E7F" for character in text)
         meaningful_count = alpha_numeric_count + thai_count
+        tokens = text.split()
+        word_like_tokens = [token for token in tokens if sum(character.isalpha() for character in token) >= 2]
+        symbolic_tokens = [
+            token
+            for token in tokens
+            if sum(character.isalnum() for character in token) <= max(len(token) // 2, 1)
+        ]
+        short_noise_tokens = [
+            token
+            for token in tokens
+            if len(token) <= 2 and sum(character.isalnum() for character in token) <= 1
+        ]
 
         if meaningful_count < 2 and len(text) <= 3:
             return False
@@ -848,6 +1323,10 @@ class TextDetectionPipeline:
         )
         if punctuation_ratio > 0.55 and meaningful_count < 5:
             return False
+        if len(tokens) >= 6 and len(word_like_tokens) <= 2:
+            noisy_token_count = len(symbolic_tokens) + len(short_noise_tokens)
+            if noisy_token_count / max(len(tokens), 1) >= 0.42:
+                return False
         if confidence is not None and confidence < 25.0 and meaningful_count < 6:
             return False
         return True
