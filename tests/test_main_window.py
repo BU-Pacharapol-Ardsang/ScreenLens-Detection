@@ -49,6 +49,7 @@ class DummyWorker(QObject):
         self.settings = settings
         self.started = False
         self.stopped = False
+        self._hover_locked = False
         DummyWorker.instances.append(self)
 
     def start(self) -> None:
@@ -70,6 +71,16 @@ class DummyWorker(QObject):
         self.stopped = True
         self.finished.emit()
 
+    def hover_position_locked(self) -> bool:
+        return self._hover_locked
+
+    def lock_hover_position(self) -> bool:
+        self._hover_locked = True
+        return True
+
+    def unlock_hover_position(self) -> None:
+        self._hover_locked = False
+
 
 def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch) -> None:
     DummyWorker.instances.clear()
@@ -86,10 +97,17 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert easyocr_index >= 0
         scanline_index = window.scanline_roi_combo.findData(True)
         assert scanline_index >= 0
+        hover_region_index = window.translation_region_mode_combo.findData("hover")
+        assert hover_region_index >= 0
+        strict_block_index = window.translation_block_mode_combo.findData("strict")
+        assert strict_block_index >= 0
 
         window.translation_mode_combo.setCurrentIndex(google_index)
         window.text_detector_combo.setCurrentIndex(easyocr_index)
         window.scanline_roi_combo.setCurrentIndex(scanline_index)
+        window.translation_region_mode_combo.setCurrentIndex(hover_region_index)
+        window.translation_block_mode_combo.setCurrentIndex(strict_block_index)
+        window.translation_stability_checkbox.setChecked(False)
         window.interval_spin.setValue(1000)
         window.scale_spin.setValue(1.0)
         window.detection_scale_spin.setValue(0.50)
@@ -109,17 +127,30 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert worker.settings.text_detector_mode == "easyocr"
         assert worker.settings.detection_scale == 0.50
         assert worker.settings.scanline_roi_enabled is True
+        assert worker.settings.translation_region_mode == "hover"
+        assert worker.settings.translation_block_mode == "strict"
+        assert worker.settings.translation_similarity_stability_enabled is False
         assert worker.settings.overlay_tracking_enabled is True
         assert worker.settings.overlay_tracking_mode == "anchor"
         assert window.worker is worker
         assert window.text_detector_combo.isEnabled() is False
         assert window.scanline_roi_combo.isEnabled() is False
         assert window.translation_mode_combo.isEnabled() is False
+        assert window.translation_region_mode_combo.isEnabled() is False
+        assert window.translation_block_mode_combo.isEnabled() is False
+        assert window.translation_stability_checkbox.isEnabled() is False
         assert window.overlay_tracking_checkbox.isEnabled() is False
         assert window.overlay_tracking_mode_combo.isEnabled() is False
         assert window.stop_button.isEnabled() is True
         assert window.status_label.text() == "Synthetic worker running"
         assert window.ocr_runtime_label.text() == "Synthetic OCR runtime"
+
+        window._handle_hotkey(3)
+        assert worker.hover_position_locked() is True
+        assert "Hover locked" in window.status_label.text()
+
+        window._handle_hotkey(3)
+        assert worker.hover_position_locked() is False
 
         window._stop_worker()
         app.processEvents()
@@ -129,6 +160,9 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert window.text_detector_combo.isEnabled() is True
         assert window.scanline_roi_combo.isEnabled() is True
         assert window.translation_mode_combo.isEnabled() is True
+        assert window.translation_region_mode_combo.isEnabled() is True
+        assert window.translation_block_mode_combo.isEnabled() is True
+        assert window.translation_stability_checkbox.isEnabled() is True
         assert window.stop_button.isEnabled() is False
         assert window.status_label.text() == "Stopped"
     finally:

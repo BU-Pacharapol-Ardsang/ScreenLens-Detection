@@ -22,6 +22,7 @@ if sys.platform == "win32":
     MOD_NOREPEAT = 0x4000
     VK_F2 = 0x71
     VK_F6 = 0x75
+    VK_F7 = 0x76
     USER32 = ctypes.windll.user32
 
     class MSG(ctypes.Structure):
@@ -38,6 +39,7 @@ else:
     MOD_NOREPEAT = 0
     VK_F2 = 0
     VK_F6 = 0
+    VK_F7 = 0
     USER32 = None
     MSG = None
 
@@ -45,11 +47,23 @@ else:
 HOTKEY_SPECS: tuple[HotkeySpec, ...] = (
     HotkeySpec(id=1, label="F6", modifiers=MOD_NOREPEAT, virtual_key=VK_F6),
     HotkeySpec(id=2, label="Shift+F2", modifiers=MOD_SHIFT | MOD_NOREPEAT, virtual_key=VK_F2),
+    HotkeySpec(id=3, label="F7", modifiers=MOD_NOREPEAT, virtual_key=VK_F7),
 )
 
 
 def hotkey_labels() -> str:
     return ", ".join(spec.label for spec in HOTKEY_SPECS)
+
+
+def overlay_hotkey_labels() -> str:
+    return ", ".join(spec.label for spec in HOTKEY_SPECS if spec.id in {1, 2})
+
+
+def hover_lock_hotkey_label() -> str:
+    for spec in HOTKEY_SPECS:
+        if spec.id == 3:
+            return spec.label
+    return "F7"
 
 
 def register_window_hotkeys(hwnd: int) -> list[str]:

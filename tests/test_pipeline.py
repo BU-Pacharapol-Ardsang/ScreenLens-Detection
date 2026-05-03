@@ -203,6 +203,83 @@ def test_pipeline_scanline_mode_reuses_boxes_outside_active_band() -> None:
     assert "scanline 1/2" in third.status
 
 
+def test_pipeline_hover_region_selects_nearest_box_in_line_mode() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_region_mode="hover"),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    selected = pipeline._select_hover_source_boxes(
+        [
+            (40, 80, 180, 32),
+            (420, 80, 180, 32),
+            (40, 180, 180, 32),
+        ],
+        (60, 92),
+    )
+
+    assert selected == [(40, 80, 180, 32)]
+
+
+def test_pipeline_hover_region_selects_strict_block_neighbors_for_wide_text() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_region_mode="hover", translation_block_mode="strict"),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    selected = pipeline._select_hover_source_boxes(
+        [
+            (100, 100, 620, 32),
+            (102, 140, 630, 32),
+            (101, 180, 590, 32),
+            (780, 100, 520, 32),
+            (30, 260, 150, 28),
+        ],
+        (160, 112),
+    )
+
+    assert selected == [
+        (100, 100, 620, 32),
+        (102, 140, 630, 32),
+        (101, 180, 590, 32),
+    ]
+
+
+def test_pipeline_hover_region_uses_recent_ocr_cache_before_roi_detection() -> None:
+    backend = BatchRecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            translation_region_mode="hover",
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=4,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+
+    frame = np.full((300, 500, 3), 255, dtype=np.uint8)
+    gray = np.full((300, 500), 255, dtype=np.uint8)
+    pipeline._annotate_with_ocr([(100, 100, 300, 32)], gray, frame.shape, 1.0)
+
+    detection_gray = pipeline._enhance_grayscale(frame)
+    preview_boxes, line_mask, working_boxes = pipeline._hover_detection_pass(
+        frame,
+        detection_gray,
+        frame.shape,
+        1.0,
+        (120, 112),
+    )
+
+    assert working_boxes == [(100, 100, 300, 32)]
+    assert preview_boxes == [(100, 100, 300, 32)]
+    assert line_mask[110, 120] == 255
+    assert pipeline._last_hover_region_status == "hover cache"
+    assert backend.batch_calls == [(1, "eng", [7])]
+
+
 class RecordingOCRBackend(OCRBackend):
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
@@ -697,6 +774,166 @@ def test_pipeline_deduplicates_repeated_text_before_translation() -> None:
     assert translated[1].translated_text == "tha:Breaking news from BBC"
 
 
+def test_pipeline_strict_block_translation_groups_paragraph_lines() -> None:
+    backend = RecordingRouteTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_block_mode="strict"),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    boxes = [
+        DetectionBox(
+            x=100,
+            y=100,
+            w=720,
+            h=32,
+            text="Plastic pollution affects daily life and the environment.",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+        DetectionBox(
+            x=102,
+            y=140,
+            w=735,
+            h=32,
+            text="People can reduce waste by changing routine behavior.",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+        DetectionBox(
+            x=101,
+            y=180,
+            w=680,
+            h=32,
+            text="Using reusable bags and bottles helps lower plastic use.",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+    ]
+
+    translated = pipeline._apply_translations(boxes)
+
+    expected_text = "\n".join(box.text for box in boxes)
+    assert backend.calls == [("eng", "tha", [expected_text])]
+    assert len(translated) == 1
+    assert translated[0].text == expected_text
+    assert translated[0].translated_text == f"tha:{expected_text}"
+    assert (translated[0].x, translated[0].y, translated[0].w, translated[0].h) == (100, 100, 737, 112)
+
+
+def test_pipeline_strict_block_translation_reuses_recent_block_text() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_block_mode="strict"),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=100,
+            w=720,
+            h=32,
+            text="Plastic pollution affects daily life and the environment.",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+        DetectionBox(
+            x=102,
+            y=140,
+            w=735,
+            h=32,
+            text="People can reduce waste by changing routine behavior.",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+    ]
+    first_result = pipeline._apply_translations(first_frame)
+
+    second_frame = [replace(box, x=box.x + 2, y=box.y + 2) for box in first_frame]
+    second_result = pipeline._apply_translations(second_frame)
+
+    assert first_result[0].translated_text.startswith("translated:")
+    assert second_result[0].translated_text == first_result[0].translated_text
+    assert backend.calls == 1
+
+
+def test_pipeline_strict_block_translation_leaves_menu_labels_as_lines() -> None:
+    backend = RecordingRouteTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_block_mode="strict"),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    boxes = [
+        DetectionBox(
+            x=30,
+            y=40,
+            w=180,
+            h=28,
+            text="Settings",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+        DetectionBox(
+            x=30,
+            y=78,
+            w=180,
+            h=28,
+            text="Save Game",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+        DetectionBox(
+            x=30,
+            y=116,
+            w=180,
+            h=28,
+            text="Exit",
+            source_language_code="eng",
+            source_language_label="English",
+        ),
+    ]
+
+    translated = pipeline._apply_translations(boxes)
+
+    assert len(translated) == 3
+    assert all("\n" not in box.text for box in translated)
+    assert len(backend.calls) == 1
+    assert len(backend.calls[0][2]) == 3
+
+
+def test_pipeline_strict_block_translation_does_not_cross_columns() -> None:
+    backend = RecordingRouteTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_block_mode="strict"),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    left_first = "Plastic pollution affects daily life and the environment."
+    left_second = "People can reduce waste by changing routine behavior."
+    right_first = "Economic reports describe a slower recovery this quarter."
+    right_second = "Analysts expect demand to improve during the summer."
+    boxes = [
+        DetectionBox(x=100, y=100, w=520, h=32, text=left_first, source_language_code="eng"),
+        DetectionBox(x=700, y=100, w=520, h=32, text=right_first, source_language_code="eng"),
+        DetectionBox(x=100, y=140, w=520, h=32, text=left_second, source_language_code="eng"),
+        DetectionBox(x=700, y=140, w=520, h=32, text=right_second, source_language_code="eng"),
+    ]
+
+    translated = pipeline._apply_translations(boxes)
+
+    assert len(translated) == 2
+    assert translated[0].text == f"{left_first}\n{left_second}"
+    assert translated[1].text == f"{right_first}\n{right_second}"
+    assert len(backend.calls) == 1
+    assert backend.calls[0][2] == [translated[0].text, translated[1].text]
+
+
 def test_pipeline_recent_translation_lookup_keeps_language_route_separate() -> None:
     backend = RecordingRouteTranslationBackend()
     pipeline = TextDetectionPipeline(
@@ -769,6 +1006,158 @@ def test_pipeline_reuses_recent_translation_for_similar_box_in_next_frame() -> N
 
     assert first_result[0].translated_text.startswith("translated:")
     assert second_result[0].translated_text == first_result[0].translated_text
+
+
+def test_pipeline_reuses_recent_translation_for_stable_ocr_noise() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=200,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    first_result = pipeline._apply_translations(first_frame)
+
+    noisy_frame = [
+        DetectionBox(
+            x=101,
+            y=201,
+            w=902,
+            h=49,
+            text="US Treasury Secretary Scott Bessent has told the B8C",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    noisy_result = pipeline._apply_translations(noisy_frame)
+
+    assert noisy_result[0].translated_text == first_result[0].translated_text
+    assert backend.calls == 1
+
+
+def test_pipeline_does_not_reuse_similarity_when_numbers_change() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=200,
+            w=500,
+            h=48,
+            text="HP 90 remaining after attack",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    pipeline._apply_translations(first_frame)
+
+    changed_frame = [
+        DetectionBox(
+            x=101,
+            y=201,
+            w=500,
+            h=48,
+            text="HP 10 remaining after attack",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    changed_result = pipeline._apply_translations(changed_frame)
+
+    assert changed_result[0].translated_text == ""
+    assert backend.calls == 2
+
+
+def test_pipeline_does_not_reuse_similarity_for_short_menu_labels() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=200,
+            w=180,
+            h=40,
+            text="Continue",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    pipeline._apply_translations(first_frame)
+
+    changed_frame = [
+        DetectionBox(
+            x=101,
+            y=201,
+            w=180,
+            h=40,
+            text="Continua",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    changed_result = pipeline._apply_translations(changed_frame)
+
+    assert changed_result[0].translated_text == ""
+    assert backend.calls == 2
+
+
+def test_pipeline_can_disable_text_similarity_stability() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_similarity_stability_enabled=False),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_frame = [
+        DetectionBox(
+            x=100,
+            y=200,
+            w=900,
+            h=48,
+            text="US Treasury Secretary Scott Bessent has told the BBC",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    pipeline._apply_translations(first_frame)
+
+    noisy_frame = [
+        DetectionBox(
+            x=101,
+            y=201,
+            w=902,
+            h=49,
+            text="US Treasury Secretary Scott Bessent has told the B8C",
+            source_language_code="eng",
+            source_language_label="English",
+        )
+    ]
+    noisy_result = pipeline._apply_translations(noisy_frame)
+
+    assert noisy_result[0].translated_text == ""
+    assert backend.calls == 2
 
 
 def test_pipeline_reuses_tracked_translation_after_blank_and_scroll() -> None:

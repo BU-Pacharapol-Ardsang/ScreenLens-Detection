@@ -46,6 +46,13 @@ class PipelineSettings:
     source_language_code: str = "auto"
     target_language_code: str = "tha"
     translation_mode: str = "argos"
+    translation_region_mode: str = "full"
+    hover_region_radius: int = 260
+    hover_box_margin: int = 96
+    translation_block_mode: str = "line"
+    translation_similarity_stability_enabled: bool = True
+    translation_similarity_threshold: float = 0.92
+    translation_similarity_min_chars: int = 16
     ocr_enabled: bool = True
     ocr_device_preference: str = "auto"
     ocr_language: str = "tha+eng+jpn"

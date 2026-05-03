@@ -58,6 +58,12 @@ class _CachedOCRResult:
     stable_hits: int = 1
 
 
+@dataclass(slots=True, frozen=True)
+class _TranslationBlock:
+    indices: tuple[int, ...]
+    text: str
+
+
 class TextDetectionPipeline:
     """Realtime screen-text pipeline using traditional CV and optional OCR."""
 
@@ -85,6 +91,7 @@ class TextDetectionPipeline:
         self._scanline_last_band_count = 0
         self._scanline_source_shape: tuple[int, int, int] | None = None
         self._scanline_detection_shape: tuple[int, int, int] | None = None
+        self._last_hover_region_status = ""
         self._previous_motion_gray: np.ndarray | None = None
         self._current_motion_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._current_scaled_motion_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -99,13 +106,28 @@ class TextDetectionPipeline:
         if self._deep_text_detector is not None:
             self._deep_text_detector.close()
 
-    def process(self, frame: np.ndarray, *, monitor_label: str = "") -> FrameAnalysis:
+    def process(
+        self,
+        frame: np.ndarray,
+        *,
+        monitor_label: str = "",
+        cursor_position: tuple[int, int] | None = None,
+    ) -> FrameAnalysis:
         started = perf_counter()
 
         detection_frame, detection_scale = self._scale_frame(frame)
         self._active_detection_scale = detection_scale
         detection_gray = self._enhance_grayscale(detection_frame)
-        if self.settings.scanline_roi_enabled:
+        if self._translation_region_mode() == "hover":
+            self._reset_scanline_state()
+            detection_boxes, line_mask, working_boxes = self._hover_detection_pass(
+                detection_frame,
+                detection_gray,
+                frame.shape,
+                detection_scale,
+                cursor_position,
+            )
+        elif self.settings.scanline_roi_enabled:
             detection_boxes, line_mask, working_boxes = self._scanline_detection_pass(
                 detection_frame,
                 detection_gray,
@@ -114,6 +136,7 @@ class TextDetectionPipeline:
             )
         else:
             self._reset_scanline_state()
+            self._last_hover_region_status = ""
             mask = self._build_text_mask(detection_frame, detection_gray)
             line_mask = self._build_line_mask(mask)
             detection_boxes = self._detect_text_boxes(detection_frame, line_mask, mask, detection_gray)
@@ -345,6 +368,205 @@ class TextDetectionPipeline:
         self._scanline_last_band_count = 0
         self._scanline_source_shape = None
         self._scanline_detection_shape = None
+
+    def _translation_region_mode(self) -> str:
+        mode = (self.settings.translation_region_mode or "full").casefold().strip()
+        if mode in {"hover", "cursor", "hover_region"}:
+            return "hover"
+        return "full"
+
+    def _hover_detection_pass(
+        self,
+        detection_frame: np.ndarray,
+        detection_gray: np.ndarray,
+        source_shape: tuple[int, int, int],
+        detection_scale: float,
+        cursor_position: tuple[int, int] | None,
+    ) -> tuple[list[tuple[int, int, int, int]], np.ndarray, list[tuple[int, int, int, int]]]:
+        line_mask = np.zeros_like(detection_gray)
+        if cursor_position is None or not self._cursor_inside_source_frame(cursor_position, source_shape):
+            self._last_hover_region_status = "hover waiting"
+            return [], line_mask, []
+
+        cached_boxes = self._select_hover_source_boxes(
+            self._hover_cached_source_boxes(cursor_position),
+            cursor_position,
+        )
+        if cached_boxes:
+            self._last_hover_region_status = "hover cache"
+            preview_boxes = self._map_boxes_to_detection_frame(cached_boxes, detection_frame.shape, detection_scale)
+            self._paint_hover_preview_mask(line_mask, preview_boxes)
+            return preview_boxes, line_mask, cached_boxes
+
+        source_left, source_top, source_right, source_bottom = self._hover_source_roi_bounds(
+            cursor_position,
+            source_shape,
+        )
+        detection_left = max(int(np.floor(source_left * detection_scale)), 0)
+        detection_top = max(int(np.floor(source_top * detection_scale)), 0)
+        detection_right = min(int(np.ceil(source_right * detection_scale)), detection_frame.shape[1])
+        detection_bottom = min(int(np.ceil(source_bottom * detection_scale)), detection_frame.shape[0])
+        if detection_right <= detection_left or detection_bottom <= detection_top:
+            self._last_hover_region_status = "hover ROI empty"
+            return [], line_mask, []
+
+        roi_frame = detection_frame[detection_top:detection_bottom, detection_left:detection_right]
+        roi_gray = detection_gray[detection_top:detection_bottom, detection_left:detection_right]
+        mask_roi = self._build_text_mask(roi_frame, roi_gray)
+        line_mask_roi = self._build_line_mask(mask_roi)
+        roi_boxes = self._detect_text_boxes(
+            roi_frame,
+            line_mask_roi,
+            mask_roi,
+            roi_gray,
+            filter_frame_shape=detection_frame.shape,
+        )
+        detection_boxes = [(x + detection_left, y + detection_top, w, h) for x, y, w, h in roi_boxes]
+        source_boxes = self._map_boxes_to_source_frame(detection_boxes, source_shape, detection_scale)
+        selected_source_boxes = self._select_hover_source_boxes(source_boxes, cursor_position)
+        preview_boxes = self._map_boxes_to_detection_frame(
+            selected_source_boxes,
+            detection_frame.shape,
+            detection_scale,
+        )
+
+        line_mask[detection_top:detection_bottom, detection_left:detection_right] = line_mask_roi
+        if preview_boxes:
+            self._last_hover_region_status = (
+                f"hover ROI {source_right - source_left}x{source_bottom - source_top}"
+            )
+        else:
+            self._last_hover_region_status = "hover ROI none"
+        return preview_boxes, line_mask, selected_source_boxes
+
+    def _hover_cached_source_boxes(self, cursor_position: tuple[int, int]) -> list[tuple[int, int, int, int]]:
+        if not self._recent_ocr_results:
+            return []
+
+        boxes: list[tuple[int, int, int, int]] = []
+        max_age = self._max_ocr_cache_age_frames()
+        for cached in self._recent_ocr_results:
+            if not cached.text:
+                continue
+            if self._ocr_cache_generation - cached.last_seen_generation > max_age:
+                continue
+            for candidate_rect, _motion_adjusted in self._iter_motion_adjusted_rects(cached.rect, scaled=False):
+                if self._cursor_box_distance(cursor_position, candidate_rect) <= max(
+                    self.settings.hover_region_radius,
+                    self._hover_box_margin(),
+                ):
+                    boxes.append(candidate_rect)
+                    break
+
+        return self._dedupe_rects(boxes)
+
+    def _select_hover_source_boxes(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        cursor_position: tuple[int, int],
+    ) -> list[tuple[int, int, int, int]]:
+        if not boxes:
+            return []
+
+        deduped = self._dedupe_rects(boxes)
+        ranked = [
+            (self._cursor_box_distance(cursor_position, box), box)
+            for box in deduped
+        ]
+        ranked.sort(key=lambda item: (item[0], item[1][1], item[1][0]))
+        if not ranked or ranked[0][0] > self._hover_box_margin():
+            return []
+
+        anchor = ranked[0][1]
+        if self._translation_block_mode() != "strict" or anchor[2] < 240:
+            return [anchor]
+
+        return self._hover_strict_geometry_block(deduped, anchor)
+
+    def _hover_strict_geometry_block(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        anchor: tuple[int, int, int, int],
+    ) -> list[tuple[int, int, int, int]]:
+        anchor_height = max(anchor[3], 1)
+        anchor_center_y = anchor[1] + (anchor[3] / 2.0)
+        x_tolerance = max(int(round(anchor_height * 1.45)), 36)
+        vertical_span = max(self.settings.hover_region_radius, int(round(anchor_height * 5.0)))
+        selected: list[tuple[int, int, int, int]] = []
+
+        for box in boxes:
+            height_ratio = box[3] / anchor_height
+            if height_ratio < 0.70 or height_ratio > 1.35:
+                continue
+            if abs(box[0] - anchor[0]) > x_tolerance:
+                continue
+            if self._horizontal_overlap_ratio(box, anchor) < 0.45:
+                continue
+            center_y = box[1] + (box[3] / 2.0)
+            if abs(center_y - anchor_center_y) > vertical_span:
+                continue
+            selected.append(box)
+
+        if len(selected) <= 1:
+            return [anchor]
+
+        selected.sort(key=lambda box: (abs((box[1] + (box[3] / 2.0)) - anchor_center_y), box[1], box[0]))
+        selected = selected[:6]
+        selected.sort(key=lambda box: (box[1], box[0]))
+        return selected
+
+    def _hover_source_roi_bounds(
+        self,
+        cursor_position: tuple[int, int],
+        source_shape: tuple[int, int, int],
+    ) -> tuple[int, int, int, int]:
+        frame_height, frame_width = source_shape[:2]
+        radius = max(self.settings.hover_region_radius, 32)
+        cursor_x, cursor_y = cursor_position
+        left = max(cursor_x - radius, 0)
+        top = max(cursor_y - radius, 0)
+        right = min(cursor_x + radius, frame_width)
+        bottom = min(cursor_y + radius, frame_height)
+        return left, top, right, bottom
+
+    def _hover_box_margin(self) -> int:
+        return max(self.settings.hover_box_margin, 8)
+
+    @staticmethod
+    def _cursor_inside_source_frame(
+        cursor_position: tuple[int, int],
+        source_shape: tuple[int, int, int],
+    ) -> bool:
+        x, y = cursor_position
+        return 0 <= x < source_shape[1] and 0 <= y < source_shape[0]
+
+    @staticmethod
+    def _cursor_box_distance(
+        cursor_position: tuple[int, int],
+        box: tuple[int, int, int, int],
+    ) -> float:
+        cursor_x, cursor_y = cursor_position
+        x, y, w, h = box
+        dx = max(x - cursor_x, 0, cursor_x - (x + w))
+        dy = max(y - cursor_y, 0, cursor_y - (y + h))
+        return float((dx * dx + dy * dy) ** 0.5)
+
+    @staticmethod
+    def _dedupe_rects(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+        deduped: list[tuple[int, int, int, int]] = []
+        for box in boxes:
+            if box in deduped:
+                continue
+            deduped.append(box)
+        return deduped
+
+    @staticmethod
+    def _paint_hover_preview_mask(
+        line_mask: np.ndarray,
+        preview_boxes: list[tuple[int, int, int, int]],
+    ) -> None:
+        for x, y, w, h in preview_boxes:
+            cv2.rectangle(line_mask, (x, y), (x + w, y + h), 255, -1)
 
     def _enhance_grayscale(self, frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -1376,8 +1598,26 @@ class TextDetectionPipeline:
 
         self._blank_translation_frames = 0
         translated_boxes = self._reuse_recent_translations(boxes)
+        line_skip_indices: set[int] = set()
+        if self._translation_block_mode() == "strict":
+            translated_boxes, line_skip_indices = self._apply_strict_block_translations(translated_boxes)
+
+        translated_boxes = self._apply_line_translations(translated_boxes, skip_indices=line_skip_indices)
+        self._remember_translations(translated_boxes)
+        return translated_boxes
+
+    def _apply_line_translations(
+        self,
+        boxes: list[DetectionBox],
+        *,
+        skip_indices: set[int] | None = None,
+    ) -> list[DetectionBox]:
+        skip_indices = skip_indices or set()
+        translated_boxes = list(boxes)
         grouped_indices: dict[tuple[str, str], list[int]] = {}
         for index, box in enumerate(translated_boxes):
+            if index in skip_indices:
+                continue
             if not box.text or box.translated_text:
                 continue
             grouped_indices.setdefault((box.source_language_code, box.target_language_code), []).append(index)
@@ -1411,8 +1651,268 @@ class TextDetectionPipeline:
                 for index in text_to_indices.get(normalized_text, []):
                     translated_boxes[index] = replace(translated_boxes[index], translated_text=translated_text)
 
-        self._remember_translations(translated_boxes)
         return translated_boxes
+
+    def _translation_block_mode(self) -> str:
+        mode = (self.settings.translation_block_mode or "line").casefold().strip()
+        if mode in {"strict", "block_strict"}:
+            return "strict"
+        return "line"
+
+    def _apply_strict_block_translations(
+        self,
+        boxes: list[DetectionBox],
+    ) -> tuple[list[DetectionBox], set[int]]:
+        blocks = self._strict_translation_blocks(boxes)
+        if not blocks:
+            return list(boxes), set()
+
+        block_translations = self._translate_blocks(boxes, blocks)
+        block_by_anchor: dict[int, DetectionBox] = {}
+        block_member_indices: set[int] = set()
+        for block_index, block in enumerate(blocks):
+            block_member_indices.update(block.indices)
+            block_by_anchor[block.indices[0]] = self._block_detection_box(
+                boxes,
+                block,
+                translated_text=block_translations[block_index],
+            )
+
+        translated_boxes: list[DetectionBox] = []
+        line_skip_indices: set[int] = set()
+        for index, box in enumerate(boxes):
+            block_box = block_by_anchor.get(index)
+            if block_box is not None:
+                line_skip_indices.add(len(translated_boxes))
+                translated_boxes.append(block_box)
+                continue
+            if index in block_member_indices:
+                continue
+            translated_boxes.append(box)
+
+        return translated_boxes, line_skip_indices
+
+    def _translate_blocks(
+        self,
+        boxes: list[DetectionBox],
+        blocks: list[_TranslationBlock],
+    ) -> list[str]:
+        translated_blocks = [""] * len(blocks)
+        grouped_indices: dict[tuple[str, str], list[int]] = {}
+
+        for block_index, block in enumerate(blocks):
+            anchor = boxes[block.indices[0]]
+            normalized_text = self._normalize_text_for_matching(block.text)
+            cached_translation = self._recent_translation_lookup.get(
+                (anchor.source_language_code, anchor.target_language_code, normalized_text),
+            )
+            if cached_translation:
+                translated_blocks[block_index] = cached_translation
+                continue
+            grouped_indices.setdefault(
+                (anchor.source_language_code, anchor.target_language_code),
+                [],
+            ).append(block_index)
+
+        for (source_language_code, target_language_code), indices in grouped_indices.items():
+            unique_text_order: list[str] = []
+            text_to_indices: dict[str, list[int]] = {}
+            for block_index in indices:
+                text = blocks[block_index].text
+                normalized_text = self._normalize_text_for_matching(text)
+                if not normalized_text:
+                    continue
+                if normalized_text not in text_to_indices:
+                    unique_text_order.append(text)
+                    text_to_indices[normalized_text] = [block_index]
+                else:
+                    text_to_indices[normalized_text].append(block_index)
+
+            if not unique_text_order:
+                continue
+
+            translated_batch = self.translation_backend.translate_batch(
+                unique_text_order,
+                source_language_code=source_language_code,
+                target_language_code=target_language_code,
+            )
+            for text, translated_text in zip(unique_text_order, translated_batch, strict=False):
+                normalized_text = self._normalize_text_for_matching(text)
+                for block_index in text_to_indices.get(normalized_text, []):
+                    translated_blocks[block_index] = translated_text
+
+        return translated_blocks
+
+    def _strict_translation_blocks(self, boxes: list[DetectionBox]) -> list[_TranslationBlock]:
+        candidates = [
+            (index, box)
+            for index, box in enumerate(boxes)
+            if self._is_strict_block_line_candidate(box)
+        ]
+        if len(candidates) < 2:
+            return []
+
+        candidates.sort(key=lambda item: (item[1].y, item[1].x))
+        used_indices: set[int] = set()
+        blocks: list[_TranslationBlock] = []
+        max_lines = 6
+
+        for start_index, start_box in candidates:
+            if start_index in used_indices:
+                continue
+
+            block: list[tuple[int, DetectionBox]] = [(start_index, start_box)]
+            while len(block) < max_lines:
+                successor = self._next_strict_block_successor(block, candidates, used_indices)
+                if successor is None:
+                    break
+                block.append(successor)
+
+            block_indices = tuple(index for index, _box in block)
+            if self._is_valid_strict_block(block) and not any(index in used_indices for index in block_indices):
+                used_indices.update(block_indices)
+                blocks.append(
+                    _TranslationBlock(
+                        indices=block_indices,
+                        text="\n".join(box.text.strip() for _index, box in block if box.text.strip()),
+                    )
+                )
+
+        return blocks
+
+    def _next_strict_block_successor(
+        self,
+        block: list[tuple[int, DetectionBox]],
+        candidates: list[tuple[int, DetectionBox]],
+        used_indices: set[int],
+    ) -> tuple[int, DetectionBox] | None:
+        possible: list[tuple[float, int, DetectionBox]] = []
+        last = block[-1][1]
+        for candidate_index, candidate in candidates:
+            if candidate_index in used_indices or any(index == candidate_index for index, _box in block):
+                continue
+            if candidate.y < last.y:
+                continue
+            if not self._can_append_strict_block_line(block, candidate):
+                continue
+            vertical_gap = max(candidate.y - last.bottom, 0)
+            x_delta = abs(candidate.x - block[0][1].x)
+            possible.append((vertical_gap + (x_delta * 0.15), candidate_index, candidate))
+
+        if not possible:
+            return None
+        possible.sort(key=lambda item: (item[0], item[2].y, item[2].x))
+        return possible[0][1], possible[0][2]
+
+    def _can_append_strict_block_line(
+        self,
+        block: list[tuple[int, DetectionBox]],
+        candidate: DetectionBox,
+    ) -> bool:
+        anchor = block[0][1]
+        last = block[-1][1]
+        if candidate.source_language_code != anchor.source_language_code:
+            return False
+        if candidate.target_language_code != anchor.target_language_code:
+            return False
+
+        heights = [box.h for _index, box in block]
+        median_height = float(np.median(heights))
+        height_ratio = candidate.h / max(median_height, 1.0)
+        if height_ratio < 0.70 or height_ratio > 1.35:
+            return False
+
+        vertical_gap = candidate.y - last.bottom
+        if vertical_gap < -max(int(round(median_height * 0.25)), 2):
+            return False
+        if vertical_gap > max(int(round(median_height * 1.30)), 8):
+            return False
+
+        x_tolerance = max(int(round(median_height * 1.45)), 36)
+        if abs(candidate.x - anchor.x) > x_tolerance:
+            return False
+
+        last_overlap = self._horizontal_overlap_ratio(
+            (last.x, last.y, last.w, last.h),
+            (candidate.x, candidate.y, candidate.w, candidate.h),
+        )
+        if last_overlap < 0.45:
+            return False
+
+        left = min(box.x for _index, box in block)
+        right = max(box.right for _index, box in block)
+        candidate_center_x = candidate.x + (candidate.w / 2.0)
+        if candidate_center_x < left - x_tolerance or candidate_center_x > right + x_tolerance:
+            return False
+
+        return True
+
+    def _is_valid_strict_block(self, block: list[tuple[int, DetectionBox]]) -> bool:
+        if len(block) < 2:
+            return False
+        combined_text = " ".join(box.text.strip() for _index, box in block)
+        normalized_text = self._normalize_text_for_matching(combined_text)
+        if len(normalized_text) < 48:
+            return False
+        if len(normalized_text.split()) < 8:
+            return False
+        return True
+
+    def _is_strict_block_line_candidate(self, box: DetectionBox) -> bool:
+        if not box.text or box.translated_text:
+            return False
+        text = " ".join(box.text.split())
+        normalized_text = self._normalize_text_for_matching(text)
+        if len(normalized_text) < 16:
+            return False
+        if self._looks_like_url(text) or self._looks_like_match_url(normalized_text):
+            return False
+
+        words = normalized_text.split()
+        if len(words) < 3 and len(normalized_text) < 24:
+            return False
+        alpha_count = sum(character.isalpha() for character in normalized_text)
+        digit_count = sum(character.isdigit() for character in normalized_text)
+        if alpha_count == 0 or digit_count >= alpha_count:
+            return False
+        if len(words) <= 2 and len(normalized_text) < 28:
+            return False
+        return True
+
+    def _block_detection_box(
+        self,
+        boxes: list[DetectionBox],
+        block: _TranslationBlock,
+        *,
+        translated_text: str,
+    ) -> DetectionBox:
+        block_boxes = [boxes[index] for index in block.indices]
+        anchor = block_boxes[0]
+        left = min(box.x for box in block_boxes)
+        top = min(box.y for box in block_boxes)
+        right = max(box.right for box in block_boxes)
+        bottom = max(box.bottom for box in block_boxes)
+        confidences = [box.confidence for box in block_boxes if box.confidence is not None]
+        confidence = float(np.mean(confidences)) if confidences else anchor.confidence
+        return replace(
+            anchor,
+            x=left,
+            y=top,
+            w=right - left,
+            h=bottom - top,
+            text=block.text,
+            translated_text=translated_text,
+            confidence=confidence,
+        )
+
+    @staticmethod
+    def _horizontal_overlap_ratio(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> float:
+        left = max(first[0], second[0])
+        right = min(first[0] + first[2], second[0] + second[2])
+        return max(right - left, 0) / max(min(first[2], second[2]), 1)
 
     def _reuse_recent_translations(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
         if not self._recent_translation_candidates:
@@ -1477,18 +1977,18 @@ class TextDetectionPipeline:
                 score = geometry_score
             else:
                 similarity = SequenceMatcher(None, current_text, recent_text).ratio()
+                if not self._is_stable_translation_similarity_match(
+                    current_text=current_text,
+                    recent_text=recent_text,
+                    similarity=similarity,
+                    geometry_score=geometry_score,
+                    overlap=overlap,
+                ):
+                    continue
                 if overlap < 0.35:
-                    if (
-                        not self.settings.overlay_tracking_enabled
-                        and self._current_motion_offset[2] < 0.06
-                    ) or similarity < 0.88:
-                        continue
                     score = (similarity * 0.82) + (geometry_score * 0.18)
                 else:
                     score = (overlap * 0.50) + (similarity * 0.42) + (geometry_score * 0.08)
-
-                if similarity < 0.45:
-                    continue
 
             if score > best_score:
                 best_score = score
@@ -1518,6 +2018,43 @@ class TextDetectionPipeline:
                 best_score = score
                 best_overlap = overlap
         return min(best_score, 1.0), best_overlap
+
+    def _is_stable_translation_similarity_match(
+        self,
+        *,
+        current_text: str,
+        recent_text: str,
+        similarity: float,
+        geometry_score: float,
+        overlap: float,
+    ) -> bool:
+        if not self.settings.translation_similarity_stability_enabled:
+            return False
+        if not current_text or not recent_text:
+            return False
+        if self._looks_like_match_url(current_text) or self._looks_like_match_url(recent_text):
+            return False
+        if self._translation_numbers(current_text) != self._translation_numbers(recent_text):
+            return False
+
+        min_chars = max(self.settings.translation_similarity_min_chars, 1)
+        if min(len(current_text), len(recent_text)) < min_chars:
+            return False
+
+        alpha_count = sum(character.isalpha() for character in current_text + recent_text)
+        digit_count = sum(character.isdigit() for character in current_text + recent_text)
+        if alpha_count == 0 or digit_count > alpha_count:
+            return False
+
+        threshold = min(max(self.settings.translation_similarity_threshold, 0.0), 1.0)
+        if overlap < 0.35:
+            if not self.settings.overlay_tracking_enabled and self._current_motion_offset[2] < 0.06:
+                return False
+            threshold = max(threshold, 0.94)
+        elif geometry_score < 0.58:
+            return False
+
+        return similarity >= threshold
 
     def _prioritize_translation_indices(
         self,
@@ -1709,6 +2246,20 @@ class TextDetectionPipeline:
         return " ".join(normalized.split())
 
     @staticmethod
+    def _translation_numbers(normalized_text: str) -> tuple[str, ...]:
+        return tuple(token for token in normalized_text.split() if token.isdigit())
+
+    @staticmethod
+    def _looks_like_match_url(normalized_text: str) -> bool:
+        tokens = normalized_text.split()
+        collapsed = "".join(tokens)
+        return (
+            collapsed.startswith(("http", "www"))
+            or "www" in tokens
+            or any(token in {"com", "org", "net", "io", "gg"} for token in tokens)
+        )
+
+    @staticmethod
     def _looks_like_url(text: str) -> bool:
         normalized = text.casefold().replace(" ", "")
         return (
@@ -1829,18 +2380,21 @@ class TextDetectionPipeline:
         mode = normalize_text_detector_mode(self.settings.text_detector_mode)
         scale = self._effective_detection_scale()
         scale_suffix = f" @ {scale:.2f}x" if abs(scale - 1.0) >= 0.01 else ""
+        region_suffix = ""
+        if self._translation_region_mode() == "hover":
+            region_suffix = f" | {self._last_hover_region_status or 'hover'}"
         scanline_suffix = ""
-        if self.settings.scanline_roi_enabled:
+        if self._translation_region_mode() != "hover" and self.settings.scanline_roi_enabled:
             band_count = self._scanline_last_band_count or max(self.settings.scanline_roi_band_count, 2)
             if self._scanline_last_band_index is None:
                 scanline_suffix = f" | scanline {band_count} bands"
             else:
                 scanline_suffix = f" | scanline {self._scanline_last_band_index + 1}/{band_count}"
         if mode == "opencv":
-            return f"OpenCV morphology detector{scale_suffix}{scanline_suffix}"
+            return f"OpenCV morphology detector{scale_suffix}{region_suffix}{scanline_suffix}"
 
         detector = self._ensure_deep_text_detector(mode)
-        return f"{detector.describe()}{scale_suffix}{scanline_suffix}"
+        return f"{detector.describe()}{scale_suffix}{region_suffix}{scanline_suffix}"
 
     def _effective_detection_scale(self) -> float:
         detector_scale = min(max(self.settings.detection_scale, 0.25), 1.0)

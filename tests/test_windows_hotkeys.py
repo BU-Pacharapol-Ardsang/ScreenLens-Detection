@@ -1,6 +1,13 @@
 import ctypes
 
-from screenlens_detection.windows_hotkeys import MSG, WM_HOTKEY, _coerce_message_address, extract_hotkey_id
+from screenlens_detection.windows_hotkeys import (
+    MSG,
+    WM_HOTKEY,
+    _coerce_message_address,
+    extract_hotkey_id,
+    hover_lock_hotkey_label,
+    overlay_hotkey_labels,
+)
 
 
 def test_coerce_message_address_from_c_void_p() -> None:
@@ -24,3 +31,8 @@ def test_extract_hotkey_id_from_void_pointer() -> None:
 
     pointer = ctypes.c_void_p(ctypes.addressof(msg))
     assert extract_hotkey_id(pointer) == 1
+
+
+def test_hotkey_labels_separate_overlay_and_hover_lock() -> None:
+    assert overlay_hotkey_labels() == "F6, Shift+F2"
+    assert hover_lock_hotkey_label() == "F7"
