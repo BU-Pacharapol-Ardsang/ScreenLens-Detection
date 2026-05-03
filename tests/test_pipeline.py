@@ -379,6 +379,7 @@ def test_pipeline_reused_ocr_cache_does_not_consume_per_frame_budget() -> None:
     assert pipeline._last_ocr_candidate_count == 2
     assert pipeline._last_ocr_reuse_count == 1
     assert pipeline._last_ocr_submitted_count == 1
+    assert "1 new OCR/frame | submitted 1, reused 1/2" in pipeline._status_message()
 
 
 def test_pipeline_reused_ocr_cache_keeps_translated_text() -> None:

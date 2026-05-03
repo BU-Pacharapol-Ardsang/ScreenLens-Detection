@@ -1814,7 +1814,7 @@ class TextDetectionPipeline:
         detector_status = self._detector_status_message()
         translation_status = self.translation_backend.describe()
         if self.settings.ocr_enabled and self.ocr_backend.is_available():
-            ocr_status = f"{self.ocr_backend.describe()} | {self.settings.max_ocr_boxes_per_frame} boxes/frame"
+            ocr_status = f"{self.ocr_backend.describe()} | {self.settings.max_ocr_boxes_per_frame} new OCR/frame"
             if self._last_ocr_candidate_count:
                 ocr_status = (
                     f"{ocr_status} | submitted {self._last_ocr_submitted_count}, "
