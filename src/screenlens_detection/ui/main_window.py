@@ -54,6 +54,7 @@ class MainWindow(QMainWindow):
         self.overlay_window = TranslationOverlay()
         self.overlay_active = False
         self._overlay_started_worker = False
+        self._hover_target_mode_active = False
         self._hotkeys_registered = False
         self._base_status = "Idle"
         defaults = PipelineSettings()
@@ -367,6 +368,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.record_button.setEnabled(False)
         self._overlay_started_worker = False
+        self._hover_target_mode_active = False
         if self._base_status != "Error":
             self._set_base_status("Stopped")
         self.ocr_runtime_label.setText("Stopped")
@@ -435,7 +437,7 @@ class MainWindow(QMainWindow):
         if hotkey_id in {1, 2}:
             self._toggle_overlay_mode()
         elif hotkey_id == 3:
-            self._toggle_hover_target_lock()
+            self._toggle_hover_target_mode()
 
     def _toggle_overlay_mode(self) -> None:
         if self.overlay_active:
@@ -443,21 +445,50 @@ class MainWindow(QMainWindow):
             return
         self._enable_overlay_mode()
 
-    def _toggle_hover_target_lock(self) -> None:
-        if self.translation_region_mode_combo.currentData() != "hover":
-            self._set_base_status("Hover target lock requires Hover cursor region mode")
+    def _toggle_hover_target_mode(self) -> None:
+        if self._hover_target_mode_active:
+            if self.worker is not None:
+                self.worker.reset_hover_target()
+            self._set_base_status("Hover target mode active")
             return
-        if self.worker is None:
-            self._set_base_status("Start processing before locking hover target")
+
+        self._enable_hover_target_mode()
+
+    def _enable_hover_target_mode(self) -> None:
+        if not self._select_hover_translation_region():
+            self._set_base_status("Hover cursor region mode is unavailable")
             return
-        if self.worker.hover_position_locked():
-            self.worker.unlock_hover_position()
-            self._set_base_status("Hover target unlocked")
-            return
-        if self.worker.lock_hover_position():
-            self._set_base_status("Hover target locked")
+
+        if self.worker is not None:
+            self.worker.set_translation_region_mode("hover")
+            self.worker.reset_hover_target()
+
+        if self.overlay_active:
+            if self.worker is None:
+                self._start_worker()
         else:
-            self._set_base_status("Cursor is outside the selected monitor")
+            self._enable_overlay_mode()
+
+        if self.worker is None or not self.overlay_active:
+            self._hover_target_mode_active = False
+            self._set_base_status("Start processing before hover target mode")
+            return
+
+        self._hover_target_mode_active = True
+        self.worker.set_translation_region_mode("hover")
+        self.worker.reset_hover_target()
+        self._set_base_status("Hover target mode active")
+
+    def _select_hover_translation_region(self) -> bool:
+        if self.translation_region_mode_combo.currentData() == "hover":
+            return True
+
+        hover_index = self.translation_region_mode_combo.findData("hover")
+        if hover_index < 0:
+            return False
+
+        self.translation_region_mode_combo.setCurrentIndex(hover_index)
+        return True
 
     def _enable_overlay_mode(self) -> None:
         monitor = self.monitor_combo.currentData()
@@ -484,6 +515,7 @@ class MainWindow(QMainWindow):
     def _disable_overlay_mode(self) -> None:
         owned_worker = self._overlay_started_worker
         self._overlay_started_worker = False
+        self._hover_target_mode_active = False
         self._hide_overlay()
 
         if owned_worker and self.worker is not None:
@@ -492,6 +524,7 @@ class MainWindow(QMainWindow):
     def _hide_overlay(self) -> None:
         self._stop_overlay_tracker()
         self.overlay_active = False
+        self._hover_target_mode_active = False
         self.overlay_window.clear_analysis()
         self.overlay_window.hide()
         self._refresh_status_label()
@@ -539,8 +572,10 @@ class MainWindow(QMainWindow):
             status = f"{status} | Overlay ON"
         if self.overlay_tracker is not None:
             status = f"{status} | Tracking ON"
-        if self.worker is not None and self.worker.hover_position_locked():
-            status = f"{status} | Hover locked"
+        if self._hover_target_mode_active:
+            status = f"{status} | Hover target ON"
+        if self.worker is not None and self.worker.hover_target_confirmed():
+            status = f"{status} | Hover confirmed"
         if self._recording_session is not None:
             status = f"{status} | Recording ON"
         self.status_label.setText(status)
@@ -609,7 +644,7 @@ class MainWindow(QMainWindow):
     def _hotkey_help_text(*, prefix: str) -> str:
         return (
             f"{prefix}: {overlay_hotkey_labels()} toggle live screen overlay; "
-            f"{hover_lock_hotkey_label()} lock hover target"
+            f"{hover_lock_hotkey_label()} start hover translate overlay"
         )
 
     def _update_ocr_boxes_label(self, value: int) -> None:

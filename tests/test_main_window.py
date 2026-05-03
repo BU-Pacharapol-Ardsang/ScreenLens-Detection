@@ -49,7 +49,8 @@ class DummyWorker(QObject):
         self.settings = settings
         self.started = False
         self.stopped = False
-        self._hover_locked = False
+        self.hover_reset_count = 0
+        self._hover_confirmed = False
         DummyWorker.instances.append(self)
 
     def start(self) -> None:
@@ -71,21 +72,81 @@ class DummyWorker(QObject):
         self.stopped = True
         self.finished.emit()
 
-    def hover_position_locked(self) -> bool:
-        return self._hover_locked
+    def set_translation_region_mode(self, mode: str) -> None:
+        self.settings.translation_region_mode = "hover" if mode == "hover" else "full"
 
-    def lock_hover_position(self) -> bool:
-        self._hover_locked = True
-        return True
+    def reset_hover_target(self) -> None:
+        self.hover_reset_count += 1
+        self._hover_confirmed = False
 
-    def unlock_hover_position(self) -> None:
-        self._hover_locked = False
+    def hover_target_confirmed(self) -> bool:
+        return self._hover_confirmed
+
+
+class DummyOverlay:
+    def __init__(self) -> None:
+        self.shown_for: MonitorSpec | None = None
+        self.hidden = False
+        self.closed = False
+        self.cleared = False
+        self.tracking_mode: str | None = None
+        self.tracking_enabled = False
+        self.realtime_tracking_active = False
+
+    def show_for_monitor(self, monitor: MonitorSpec) -> None:
+        self.shown_for = monitor
+        self.hidden = False
+
+    def hide(self) -> None:
+        self.hidden = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def clear_analysis(self) -> None:
+        self.cleared = True
+
+    def update_analysis(self, _analysis: object) -> None:
+        return None
+
+    def set_tracking_mode(self, mode: str | None) -> None:
+        self.tracking_mode = mode
+
+    def set_tracking_enabled(self, enabled: bool) -> None:
+        self.tracking_enabled = enabled
+
+    def set_realtime_tracking_active(self, active: bool) -> None:
+        self.realtime_tracking_active = active
+
+    def apply_tracking_frame(self, _tracking_frame: object) -> None:
+        return None
+
+
+class DummyOverlayTrackingWorker(QObject):
+    frame_ready = Signal(object)
+    worker_error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, monitor: MonitorSpec) -> None:
+        super().__init__()
+        self.monitor = monitor
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+        self.finished.emit()
 
 
 def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch) -> None:
     DummyWorker.instances.clear()
     monkeypatch.setattr(main_window_module, "ScreenCapturer", FakeScreenCapturer)
     monkeypatch.setattr(main_window_module, "ProcessingWorker", DummyWorker)
+    monkeypatch.setattr(main_window_module, "TranslationOverlay", DummyOverlay)
+    monkeypatch.setattr(main_window_module, "OverlayTrackingWorker", DummyOverlayTrackingWorker)
 
     app = _app()
     window = main_window_module.MainWindow()
@@ -146,11 +207,13 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert window.ocr_runtime_label.text() == "Synthetic OCR runtime"
 
         window._handle_hotkey(3)
-        assert worker.hover_position_locked() is True
-        assert "Hover locked" in window.status_label.text()
+        assert worker.settings.translation_region_mode == "hover"
+        assert window.overlay_active is True
+        assert "Hover target ON" in window.status_label.text()
 
         window._handle_hotkey(3)
-        assert worker.hover_position_locked() is False
+        assert worker.hover_reset_count >= 2
+        assert "Hover target ON" in window.status_label.text()
 
         window._stop_worker()
         app.processEvents()
@@ -165,6 +228,35 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert window.translation_stability_checkbox.isEnabled() is True
         assert window.stop_button.isEnabled() is False
         assert window.status_label.text() == "Stopped"
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_main_window_f7_starts_hover_overlay_and_arms_hover_target(monkeypatch) -> None:
+    DummyWorker.instances.clear()
+    monkeypatch.setattr(main_window_module, "ScreenCapturer", FakeScreenCapturer)
+    monkeypatch.setattr(main_window_module, "ProcessingWorker", DummyWorker)
+    monkeypatch.setattr(main_window_module, "TranslationOverlay", DummyOverlay)
+    monkeypatch.setattr(main_window_module, "OverlayTrackingWorker", DummyOverlayTrackingWorker)
+
+    app = _app()
+    window = main_window_module.MainWindow()
+
+    try:
+        assert window.translation_region_mode_combo.currentData() == "full"
+
+        window._handle_hotkey(3)
+        app.processEvents()
+
+        worker = DummyWorker.instances[-1]
+        assert worker.started is True
+        assert worker.settings.translation_region_mode == "hover"
+        assert window.translation_region_mode_combo.currentData() == "hover"
+        assert window.overlay_active is True
+        assert window._hover_target_mode_active is True
+        assert window.overlay_window.shown_for == worker.monitor
+        assert "Hover target ON" in window.status_label.text()
     finally:
         window.close()
         app.processEvents()

@@ -49,6 +49,8 @@ class PipelineSettings:
     translation_region_mode: str = "full"
     hover_region_radius: int = 260
     hover_box_margin: int = 96
+    hover_dwell_ms: int = 1000
+    hover_move_tolerance: int = 12
     translation_block_mode: str = "line"
     translation_similarity_stability_enabled: bool = True
     translation_similarity_threshold: float = 0.92
