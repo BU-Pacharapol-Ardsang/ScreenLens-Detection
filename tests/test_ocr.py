@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 from time import sleep
 
@@ -203,3 +204,54 @@ def test_queued_ocr_backend_processes_priority_subset_synchronously() -> None:
         assert backend.calls[0] == (2, "eng", [7, 7])
     finally:
         queued.close()
+
+
+def test_queued_ocr_backend_reports_configured_worker_count() -> None:
+    backend = RecordingOCRBackend()
+    queued = QueuedOCRBackend(backend, max_batch_size=8, synchronous_batch_size=0, worker_count=2)
+
+    try:
+        assert "async OCR queue, 2 workers" in queued.runtime_diagnostics()
+    finally:
+        queued.close()
+
+
+def test_tesseract_backend_recognizes_batch_in_parallel() -> None:
+    class ParallelTesseractBackend(TesseractOCRBackend):
+        def __init__(self) -> None:
+            self._binary = "tesseract.exe"
+            self._tessdata_dir = None
+            self._available_languages = {"eng"}
+            self._max_workers = 2
+            self._executor = None
+            self._executor_worker_count = 0
+            self._executor_lock = threading.Lock()
+            self.barrier = threading.Barrier(2)
+            self.thread_ids: set[int] = set()
+
+        def is_available(self) -> bool:
+            return True
+
+        def _build_candidates(self, image: np.ndarray) -> list[np.ndarray]:
+            return [image]
+
+        def _recognize_candidate(self, image: np.ndarray, *, language: str, config: str) -> OCRResult:
+            self.thread_ids.add(threading.get_ident())
+            self.barrier.wait(timeout=1.0)
+            return OCRResult(text=str(int(image[0, 0])), confidence=90.0)
+
+    backend = ParallelTesseractBackend()
+    try:
+        results = backend.recognize_batch(
+            [
+                np.full((8, 8), 1, dtype=np.uint8),
+                np.full((8, 8), 2, dtype=np.uint8),
+            ],
+            language="eng",
+            psms=[7, 7],
+        )
+
+        assert [result.text for result in results] == ["1", "2"]
+        assert len(backend.thread_ids) == 2
+    finally:
+        backend.close()

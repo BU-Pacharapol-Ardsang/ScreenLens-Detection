@@ -6,6 +6,7 @@ import re
 import shutil
 import threading
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,23 +97,29 @@ class QueuedOCRBackend(OCRBackend):
         max_batch_size: int = 32,
         synchronous_batch_size: int = 4,
         max_queue_size: int = 96,
+        worker_count: int = 1,
     ) -> None:
         self._underlying = underlying
         self._max_batch_size = max(max_batch_size, 1)
         self._synchronous_batch_size = max(synchronous_batch_size, 0)
         self._max_queue_size = max(max_queue_size, self._max_batch_size)
+        self._worker_count = max(worker_count, 1)
         self._cache: dict[_OCRCacheKey, OCRResult] = {}
         self._queue: deque[_QueuedOCRItem] = deque()
         self._queued_keys: set[_OCRCacheKey] = set()
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._closed = False
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name=f"{underlying.name}-ocr-worker",
-            daemon=True,
-        )
-        self._worker.start()
+        self._workers = [
+            threading.Thread(
+                target=self._worker_loop,
+                name=f"{underlying.name}-ocr-worker-{index + 1}",
+                daemon=True,
+            )
+            for index in range(self._worker_count)
+        ]
+        for worker in self._workers:
+            worker.start()
 
     def is_available(self) -> bool:
         return self._underlying.is_available()
@@ -121,12 +128,13 @@ class QueuedOCRBackend(OCRBackend):
         return f"{self._underlying.describe()} (queued)"
 
     def runtime_diagnostics(self) -> str:
+        worker_label = f", {self._worker_count} workers" if self._worker_count > 1 else ""
         if self._synchronous_batch_size > 0:
             return (
                 f"{self._underlying.runtime_diagnostics()} | "
-                f"hybrid OCR queue, sync first {self._synchronous_batch_size}"
+                f"hybrid OCR queue, sync first {self._synchronous_batch_size}{worker_label}"
             )
-        return f"{self._underlying.runtime_diagnostics()} | async OCR queue"
+        return f"{self._underlying.runtime_diagnostics()} | async OCR queue{worker_label}"
 
     def prepare_image(self, image: np.ndarray) -> np.ndarray:
         return self._underlying.prepare_image(image)
@@ -210,7 +218,7 @@ class QueuedOCRBackend(OCRBackend):
                 queued_any = True
 
             if queued_any:
-                self._condition.notify()
+                self._condition.notify_all()
 
         return results
 
@@ -233,7 +241,8 @@ class QueuedOCRBackend(OCRBackend):
             self._closed = True
             self._condition.notify_all()
 
-        self._worker.join(timeout=5.0)
+        for worker in self._workers:
+            worker.join(timeout=5.0)
         self._underlying.close()
 
     def _worker_loop(self) -> None:
@@ -323,6 +332,7 @@ class EasyOCRBackend(OCRBackend):
         self._gpu_available = _nvidia_cuda_available()
         self._gpu = self._resolve_gpu_enabled()
         self._readers: dict[tuple[str, ...], object] = {}
+        self._reader_lock = threading.Lock()
 
     def is_available(self) -> bool:
         return EasyOCRReader is not None
@@ -509,11 +519,12 @@ class EasyOCRBackend(OCRBackend):
 
     def _get_reader(self, language: str) -> object:
         lang_list = self._resolve_language_list(language)
-        reader = self._readers.get(lang_list)
-        if reader is None:
-            reader = EasyOCRReader(list(lang_list), gpu=self._gpu, verbose=False)
-            self._readers[lang_list] = reader
-        return reader
+        with self._reader_lock:
+            reader = self._readers.get(lang_list)
+            if reader is None:
+                reader = EasyOCRReader(list(lang_list), gpu=self._gpu, verbose=False)
+                self._readers[lang_list] = reader
+            return reader
 
     @staticmethod
     def _resolve_language_list(language: str) -> tuple[str, ...]:
@@ -556,6 +567,13 @@ class TesseractOCRBackend(OCRBackend):
         self._binary = self._resolve_binary()
         self._tessdata_dir = self._resolve_tessdata_dir(self._binary)
         self._available_languages = self._resolve_available_languages(self._tessdata_dir)
+        self._max_workers = _parse_positive_int(
+            os.getenv("SCREENLENS_TESSERACT_WORKERS"),
+            default=min(max(os.cpu_count() or 2, 1), 4),
+        )
+        self._executor: ThreadPoolExecutor | None = None
+        self._executor_worker_count = 0
+        self._executor_lock = threading.Lock()
         if self._binary and pytesseract is not None:
             pytesseract.pytesseract.tesseract_cmd = self._binary
         if self._tessdata_dir:
@@ -633,7 +651,7 @@ class TesseractOCRBackend(OCRBackend):
 
     def runtime_diagnostics(self) -> str:
         if self.is_available():
-            return f"Tesseract OCR | active CPU process | binary {self._binary}"
+            return f"Tesseract OCR | CPU process pool x{self._max_workers} | binary {self._binary}"
         return self.describe()
 
     def prepare_image(self, image: np.ndarray) -> np.ndarray:
@@ -659,8 +677,58 @@ class TesseractOCRBackend(OCRBackend):
             return OCRResult()
 
         language = self._resolve_requested_language(language)
+        return self._recognize_prepared(np.asarray(image), language=language, psm=psm)
+
+    def recognize_batch(self, images: list[object], *, language: str, psms: list[int]) -> list[OCRResult]:
+        if not images:
+            return []
+        if not self.is_available():
+            return [OCRResult() for _image in images]
+
+        resolved_language = self._resolve_requested_language(language)
+        prepared_images = [np.asarray(image) for image in images]
+        resolved_psms = [
+            psms[index] if index < len(psms) else self._resolve_psm_default()
+            for index in range(len(images))
+        ]
+        worker_count = min(self._max_workers, len(prepared_images))
+
+        if worker_count <= 1:
+            return [
+                self._recognize_prepared(image, language=resolved_language, psm=psm)
+                for image, psm in zip(prepared_images, resolved_psms, strict=False)
+            ]
+
+        executor = self._ensure_executor()
+        futures: list[Future[OCRResult]] = [
+            executor.submit(self._recognize_prepared, image, language=resolved_language, psm=psm)
+            for image, psm in zip(prepared_images, resolved_psms, strict=False)
+        ]
+        results: list[OCRResult] = []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception:
+                results.append(OCRResult())
+        return results
+
+    @staticmethod
+    def _resolve_psm_default() -> int:
+        return 7
+
+    def _ensure_executor(self) -> ThreadPoolExecutor:
+        with self._executor_lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="screenlens-tesseract",
+                )
+                self._executor_worker_count = self._max_workers
+            return self._executor
+
+    def _recognize_prepared(self, image: np.ndarray, *, language: str, psm: int) -> OCRResult:
         config = f"--oem 3 --psm {psm}"
-        candidates = self._build_candidates(np.asarray(image))
+        candidates = self._build_candidates(image)
         best = OCRResult()
         best_score = -1.0
 
@@ -672,6 +740,13 @@ class TesseractOCRBackend(OCRBackend):
                 best_score = score
 
         return best
+
+    def close(self) -> None:
+        with self._executor_lock:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._executor = None
+                self._executor_worker_count = 0
 
     def _resolve_requested_language(self, language: str) -> str:
         requested = [token.strip() for token in language.split("+") if token.strip()]
@@ -754,7 +829,7 @@ def create_default_ocr_backend(*, device_preference: str | None = None) -> OCRBa
     if preference == "tesseract":
         backend = TesseractOCRBackend()
         if backend.is_available():
-            return backend
+            return _maybe_queue_ocr_backend(backend)
         return NoOpOCRBackend()
 
     if preference == "easyocr":
@@ -769,9 +844,7 @@ def create_default_ocr_backend(*, device_preference: str | None = None) -> OCRBa
         else:
             backend = backend_cls()
         if backend.is_available():
-            if backend_cls is EasyOCRBackend:
-                return _maybe_queue_ocr_backend(backend)
-            return backend
+            return _maybe_queue_ocr_backend(backend)
     return NoOpOCRBackend()
 
 
@@ -780,7 +853,16 @@ def _maybe_queue_ocr_backend(backend: OCRBackend) -> OCRBackend:
     if async_setting in {"0", "false", "no", "off", "disabled"}:
         return backend
     sync_batch_size = _parse_non_negative_int(os.getenv("SCREENLENS_OCR_SYNC_BATCH_SIZE"), default=2)
-    return QueuedOCRBackend(backend, synchronous_batch_size=sync_batch_size)
+    max_batch_size = _parse_positive_int(os.getenv("SCREENLENS_OCR_QUEUE_BATCH_SIZE"), default=32)
+    max_queue_size = _parse_positive_int(os.getenv("SCREENLENS_OCR_QUEUE_SIZE"), default=96)
+    worker_count = _parse_positive_int(os.getenv("SCREENLENS_OCR_WORKERS"), default=1)
+    return QueuedOCRBackend(
+        backend,
+        max_batch_size=max_batch_size,
+        synchronous_batch_size=sync_batch_size,
+        max_queue_size=max_queue_size,
+        worker_count=worker_count,
+    )
 
 
 def _parse_non_negative_int(value: str | None, *, default: int) -> int:
@@ -788,6 +870,13 @@ def _parse_non_negative_int(value: str | None, *, default: int) -> int:
         return max(int(value), 0) if value is not None else default
     except ValueError:
         return default
+
+
+def _parse_positive_int(value: str | None, *, default: int) -> int:
+    try:
+        return max(int(value), 1) if value is not None else max(default, 1)
+    except ValueError:
+        return max(default, 1)
 
 
 def normalize_ocr_device_preference(value: str | None) -> str:

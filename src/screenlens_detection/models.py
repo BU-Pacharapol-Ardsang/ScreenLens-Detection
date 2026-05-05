@@ -26,6 +26,7 @@ class MonitorSpec:
 class PipelineSettings:
     capture_interval_ms: int = 40  # Run up to ~25 FPS
     upscale_factor: float = 1.0  # Full screen game/article is already large, 1.0 reduces lag massively
+    detection_scale: float = 0.66  # Run detection on a smaller image, then OCR high-res source crops.
     clahe_clip_limit: float = 2.0
     clahe_grid_size: int = 4
     gaussian_kernel_size: int = 3
@@ -39,9 +40,21 @@ class PipelineSettings:
     max_box_height_ratio: float = 0.22
     max_boxes: int = 60
     text_detector_mode: str = "opencv"
+    scanline_roi_enabled: bool = False
+    scanline_roi_band_count: int = 6
+    scanline_roi_overlap_ratio: float = 0.18
     source_language_code: str = "auto"
     target_language_code: str = "tha"
     translation_mode: str = "argos"
+    translation_region_mode: str = "full"
+    hover_region_radius: int = 260
+    hover_box_margin: int = 96
+    hover_dwell_ms: int = 1000
+    hover_move_tolerance: int = 12
+    translation_block_mode: str = "line"
+    translation_similarity_stability_enabled: bool = True
+    translation_similarity_threshold: float = 0.92
+    translation_similarity_min_chars: int = 16
     ocr_enabled: bool = True
     ocr_device_preference: str = "auto"
     ocr_language: str = "tha+eng+jpn"

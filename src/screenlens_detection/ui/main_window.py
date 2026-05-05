@@ -32,7 +32,13 @@ from ..overlay import TranslationOverlay, overlay_font_pixel_size, overlay_text_
 from ..overlay_tracker import OverlayTrackingWorker
 from ..recording import RecordingSession, recording_fps_from_settings
 from ..text_detectors import text_detector_options
-from ..windows_hotkeys import extract_hotkey_id, hotkey_labels, register_window_hotkeys, unregister_window_hotkeys
+from ..windows_hotkeys import (
+    extract_hotkey_id,
+    hover_lock_hotkey_label,
+    overlay_hotkey_labels,
+    register_window_hotkeys,
+    unregister_window_hotkeys,
+)
 from ..worker import ProcessingWorker
 
 
@@ -48,6 +54,7 @@ class MainWindow(QMainWindow):
         self.overlay_window = TranslationOverlay()
         self.overlay_active = False
         self._overlay_started_worker = False
+        self._hover_target_mode_active = False
         self._hotkeys_registered = False
         self._base_status = "Idle"
         defaults = PipelineSettings()
@@ -59,7 +66,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.record_button = QPushButton("Start Recording")
         self.record_button.setEnabled(False)
-        self.hotkey_label = QLabel(f"Global hotkeys: {hotkey_labels()} toggle live screen overlay")
+        self.hotkey_label = QLabel(self._hotkey_help_text(prefix="Global hotkeys"))
 
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(10, 10000)
@@ -70,6 +77,12 @@ class MainWindow(QMainWindow):
         self.scale_spin.setRange(1.0, 3.0)
         self.scale_spin.setSingleStep(0.25)
         self.scale_spin.setValue(defaults.upscale_factor)
+
+        self.detection_scale_spin = QDoubleSpinBox()
+        self.detection_scale_spin.setRange(0.40, 1.00)
+        self.detection_scale_spin.setDecimals(2)
+        self.detection_scale_spin.setSingleStep(0.05)
+        self.detection_scale_spin.setValue(defaults.detection_scale)
 
         self.area_spin = QSpinBox()
         self.area_spin.setRange(50, 10000)
@@ -92,7 +105,12 @@ class MainWindow(QMainWindow):
         self.source_language_combo = QComboBox()
         self.target_language_combo = QComboBox()
         self.text_detector_combo = QComboBox()
+        self.scanline_roi_combo = QComboBox()
         self.translation_mode_combo = QComboBox()
+        self.translation_region_mode_combo = QComboBox()
+        self.translation_block_mode_combo = QComboBox()
+        self.translation_stability_checkbox = QCheckBox("Text similarity stability")
+        self.translation_stability_checkbox.setChecked(defaults.translation_similarity_stability_enabled)
         self.ocr_checkbox = QCheckBox("Enable OCR")
         self.ocr_checkbox.setChecked(True)
         self.overlay_tracking_checkbox = QCheckBox("Track overlay while scrolling")
@@ -118,7 +136,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._populate_ocr_device_control()
         self._populate_text_detector_control()
+        self._populate_scanline_roi_control()
         self._populate_translation_mode_control()
+        self._populate_translation_region_mode_control()
+        self._populate_translation_block_mode_control()
         self._populate_overlay_tracking_mode_control()
         self._populate_language_controls()
         self._connect_signals()
@@ -144,12 +165,17 @@ class MainWindow(QMainWindow):
         settings_layout = QFormLayout(settings_box)
         settings_layout.addRow("Capture interval", self.interval_spin)
         settings_layout.addRow("Upscale factor", self.scale_spin)
+        settings_layout.addRow("Detector scale", self.detection_scale_spin)
         settings_layout.addRow("Min contour area", self.area_spin)
         settings_layout.addRow("Text detector", self.text_detector_combo)
-        settings_layout.addRow("OCR boxes/frame", self.ocr_boxes_control)
+        settings_layout.addRow("Scan mode", self.scanline_roi_combo)
+        settings_layout.addRow("New OCR/frame", self.ocr_boxes_control)
         settings_layout.addRow("Source language", self.source_language_combo)
         settings_layout.addRow("Target language", self.target_language_combo)
         settings_layout.addRow("Translation mode", self.translation_mode_combo)
+        settings_layout.addRow("Translation region", self.translation_region_mode_combo)
+        settings_layout.addRow("Translation grouping", self.translation_block_mode_combo)
+        settings_layout.addRow("", self.translation_stability_checkbox)
         settings_layout.addRow("OCR device", self.ocr_device_combo)
         settings_layout.addRow("", self.ocr_checkbox)
         settings_layout.addRow("", self.overlay_tracking_checkbox)
@@ -158,7 +184,7 @@ class MainWindow(QMainWindow):
         stats_box = QGroupBox("Runtime Stats")
         stats_layout = QFormLayout(stats_box)
         stats_layout.addRow("FPS", self.fps_label)
-        stats_layout.addRow("Detected boxes", self.detected_label)
+        stats_layout.addRow("Active boxes", self.detected_label)
         stats_layout.addRow("Monitor", self.monitor_label)
         stats_layout.addRow("Status", self.status_label)
         stats_layout.addRow("Recording", self.recording_label)
@@ -196,12 +222,17 @@ class MainWindow(QMainWindow):
         self.refresh_button.setEnabled(not locked)
         self.interval_spin.setEnabled(not locked)
         self.scale_spin.setEnabled(not locked)
+        self.detection_scale_spin.setEnabled(not locked)
         self.area_spin.setEnabled(not locked)
         self.ocr_boxes_slider.setEnabled(not locked)
         self.source_language_combo.setEnabled(not locked)
         self.target_language_combo.setEnabled(not locked)
         self.text_detector_combo.setEnabled(not locked)
+        self.scanline_roi_combo.setEnabled(not locked)
         self.translation_mode_combo.setEnabled(not locked)
+        self.translation_region_mode_combo.setEnabled(not locked)
+        self.translation_block_mode_combo.setEnabled(not locked)
+        self.translation_stability_checkbox.setEnabled(not locked)
         self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
         self.overlay_tracking_checkbox.setEnabled(not locked)
@@ -218,11 +249,26 @@ class MainWindow(QMainWindow):
             self.text_detector_combo.addItem(option.label, userData=option.code)
         self.text_detector_combo.setCurrentIndex(0)
 
+    def _populate_scanline_roi_control(self) -> None:
+        self.scanline_roi_combo.addItem("Full frame", userData=False)
+        self.scanline_roi_combo.addItem("Sliding bands (video/game)", userData=True)
+        self.scanline_roi_combo.setCurrentIndex(0)
+
     def _populate_translation_mode_control(self) -> None:
         self.translation_mode_combo.addItem("Argos Translate (Offline)", userData="argos")
         self.translation_mode_combo.addItem("Google Translate (Online)", userData="google")
         self.translation_mode_combo.addItem("Disabled", userData="disabled")
         self.translation_mode_combo.setCurrentIndex(0)
+
+    def _populate_translation_region_mode_control(self) -> None:
+        self.translation_region_mode_combo.addItem("Full screen", userData="full")
+        self.translation_region_mode_combo.addItem("Hover cursor region", userData="hover")
+        self.translation_region_mode_combo.setCurrentIndex(0)
+
+    def _populate_translation_block_mode_control(self) -> None:
+        self.translation_block_mode_combo.addItem("Line mode", userData="line")
+        self.translation_block_mode_combo.addItem("Block mode: Strict", userData="strict")
+        self.translation_block_mode_combo.setCurrentIndex(0)
 
     def _populate_overlay_tracking_mode_control(self) -> None:
         self.overlay_tracking_mode_combo.addItem("Legacy motion", userData="legacy")
@@ -270,12 +316,17 @@ class MainWindow(QMainWindow):
         settings = PipelineSettings(
             capture_interval_ms=self.interval_spin.value(),
             upscale_factor=self.scale_spin.value(),
+            detection_scale=self.detection_scale_spin.value(),
             min_contour_area=self.area_spin.value(),
             text_detector_mode=self.text_detector_combo.currentData(),
+            scanline_roi_enabled=bool(self.scanline_roi_combo.currentData()),
             max_ocr_boxes_per_frame=self.ocr_boxes_slider.value(),
             source_language_code=self.source_language_combo.currentData(),
             target_language_code=self.target_language_combo.currentData(),
             translation_mode=self.translation_mode_combo.currentData(),
+            translation_region_mode=self.translation_region_mode_combo.currentData(),
+            translation_block_mode=self.translation_block_mode_combo.currentData(),
+            translation_similarity_stability_enabled=self.translation_stability_checkbox.isChecked(),
             ocr_enabled=self.ocr_checkbox.isChecked(),
             ocr_device_preference=self.ocr_device_combo.currentData(),
             ocr_language=resolve_ocr_language(self.source_language_combo.currentData()),
@@ -317,6 +368,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.record_button.setEnabled(False)
         self._overlay_started_worker = False
+        self._hover_target_mode_active = False
         if self._base_status != "Error":
             self._set_base_status("Stopped")
         self.ocr_runtime_label.setText("Stopped")
@@ -384,12 +436,59 @@ class MainWindow(QMainWindow):
     def _handle_hotkey(self, hotkey_id: int) -> None:
         if hotkey_id in {1, 2}:
             self._toggle_overlay_mode()
+        elif hotkey_id == 3:
+            self._toggle_hover_target_mode()
 
     def _toggle_overlay_mode(self) -> None:
         if self.overlay_active:
             self._disable_overlay_mode()
             return
         self._enable_overlay_mode()
+
+    def _toggle_hover_target_mode(self) -> None:
+        if self._hover_target_mode_active:
+            if self.worker is not None:
+                self.worker.reset_hover_target()
+            self._set_base_status("Hover target mode active")
+            return
+
+        self._enable_hover_target_mode()
+
+    def _enable_hover_target_mode(self) -> None:
+        if not self._select_hover_translation_region():
+            self._set_base_status("Hover cursor region mode is unavailable")
+            return
+
+        if self.worker is not None:
+            self.worker.set_translation_region_mode("hover")
+            self.worker.reset_hover_target()
+
+        if self.overlay_active:
+            if self.worker is None:
+                self._start_worker()
+        else:
+            self._enable_overlay_mode()
+
+        if self.worker is None or not self.overlay_active:
+            self._hover_target_mode_active = False
+            self._set_base_status("Start processing before hover target mode")
+            return
+
+        self._hover_target_mode_active = True
+        self.worker.set_translation_region_mode("hover")
+        self.worker.reset_hover_target()
+        self._set_base_status("Hover target mode active")
+
+    def _select_hover_translation_region(self) -> bool:
+        if self.translation_region_mode_combo.currentData() == "hover":
+            return True
+
+        hover_index = self.translation_region_mode_combo.findData("hover")
+        if hover_index < 0:
+            return False
+
+        self.translation_region_mode_combo.setCurrentIndex(hover_index)
+        return True
 
     def _enable_overlay_mode(self) -> None:
         monitor = self.monitor_combo.currentData()
@@ -416,6 +515,7 @@ class MainWindow(QMainWindow):
     def _disable_overlay_mode(self) -> None:
         owned_worker = self._overlay_started_worker
         self._overlay_started_worker = False
+        self._hover_target_mode_active = False
         self._hide_overlay()
 
         if owned_worker and self.worker is not None:
@@ -424,6 +524,7 @@ class MainWindow(QMainWindow):
     def _hide_overlay(self) -> None:
         self._stop_overlay_tracker()
         self.overlay_active = False
+        self._hover_target_mode_active = False
         self.overlay_window.clear_analysis()
         self.overlay_window.hide()
         self._refresh_status_label()
@@ -471,6 +572,10 @@ class MainWindow(QMainWindow):
             status = f"{status} | Overlay ON"
         if self.overlay_tracker is not None:
             status = f"{status} | Tracking ON"
+        if self._hover_target_mode_active:
+            status = f"{status} | Hover target ON"
+        if self.worker is not None and self.worker.hover_target_confirmed():
+            status = f"{status} | Hover confirmed"
         if self._recording_session is not None:
             status = f"{status} | Recording ON"
         self.status_label.setText(status)
@@ -526,9 +631,7 @@ class MainWindow(QMainWindow):
                 f"Some global hotkeys unavailable: {', '.join(failures)}"
             )
         else:
-            self.hotkey_label.setText(
-                f"Global hotkeys active: {hotkey_labels()} toggle live screen overlay"
-            )
+            self.hotkey_label.setText(self._hotkey_help_text(prefix="Global hotkeys active"))
 
     def _unregister_hotkeys(self) -> None:
         if not self._hotkeys_registered or sys.platform != "win32":
@@ -536,6 +639,13 @@ class MainWindow(QMainWindow):
 
         unregister_window_hotkeys(int(self.winId()))
         self._hotkeys_registered = False
+
+    @staticmethod
+    def _hotkey_help_text(*, prefix: str) -> str:
+        return (
+            f"{prefix}: {overlay_hotkey_labels()} toggle live screen overlay; "
+            f"{hover_lock_hotkey_label()} start hover translate overlay"
+        )
 
     def _update_ocr_boxes_label(self, value: int) -> None:
         self.ocr_boxes_value_label.setText(str(value))
@@ -560,7 +670,19 @@ class MainWindow(QMainWindow):
                 text = overlay_text_for_box(box)
                 if not text:
                     continue
-                MainWindow._paint_translated_preview_box(painter, QRect(box.x, box.y, box.w, box.h), text)
+                anchor_rect = QRect(box.x, box.y, box.w, box.h)
+                bubble_rect = TranslationOverlay._expanded_bubble_rect(
+                    anchor_rect,
+                    text,
+                    bounds_width=width,
+                    bounds_height=height,
+                )
+                MainWindow._paint_translated_preview_box(
+                    painter,
+                    bubble_rect,
+                    text,
+                    anchor_height=anchor_rect.height(),
+                )
         finally:
             painter.end()
 
@@ -570,10 +692,17 @@ class MainWindow(QMainWindow):
         return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
 
     @staticmethod
-    def _paint_translated_preview_box(painter: QPainter, rect: QRect, text: str) -> None:
+    def _paint_translated_preview_box(
+        painter: QPainter,
+        rect: QRect,
+        text: str,
+        *,
+        anchor_height: int | None = None,
+    ) -> None:
         accent = QColor(48, 231, 149, 220)
         background = QColor(15, 23, 42, 212)
         text_color = QColor(248, 250, 252)
+        font_anchor_height = rect.height() if anchor_height is None else anchor_height
 
         bubble_rect = rect.adjusted(0, 0, -1, -1)
         radius = max(min(rect.height() // 4, 8), 2)
@@ -591,7 +720,7 @@ class MainWindow(QMainWindow):
         if text_rect.width() <= 0 or text_rect.height() <= 0:
             text_rect = bubble_rect
 
-        painter.setFont(TranslationOverlay._font_for_text(text, text_rect, overlay_font_pixel_size(rect.height())))
+        painter.setFont(TranslationOverlay._font_for_text(text, text_rect, overlay_font_pixel_size(font_anchor_height)))
         painter.setPen(text_color)
         painter.drawText(
             text_rect,
