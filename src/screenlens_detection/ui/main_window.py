@@ -34,6 +34,7 @@ from .theme import (
     output_text_style,
     pick_section_bg,
     pick_section_fg,
+    slider_style,
     spinbox_style,
 )
 from ..capture import ScreenCapturer
@@ -224,6 +225,14 @@ class MainWindow(QMainWindow):
                 border=theme.control_border,
                 radius_px=theme.radius_px,
             )
+            groove_bg = theme.slider_groove_bg or pipeline_bg or theme.panel_bg or theme.control_bg
+            handle_bg = theme.slider_handle_bg or theme.control_bg
+            slider = slider_style(
+                groove=groove_bg,
+                handle=handle_bg,
+                border=theme.control_border,
+                radius_px=theme.radius_px,
+            )
 
             self.monitor_combo.setStyleSheet(combo)
             self.source_language_combo.setStyleSheet(combo)
@@ -236,6 +245,7 @@ class MainWindow(QMainWindow):
             self.refresh_button.setStyleSheet(button)
             self.start_button.setStyleSheet(button)
             self.stop_button.setStyleSheet(button)
+            self.ocr_boxes_slider.setStyleSheet(slider)
         else:
             self.monitor_combo.setStyleSheet("")
             self.source_language_combo.setStyleSheet("")
@@ -246,6 +256,7 @@ class MainWindow(QMainWindow):
             self.refresh_button.setStyleSheet("")
             self.start_button.setStyleSheet("")
             self.stop_button.setStyleSheet("")
+            self.ocr_boxes_slider.setStyleSheet("")
 
         if (
             theme.preview_bg is not None

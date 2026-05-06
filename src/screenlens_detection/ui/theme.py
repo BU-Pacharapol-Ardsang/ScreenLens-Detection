@@ -30,12 +30,16 @@ class Theme:
 
     # Detected panel
     detected_panel_bg: Optional[str] = "#3d4c5e"
-    detected_panel_fg: Optional[str] = "#090b0e"
+    detected_panel_fg: Optional[str] = "#fcfdff"
 
     # Inputs / buttons
     control_bg: Optional[str] = "#546881"
     control_fg: Optional[str] = "#090b0e"
     control_border: Optional[str] = "#090b0e"
+
+    # Slider (optional overrides)
+    slider_groove_bg: Optional[str] = "#D9D9D9"
+    slider_handle_bg: Optional[str] = "#666a73"
 
     # Preview image labels
     preview_bg: Optional[str] = "#151a20"
@@ -101,4 +105,26 @@ def button_style(*, bg: str, fg: str, border: str, radius_px: int) -> str:
         "}"
         "QPushButton:hover { background-color: #5f7896; }"
         "QPushButton:pressed { background-color: #4a5c73; }"
+    )
+
+
+def slider_style(*, groove: str, handle: str, border: str, radius_px: int) -> str:
+    return (
+        "QSlider { background: transparent; }"
+        "QSlider::groove:horizontal { "
+        f"background: {groove}; border: 1px solid {border}; "
+        f"height: 6px; border-radius: {radius_px}px; "
+        "}"
+        "QSlider::sub-page:horizontal { "
+        f"background: {handle}; border: 1px solid {border}; "
+        f"height: 6px; border-radius: {radius_px}px; "
+        "}"
+        "QSlider::add-page:horizontal { "
+        f"background: {groove}; border: 1px solid {border}; "
+        f"height: 6px; border-radius: {radius_px}px; "
+        "}"
+        "QSlider::handle:horizontal { "
+        f"background: {handle}; border: 1px solid {border}; "
+        f"width: 10px; margin: -4px 0; border-radius: {radius_px}px; "
+        "}"
     )
