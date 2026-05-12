@@ -76,14 +76,21 @@ class RecordingSession:
 
     def write_frame(self, analysis: FrameAnalysis) -> None:
         self._ensure_open()
-        translated = analysis.translated_preview
-        if translated is None:
-            translated = analysis.source_frame
-        if translated is None:
-            translated = analysis.annotated_frame
+        fallback = _first_available_frame(
+            analysis.source_frame,
+            analysis.annotated_frame,
+            analysis.processed_preview,
+            analysis.translated_preview,
+        )
+        if fallback is None:
+            raise ValueError("Recording requires at least one rendered or source frame.")
 
-        self._streams["annotated"].write(np.asarray(analysis.annotated_frame))
-        self._streams["segmentation"].write(np.asarray(analysis.processed_preview))
+        annotated = analysis.annotated_frame if analysis.annotated_frame is not None else fallback
+        segmentation = analysis.processed_preview if analysis.processed_preview is not None else fallback
+        translated = analysis.translated_preview if analysis.translated_preview is not None else fallback
+
+        self._streams["annotated"].write(np.asarray(annotated))
+        self._streams["segmentation"].write(np.asarray(segmentation))
         self._streams["translated"].write(np.asarray(translated))
         self._frame_index += 1
         self._write_event("frame", self._frame_payload(analysis))
@@ -161,6 +168,13 @@ def _normalize_frame(frame: np.ndarray) -> np.ndarray:
     if not normalized.flags["C_CONTIGUOUS"]:
         normalized = np.ascontiguousarray(normalized)
     return normalized
+
+
+def _first_available_frame(*frames: object | None) -> object | None:
+    for frame in frames:
+        if frame is not None:
+            return frame
+    return None
 
 
 def _create_recording_directory(root: Path, started_at: datetime) -> Path:

@@ -74,6 +74,9 @@ class PipelineSettings:
     overlay_tracking_enabled: bool = False
     overlay_tracking_mode: str = "legacy"
     runtime_debug_enabled: bool = False
+    annotated_preview_enabled: bool = True
+    segmentation_preview_enabled: bool = True
+    translated_preview_enabled: bool = True
 
 
 @dataclass(slots=True, frozen=True)
@@ -123,8 +126,8 @@ class DetectionBox:
 
 @dataclass(slots=True)
 class FrameAnalysis:
-    annotated_frame: object
-    processed_preview: object
+    annotated_frame: object | None
+    processed_preview: object | None
     boxes: list[DetectionBox] = field(default_factory=list)
     status: str = ""
     ocr_runtime: str = ""
