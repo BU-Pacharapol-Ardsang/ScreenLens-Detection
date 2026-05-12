@@ -95,6 +95,14 @@ RapidOCR can be selected as a native full-frame OCR backend. It performs detecti
 pip install -e ".[ocr_rapid]"
 ```
 
+For NVIDIA ONNX Runtime acceleration, install the GPU extra instead and select `GPU (NVIDIA CUDA)` or `Auto` in the `OCR device` dropdown:
+
+```powershell
+pip install -e ".[ocr_rapid_gpu]"
+```
+
+Do not install `onnxruntime` and `onnxruntime-gpu` into the same environment at the same time. The Windows setup script handles this automatically when `-TorchRuntime gpu` is used.
+
 ### Optional deep text detectors
 
 The UI includes a `Text detector` dropdown:
@@ -107,6 +115,12 @@ Install the optional detector packages with:
 
 ```powershell
 pip install -e ".[detectors]"
+```
+
+For RapidOCR DBNet detection with ONNX Runtime CUDA, use:
+
+```powershell
+pip install -e ".[detector_rapid_gpu]"
 ```
 
 If a selected deep detector is not installed, the app keeps running and reports the detector as unavailable in the status line.
@@ -247,7 +261,7 @@ Notes:
 - If `vendor/argos/*.argosmodel` exists, the build bundles the offline translation models and installs them automatically at runtime.
 - If no bundled or installed Tesseract is found, the app still opens in detection-only mode.
 - Optional deep detector packages are not required for the classic OpenCV detector.
-- `scripts/setup_windows.ps1` installs EasyOCR, RapidOCR/ONNXRuntime, and then pins `torch`/`torchvision` from the official PyTorch CPU or CUDA wheel index so the runtime matches your chosen device.
+- `scripts/setup_windows.ps1` installs EasyOCR, RapidOCR/ONNX Runtime, and then pins `torch`/`torchvision` from the official PyTorch CPU or CUDA wheel index so the runtime matches your chosen device. With `-TorchRuntime gpu`, it installs `onnxruntime-gpu` and verifies `CUDAExecutionProvider`.
 - `screenlens.py` and `screenlens.pyw` are still useful for local development, but the built `.exe` is the correct path for blank Windows VMs.
 - `build_screenlens_exe.bat` is the simplest build entrypoint. It creates `.venv` automatically when missing, installs build tools, and then produces `dist\ScreenLens\ScreenLens.exe`.
 

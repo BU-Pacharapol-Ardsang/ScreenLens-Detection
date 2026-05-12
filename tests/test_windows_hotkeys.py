@@ -5,7 +5,6 @@ from screenlens_detection.windows_hotkeys import (
     WM_HOTKEY,
     _coerce_message_address,
     extract_hotkey_id,
-    hover_lock_hotkey_label,
     overlay_hotkey_labels,
 )
 
@@ -33,6 +32,5 @@ def test_extract_hotkey_id_from_void_pointer() -> None:
     assert extract_hotkey_id(pointer) == 1
 
 
-def test_hotkey_labels_separate_overlay_and_hover_lock() -> None:
-    assert overlay_hotkey_labels() == "F6, Shift+F2"
-    assert hover_lock_hotkey_label() == "F7"
+def test_hotkey_label_uses_f6_overlay_toggle() -> None:
+    assert overlay_hotkey_labels() == "F6"

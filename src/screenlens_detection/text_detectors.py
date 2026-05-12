@@ -10,6 +10,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .onnxruntime_utils import onnxruntime_cuda_available, short_runtime_error
 from .runtime import application_roots
 
 
@@ -163,6 +164,8 @@ class RapidOCRTextDetector(TextDetectorBackend):
         except ImportError as exc:
             raise RuntimeError("install optional dependencies rapidocr and onnxruntime") from exc
 
+        self._use_cuda = _should_use_rapidocr_cuda(device_preference)
+        self._cuda_fallback_reason = ""
         params = {
             "Global.use_det": True,
             "Global.use_cls": False,
@@ -180,19 +183,28 @@ class RapidOCRTextDetector(TextDetectorBackend):
             "Det.score_mode": "fast",
             "EngineConfig.onnxruntime.intra_op_num_threads": 2,
             "EngineConfig.onnxruntime.inter_op_num_threads": 1,
-            "EngineConfig.onnxruntime.use_cuda": _should_use_rapidocr_cuda(device_preference),
+            "EngineConfig.onnxruntime.use_cuda": self._use_cuda,
         }
 
         package_dir = _rapidocr_package_data_dir(rapidocr)
-        cfg = ParseParams.load(package_dir / "config.yaml")
-        cfg = ParseParams.update_batch(cfg, params)
-        if cfg.Global.model_root_dir is None:
-            cfg.Global.model_root_dir = package_dir / "models"
-
         _quiet_rapidocr_logging()
-        cfg.Det.engine_cfg = cfg.EngineConfig[cfg.Det.engine_type.value]
-        cfg.Det.model_root_dir = cfg.Global.model_root_dir
-        self._detector = TextDetector(cfg.Det)
+        try:
+            cfg = self._load_detector_config(ParseParams, package_dir, params)
+            self._detector = TextDetector(cfg.Det)
+        except Exception as cuda_exc:
+            if not self._use_cuda:
+                raise
+            self._cuda_fallback_reason = short_runtime_error(str(cuda_exc))
+            self._use_cuda = False
+            params["EngineConfig.onnxruntime.use_cuda"] = False
+            try:
+                cfg = self._load_detector_config(ParseParams, package_dir, params)
+                self._detector = TextDetector(cfg.Det)
+            except Exception as cpu_exc:
+                raise RuntimeError(
+                    "failed to initialize RapidOCR detector with ONNX Runtime CUDA "
+                    f"({self._cuda_fallback_reason}); CPU fallback failed ({cpu_exc})"
+                ) from cpu_exc
         self._max_side_len = cfg.Global.max_side_len
         self._min_side_len = cfg.Global.min_side_len
         self._width_height_ratio = cfg.Global.width_height_ratio
@@ -200,6 +212,20 @@ class RapidOCRTextDetector(TextDetectorBackend):
         self._resize_image_within_bounds = resize_image_within_bounds
         self._apply_vertical_padding = apply_vertical_padding
         self._map_boxes_to_original = map_boxes_to_original
+
+    @staticmethod
+    def _load_detector_config(parse_params: object, package_dir: Path, params: dict[str, object]) -> object:
+        cfg = parse_params.load(package_dir / "config.yaml")
+        cfg = parse_params.update_batch(cfg, params)
+        if cfg.Global.model_root_dir is None:
+            cfg.Global.model_root_dir = package_dir / "models"
+        cfg.Det.engine_cfg = cfg.EngineConfig[cfg.Det.engine_type.value]
+        cfg.Det.model_root_dir = cfg.Global.model_root_dir
+        return cfg
+
+    def describe(self) -> str:
+        device = "CUDA" if self._use_cuda else "CPU fallback" if self._cuda_fallback_reason else "CPU"
+        return f"{self.name} ({device})"
 
     def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         original_height, original_width = frame.shape[:2]
@@ -318,19 +344,7 @@ def _rapidocr_package_data_dir(rapidocr_module: object) -> Path:
 
 
 def _should_use_rapidocr_cuda(device_preference: str) -> bool:
-    normalized = device_preference.casefold()
-    if normalized not in {"gpu", "cuda"}:
-        return False
-
-    try:
-        import onnxruntime
-    except ImportError:
-        return False
-
-    try:
-        return "CUDAExecutionProvider" in onnxruntime.get_available_providers()
-    except Exception:
-        return False
+    return onnxruntime_cuda_available(device_preference)
 
 
 def _enum_value(enum_class: object, name: str, fallback: str) -> object:

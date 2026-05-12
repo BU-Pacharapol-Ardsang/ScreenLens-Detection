@@ -15,6 +15,11 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from .onnxruntime_utils import (
+    onnxruntime_cuda_available,
+    onnxruntime_provider_summary,
+    short_runtime_error,
+)
 from .runtime import application_roots
 
 try:
@@ -636,15 +641,37 @@ class RapidOCRFullBackend(OCRBackend):
         self._device_preference = normalize_ocr_device_preference(device_preference)
         self._use_cuda = _rapidocr_onnx_cuda_available(self._device_preference)
         self._language = language
-        self._engine = self._create_engine(
-            RapidOCR=RapidOCR,
-            EngineType=EngineType,
-            LangDet=LangDet,
-            LangRec=LangRec,
-            ModelType=ModelType,
-            OCRVersion=OCRVersion,
-            language=language,
-        )
+        self._cuda_fallback_reason = ""
+        try:
+            self._engine = self._create_engine(
+                RapidOCR=RapidOCR,
+                EngineType=EngineType,
+                LangDet=LangDet,
+                LangRec=LangRec,
+                ModelType=ModelType,
+                OCRVersion=OCRVersion,
+                language=language,
+            )
+        except Exception as cuda_exc:
+            if not self._use_cuda:
+                raise
+            self._cuda_fallback_reason = short_runtime_error(str(cuda_exc))
+            self._use_cuda = False
+            try:
+                self._engine = self._create_engine(
+                    RapidOCR=RapidOCR,
+                    EngineType=EngineType,
+                    LangDet=LangDet,
+                    LangRec=LangRec,
+                    ModelType=ModelType,
+                    OCRVersion=OCRVersion,
+                    language=language,
+                )
+            except Exception as cpu_exc:
+                raise RuntimeError(
+                    "failed to initialize RapidOCR with ONNX Runtime CUDA "
+                    f"({self._cuda_fallback_reason}); CPU fallback failed ({cpu_exc})"
+                ) from cpu_exc
 
     def is_available(self) -> bool:
         return True
@@ -653,12 +680,20 @@ class RapidOCRFullBackend(OCRBackend):
         return True
 
     def describe(self) -> str:
-        device = "CUDA" if self._use_cuda else "CPU"
+        device = "CUDA" if self._use_cuda else "CPU fallback" if self._cuda_fallback_reason else "CPU"
         return f"RapidOCR full OCR ({device})"
 
     def runtime_diagnostics(self) -> str:
         device = "ONNX Runtime CUDA" if self._use_cuda else "ONNX Runtime CPU"
-        return f"RapidOCR full OCR | {device} | detection+recognition"
+        parts = [
+            "RapidOCR full OCR",
+            device,
+            f"providers: {onnxruntime_provider_summary()}",
+            "detection+recognition",
+        ]
+        if self._cuda_fallback_reason:
+            parts.append(f"CUDA fallback: {self._cuda_fallback_reason}")
+        return " | ".join(parts)
 
     def recognize_frame(self, frame: np.ndarray, *, language: str) -> list[OCRFrameResult]:
         if language != self._language:
@@ -1101,18 +1136,7 @@ def _rapidocr_rec_language(lang_rec_enum: object, language: str) -> object | Non
 
 
 def _rapidocr_onnx_cuda_available(device_preference: str) -> bool:
-    if device_preference not in {"gpu", "cuda"}:
-        return False
-
-    try:
-        import onnxruntime
-    except ImportError:
-        return False
-
-    try:
-        return "CUDAExecutionProvider" in onnxruntime.get_available_providers()
-    except Exception:
-        return False
+    return onnxruntime_cuda_available(device_preference)
 
 
 def _rapidocr_frame_results(result: object) -> list[OCRFrameResult]:

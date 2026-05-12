@@ -81,6 +81,36 @@ def test_recording_session_writes_three_streams_and_jsonl_log(tmp_path, monkeypa
     assert events[1]["boxes"][0]["translated_text"] == "สวัสดี"
 
 
+def test_recording_session_falls_back_to_source_when_previews_disabled(tmp_path, monkeypatch) -> None:
+    FakeVideoWriter.instances.clear()
+    monkeypatch.setattr("screenlens_detection.recording.cv2.VideoWriter", FakeVideoWriter)
+    monkeypatch.setattr("screenlens_detection.recording.cv2.VideoWriter_fourcc", lambda *_args: 1)
+
+    session = RecordingSession(
+        root=tmp_path,
+        started_at=datetime(2026, 4, 29, 4, 5, 6),
+        fps=5.0,
+    )
+    frame = np.zeros((12, 20, 3), dtype=np.uint8)
+    frame[:, :, 2] = 255
+
+    session.write_frame(
+        FrameAnalysis(
+            annotated_frame=None,
+            processed_preview=None,
+            source_frame=frame,
+            translated_preview=None,
+            status="running",
+            fps=5.0,
+            monitor_label="Monitor 1",
+        )
+    )
+    session.close()
+
+    assert [writer.size for writer in FakeVideoWriter.instances] == [(20, 12), (20, 12), (20, 12)]
+    assert all(np.array_equal(writer.frames[0], frame) for writer in FakeVideoWriter.instances)
+
+
 def test_recording_fps_from_capture_interval_is_clamped() -> None:
     assert recording_fps_from_settings(PipelineSettings(capture_interval_ms=250)) == 4.0
     assert recording_fps_from_settings(PipelineSettings(capture_interval_ms=5000)) == 1.0
