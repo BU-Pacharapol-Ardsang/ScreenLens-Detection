@@ -186,6 +186,41 @@ def test_rapidocr_full_backend_reads_modern_output(monkeypatch) -> None:
     assert FakeRapidOCR.calls == [((60, 120, 3), True, False, True)]
 
 
+def test_rapidocr_full_backend_falls_back_to_cpu_when_cuda_init_fails(monkeypatch) -> None:
+    class FakeEnum:
+        ONNXRUNTIME = "onnxruntime"
+        EN = "en"
+        MULTI = "multi"
+        MOBILE = "mobile"
+        PPOCRV4 = "PP-OCRv4"
+
+    class FakeRapidOCR:
+        init_params: list[dict[str, object]] = []
+
+        def __init__(self, *, params: dict[str, object]) -> None:
+            self.init_params.append(params.copy())
+            if params["EngineConfig.onnxruntime.use_cuda"]:
+                raise RuntimeError("CUDA session failed")
+
+    fake_module = types.SimpleNamespace(
+        EngineType=FakeEnum,
+        LangDet=FakeEnum,
+        LangRec=FakeEnum,
+        ModelType=FakeEnum,
+        OCRVersion=FakeEnum,
+        RapidOCR=FakeRapidOCR,
+    )
+    monkeypatch.setitem(sys.modules, "rapidocr", fake_module)
+    monkeypatch.setattr("screenlens_detection.ocr._rapidocr_onnx_cuda_available", lambda _device: True)
+    monkeypatch.setattr("screenlens_detection.ocr.onnxruntime_provider_summary", lambda: "CUDAExecutionProvider")
+
+    backend = RapidOCRFullBackend(language="eng", device_preference="gpu")
+
+    assert [params["EngineConfig.onnxruntime.use_cuda"] for params in FakeRapidOCR.init_params] == [True, False]
+    assert backend.describe() == "RapidOCR full OCR (CPU fallback)"
+    assert "CUDA fallback: CUDA session failed" in backend.runtime_diagnostics()
+
+
 class RecordingOCRBackend(OCRBackend):
     name = "recording"
 

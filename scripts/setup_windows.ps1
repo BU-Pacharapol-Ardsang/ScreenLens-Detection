@@ -139,15 +139,27 @@ function Install-EasyOCR {
 
 function Install-RapidOCR {
     param(
-        [string]$PythonPath
+        [string]$PythonPath,
+        [string]$Runtime
     )
 
-    Write-Host "Installing RapidOCR dependencies" -ForegroundColor Cyan
+    if ($Runtime -eq "gpu") {
+        $onnxPackage = "onnxruntime-gpu>=1.20.0"
+        $conflictingPackage = "onnxruntime"
+        $runtimeLabel = "ONNX Runtime GPU"
+    } else {
+        $onnxPackage = "onnxruntime>=1.20.0"
+        $conflictingPackage = "onnxruntime-gpu"
+        $runtimeLabel = "ONNX Runtime CPU"
+    }
+
+    Write-Host "Installing RapidOCR dependencies: $runtimeLabel" -ForegroundColor Cyan
+    Invoke-PipInstall -PythonPath $PythonPath -Arguments @("uninstall", "-y", $conflictingPackage)
     Invoke-PipInstall -PythonPath $PythonPath -Arguments @(
         "install",
         "--upgrade",
         "rapidocr>=3.0.0",
-        "onnxruntime>=1.20.0"
+        $onnxPackage
     )
 }
 
@@ -232,6 +244,41 @@ print(json.dumps({
     return $json | ConvertFrom-Json
 }
 
+function Get-OnnxRuntimeDiagnostics {
+    param(
+        [string]$PythonPath
+    )
+
+    $probeScript = @'
+import json
+
+try:
+    import onnxruntime as ort
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}))
+    raise SystemExit(0)
+
+try:
+    providers = list(ort.get_available_providers())
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}))
+    raise SystemExit(0)
+
+print(json.dumps({
+    "onnxruntime_version": getattr(ort, "__version__", ""),
+    "providers": providers,
+    "cuda_available": "CUDAExecutionProvider" in providers,
+}))
+'@
+
+    $json = $probeScript | & $PythonPath -
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    return $json | ConvertFrom-Json
+}
+
 $pythonPath = Resolve-ProjectPython -RequestedPythonPath $PythonExe
 $resolvedTorchRuntime = Resolve-TorchRuntime -RequestedRuntime $TorchRuntime
 
@@ -241,14 +288,19 @@ Write-Host "Resolved torch runtime: $resolvedTorchRuntime" -ForegroundColor Cyan
 
 Install-BaseDependencies -PythonPath $pythonPath -WithBuildTools:$IncludeBuildTools
 Install-EasyOCR -PythonPath $pythonPath
-Install-RapidOCR -PythonPath $pythonPath
+Install-RapidOCR -PythonPath $pythonPath -Runtime $resolvedTorchRuntime
 Install-TorchRuntime -PythonPath $pythonPath -Runtime $resolvedTorchRuntime
 Sync-ArgosModels -PythonPath $pythonPath
 
 $diagnostics = Get-TorchDiagnostics -PythonPath $pythonPath
+$onnxDiagnostics = Get-OnnxRuntimeDiagnostics -PythonPath $pythonPath
 
 if ($diagnostics.error) {
     throw "Failed to import torch after setup: $($diagnostics.error)"
+}
+
+if ($onnxDiagnostics.error) {
+    throw "Failed to import ONNX Runtime after setup: $($onnxDiagnostics.error)"
 }
 
 Write-Host ""
@@ -265,6 +317,16 @@ if ($diagnostics.device_name) {
     Write-Host "  Device: $($diagnostics.device_name)"
 }
 
-if ($TorchRuntime -eq "gpu" -and -not $diagnostics.cuda_available) {
+Write-Host ""
+Write-Host "ONNX Runtime diagnostics:" -ForegroundColor Green
+Write-Host "  Version: $($onnxDiagnostics.onnxruntime_version)"
+Write-Host "  Providers: $($onnxDiagnostics.providers -join ', ')"
+Write-Host "  CUDA provider available: $($onnxDiagnostics.cuda_available)"
+
+if ($resolvedTorchRuntime -eq "gpu" -and -not $diagnostics.cuda_available) {
     throw "GPU runtime was requested, but torch.cuda.is_available() is False after installation."
+}
+
+if ($resolvedTorchRuntime -eq "gpu" -and -not $onnxDiagnostics.cuda_available) {
+    throw "GPU runtime was requested, but ONNX Runtime CUDAExecutionProvider is not available after installation."
 }
