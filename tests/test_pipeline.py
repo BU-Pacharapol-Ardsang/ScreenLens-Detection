@@ -442,6 +442,26 @@ class FullFrameRecordingOCRBackend(OCRBackend):
         raise AssertionError("full-frame OCR should bypass crop recognize_batch")
 
 
+class SequencedFullFrameOCRBackend(OCRBackend):
+    def __init__(self, frames: list[list[OCRFrameResult]]) -> None:
+        self.frames = frames
+        self.frame_calls: list[tuple[tuple[int, ...], str]] = []
+
+    def is_available(self) -> bool:
+        return True
+
+    def describe(self) -> str:
+        return "Sequenced full frame OCR"
+
+    def supports_full_frame(self) -> bool:
+        return True
+
+    def recognize_frame(self, frame: np.ndarray, *, language: str) -> list[OCRFrameResult]:
+        self.frame_calls.append((frame.shape, language))
+        index = min(len(self.frame_calls) - 1, len(self.frames) - 1)
+        return self.frames[index]
+
+
 def test_pipeline_uses_full_frame_ocr_backend_directly() -> None:
     backend = FullFrameRecordingOCRBackend()
     pipeline = TextDetectionPipeline(
@@ -464,6 +484,51 @@ def test_pipeline_uses_full_frame_ocr_backend_directly() -> None:
     assert [(box.x, box.y, box.w, box.h) for box in analysis.boxes] == [(20, 30, 120, 28)]
     assert "Native full-frame OCR detector" in analysis.status
     assert "Full frame test OCR | full-frame OCR | read 1" in analysis.status
+
+
+def test_pipeline_merges_split_full_frame_ocr_line() -> None:
+    backend = SequencedFullFrameOCRBackend(
+        [
+            [
+                OCRFrameResult(rect=(40, 52, 78, 22), text="Atreus:", confidence=95.0),
+                OCRFrameResult(rect=(122, 52, 110, 22), text="Careful!", confidence=96.0),
+            ]
+        ]
+    )
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(ocr_enabled=True, ocr_language="eng"),
+        backend,
+        NoOpTranslationBackend(),
+    )
+    frame = np.full((180, 320, 3), 255, dtype=np.uint8)
+
+    analysis = pipeline.process(frame, monitor_label="full-frame-merge")
+
+    assert [box.text for box in analysis.boxes] == ["Atreus: Careful!"]
+
+
+def test_pipeline_debounces_noisy_full_frame_subtitle_text() -> None:
+    backend = SequencedFullFrameOCRBackend(
+        [
+            [OCRFrameResult(rect=(100, 150, 80, 20), text="He110", confidence=94.0)],
+            [OCRFrameResult(rect=(98, 150, 84, 20), text="Hello", confidence=96.0)],
+            [OCRFrameResult(rect=(98, 150, 84, 20), text="Hello", confidence=96.0)],
+        ]
+    )
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(ocr_enabled=True, ocr_language="eng"),
+        backend,
+        NoOpTranslationBackend(),
+    )
+    frame = np.full((200, 300, 3), 255, dtype=np.uint8)
+
+    first = pipeline.process(frame, monitor_label="subtitle-debounce")
+    second = pipeline.process(frame, monitor_label="subtitle-debounce")
+    third = pipeline.process(frame, monitor_label="subtitle-debounce")
+
+    assert first.boxes == []
+    assert second.boxes == []
+    assert [box.text for box in third.boxes] == ["Hello"]
 
 
 class CountingBatchOCRBackend(BatchRecordingOCRBackend):
@@ -1199,6 +1264,86 @@ def test_pipeline_reuses_recent_translation_for_stable_ocr_noise() -> None:
         )
     ]
     noisy_result = pipeline._apply_translations(noisy_frame)
+
+    assert noisy_result[0].translated_text == first_result[0].translated_text
+    assert backend.calls == 1
+
+
+def test_pipeline_reuses_recent_translation_for_short_spacing_noise() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_result = pipeline._apply_translations(
+        [
+            DetectionBox(
+                x=100,
+                y=200,
+                w=180,
+                h=38,
+                text="New Labor",
+                source_language_code="eng",
+                source_language_label="English",
+            )
+        ]
+    )
+
+    noisy_result = pipeline._apply_translations(
+        [
+            DetectionBox(
+                x=101,
+                y=201,
+                w=178,
+                h=38,
+                text="NewLabor",
+                source_language_code="eng",
+                source_language_label="English",
+            )
+        ]
+    )
+
+    assert noisy_result[0].translated_text == first_result[0].translated_text
+    assert backend.calls == 1
+
+
+def test_pipeline_reuses_recent_translation_for_short_ocr_confusables() -> None:
+    backend = OneShotTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    first_result = pipeline._apply_translations(
+        [
+            DetectionBox(
+                x=100,
+                y=200,
+                w=120,
+                h=34,
+                text="Hello",
+                source_language_code="eng",
+                source_language_label="English",
+            )
+        ]
+    )
+
+    noisy_result = pipeline._apply_translations(
+        [
+            DetectionBox(
+                x=102,
+                y=201,
+                w=118,
+                h=34,
+                text="He110",
+                source_language_code="eng",
+                source_language_label="English",
+            )
+        ]
+    )
 
     assert noisy_result[0].translated_text == first_result[0].translated_text
     assert backend.calls == 1

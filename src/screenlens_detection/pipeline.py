@@ -32,6 +32,15 @@ class _TrackedTextBox:
     missing_frames: int = 0
 
 
+@dataclass(slots=True)
+class _FullFrameTextTrack:
+    rect: tuple[int, int, int, int]
+    text: str
+    confidence: float | None = None
+    stable_frames: int = 1
+    missing_frames: int = 0
+
+
 @dataclass(slots=True, frozen=True)
 class _OCRCroppedBox:
     rect: tuple[int, int, int, int]
@@ -85,6 +94,7 @@ class TextDetectionPipeline:
         self._last_ocr_candidate_count = 0
         self._last_ocr_submitted_count = 0
         self._ocr_box_tracks: list[_TrackedTextBox] = []
+        self._full_frame_ocr_tracks: list[_FullFrameTextTrack] = []
         self._scanline_source_boxes: list[tuple[int, int, int, int]] = []
         self._scanline_frame_index = 0
         self._scanline_last_band_index: int | None = None
@@ -1063,7 +1073,7 @@ class TextDetectionPipeline:
         self._last_ocr_submitted_count = len(filtered_results)
 
         preview_boxes: list[tuple[int, int, int, int]] = []
-        detected_boxes: list[DetectionBox] = []
+        usable_results: list[OCRFrameResult] = []
         for result in filtered_results:
             preview_boxes.append(result.rect)
             text = self._normalize_recognized_text(result.text)
@@ -1073,13 +1083,28 @@ class TextDetectionPipeline:
                 confidence = None
             if not text:
                 continue
+            usable_results.append(
+                OCRFrameResult(
+                    rect=result.rect,
+                    text=text,
+                    confidence=confidence,
+                )
+            )
+
+        stable_results = self._stabilize_full_frame_ocr_results(
+            self._merge_full_frame_line_results(usable_results),
+            detection_frame.shape,
+        )
+
+        detected_boxes: list[DetectionBox] = []
+        for result in stable_results:
             detected_boxes.append(
                 self._detection_box_from_frame_ocr_result(
                     result,
                     original_shape=original_shape,
                     scale=scale,
-                    text=text,
-                    confidence=confidence,
+                    text=result.text,
+                    confidence=result.confidence,
                 )
             )
 
@@ -1148,6 +1173,306 @@ class TextDetectionPipeline:
             key=lambda result: self._ocr_candidate_priority(result.rect),
             reverse=True,
         )[: self.settings.max_boxes]
+
+    def _merge_full_frame_line_results(self, results: list[OCRFrameResult]) -> list[OCRFrameResult]:
+        if len(results) <= 1:
+            return list(results)
+
+        merged = sorted(results, key=lambda result: (result.rect[1], result.rect[0]))
+        changed = True
+        while changed:
+            changed = False
+            next_pass: list[OCRFrameResult] = []
+
+            while merged:
+                current = merged.pop(0)
+                scan_index = 0
+                while scan_index < len(merged):
+                    candidate = merged[scan_index]
+                    if self._should_merge_full_frame_line_results(current, candidate):
+                        current = self._merge_full_frame_result_pair(current, candidate)
+                        merged.pop(scan_index)
+                        changed = True
+                        continue
+                    scan_index += 1
+                next_pass.append(current)
+
+            merged = sorted(next_pass, key=lambda result: (result.rect[1], result.rect[0]))
+
+        return merged
+
+    def _should_merge_full_frame_line_results(
+        self,
+        first: OCRFrameResult,
+        second: OCRFrameResult,
+    ) -> bool:
+        if not first.text or not second.text:
+            return False
+
+        x1, y1, w1, h1 = first.rect
+        x2, y2, w2, h2 = second.rect
+        min_height = max(min(h1, h2), 1)
+        height_ratio = max(h1, h2) / min_height
+        if height_ratio > 2.1:
+            return False
+
+        vertical_overlap = max(min(y1 + h1, y2 + h2) - max(y1, y2), 0)
+        if vertical_overlap / min_height < 0.52:
+            return False
+
+        intersection = self._intersection_area(first.rect, second.rect)
+        smaller_area = max(min(w1 * h1, w2 * h2), 1)
+        if intersection / smaller_area >= 0.72:
+            return self._full_frame_text_compatible(first.text, second.text)
+
+        horizontal_gap = max(max(x1, x2) - min(x1 + w1, x2 + w2), 0)
+        gap_limit = max(int(round(max(h1, h2) * 1.7)), 18)
+        return horizontal_gap <= gap_limit
+
+    def _merge_full_frame_result_pair(
+        self,
+        first: OCRFrameResult,
+        second: OCRFrameResult,
+    ) -> OCRFrameResult:
+        intersection = self._intersection_area(first.rect, second.rect)
+        smaller_area = max(min(first.rect[2] * first.rect[3], second.rect[2] * second.rect[3]), 1)
+        if intersection / smaller_area >= 0.72 and self._full_frame_text_compatible(first.text, second.text):
+            return self._better_full_frame_result(first, second)
+
+        left_result, right_result = sorted((first, second), key=lambda result: result.rect[0])
+        left, top, width, height = self._merge_box_pair(first.rect, second.rect)
+        confidences = [result.confidence for result in (first, second) if result.confidence is not None]
+        confidence = float(np.mean(confidences)) if confidences else None
+        text = " ".join(part for part in (left_result.text.strip(), right_result.text.strip()) if part)
+        return OCRFrameResult(rect=(left, top, width, height), text=text, confidence=confidence)
+
+    def _better_full_frame_result(
+        self,
+        first: OCRFrameResult,
+        second: OCRFrameResult,
+    ) -> OCRFrameResult:
+        first_score = self._full_frame_text_quality_score(first.text, first.confidence)
+        second_score = self._full_frame_text_quality_score(second.text, second.confidence)
+        if second_score > first_score:
+            return second
+        return first
+
+    def _stabilize_full_frame_ocr_results(
+        self,
+        results: list[OCRFrameResult],
+        frame_shape: tuple[int, ...],
+    ) -> list[OCRFrameResult]:
+        if not results:
+            self._full_frame_ocr_tracks = [
+                _FullFrameTextTrack(
+                    rect=track.rect,
+                    text=track.text,
+                    confidence=track.confidence,
+                    stable_frames=track.stable_frames,
+                    missing_frames=track.missing_frames + 1,
+                )
+                for track in self._full_frame_ocr_tracks
+                if track.missing_frames < 2
+            ]
+            return []
+
+        matched_track_indices: set[int] = set()
+        next_tracks: list[_FullFrameTextTrack] = []
+        stable_results: list[OCRFrameResult] = []
+
+        for result in results:
+            match_index = self._find_matching_full_frame_track(result, matched_track_indices)
+            if match_index is None:
+                track = _FullFrameTextTrack(
+                    rect=result.rect,
+                    text=result.text,
+                    confidence=result.confidence,
+                )
+            else:
+                matched_track_indices.add(match_index)
+                previous = self._full_frame_ocr_tracks[match_index]
+                if self._full_frame_text_compatible(result.text, previous.text):
+                    chosen_text, chosen_confidence = self._prefer_full_frame_track_text(result, previous)
+                    track = _FullFrameTextTrack(
+                        rect=self._smoothed_full_frame_rect(previous.rect, result.rect),
+                        text=chosen_text,
+                        confidence=chosen_confidence,
+                        stable_frames=previous.stable_frames + 1,
+                    )
+                else:
+                    track = _FullFrameTextTrack(
+                        rect=result.rect,
+                        text=result.text,
+                        confidence=result.confidence,
+                    )
+
+            next_tracks.append(track)
+            required_frames = self._required_full_frame_stable_frames(track.rect, frame_shape)
+            if track.stable_frames >= required_frames:
+                stable_results.append(
+                    OCRFrameResult(
+                        rect=track.rect,
+                        text=track.text,
+                        confidence=track.confidence,
+                    )
+                )
+
+        for index, track in enumerate(self._full_frame_ocr_tracks):
+            if index in matched_track_indices:
+                continue
+            if track.missing_frames >= 2:
+                continue
+            next_tracks.append(
+                _FullFrameTextTrack(
+                    rect=track.rect,
+                    text=track.text,
+                    confidence=track.confidence,
+                    stable_frames=track.stable_frames,
+                    missing_frames=track.missing_frames + 1,
+                )
+            )
+
+        next_tracks.sort(
+            key=lambda track: (
+                track.missing_frames,
+                -track.stable_frames,
+                -self._ocr_candidate_priority(track.rect),
+            )
+        )
+        self._full_frame_ocr_tracks = next_tracks[: max(self.settings.max_boxes * 2, 64)]
+
+        stable_results.sort(key=lambda result: (result.rect[1], result.rect[0]))
+        return stable_results
+
+    def _find_matching_full_frame_track(
+        self,
+        result: OCRFrameResult,
+        used_indices: set[int],
+    ) -> int | None:
+        best_index: int | None = None
+        best_score = 0.0
+        for index, track in enumerate(self._full_frame_ocr_tracks):
+            if index in used_indices:
+                continue
+            score = self._full_frame_track_score(result, track)
+            if score > best_score:
+                best_index = index
+                best_score = score
+
+        if best_index is None or best_score < 0.40:
+            return None
+        return best_index
+
+    def _full_frame_track_score(self, result: OCRFrameResult, track: _FullFrameTextTrack) -> float:
+        current_rect = result.rect
+        track_rect = track.rect
+        intersection = self._intersection_area(current_rect, track_rect)
+        current_area = max(current_rect[2] * current_rect[3], 1)
+        track_area = max(track_rect[2] * track_rect[3], 1)
+        mutual_overlap = max(intersection / current_area, intersection / track_area)
+        iou = self._intersection_over_union(current_rect, track_rect)
+        proximity = self._rect_center_proximity(current_rect, track_rect)
+        size_similarity = self._rect_size_similarity(current_rect, track_rect)
+        score = (mutual_overlap * 0.46) + (iou * 0.18) + (proximity * 0.26) + (size_similarity * 0.10)
+        if self._full_frame_text_compatible(result.text, track.text):
+            score += 0.10
+        return min(score, 1.0)
+
+    def _required_full_frame_stable_frames(
+        self,
+        rect: tuple[int, int, int, int],
+        frame_shape: tuple[int, ...],
+    ) -> int:
+        required = max(self.settings.stable_ocr_frames, 1)
+        if self._is_subtitle_like_full_frame_rect(rect, frame_shape):
+            required = max(required, 3)
+        return required
+
+    @staticmethod
+    def _is_subtitle_like_full_frame_rect(
+        rect: tuple[int, int, int, int],
+        frame_shape: tuple[int, ...],
+    ) -> bool:
+        frame_height, frame_width = frame_shape[:2]
+        if frame_height <= 0 or frame_width <= 0:
+            return False
+
+        x, y, w, h = rect
+        center_x = x + (w / 2.0)
+        center_y = y + (h / 2.0)
+        if center_y < frame_height * 0.72:
+            return False
+        if h > max(int(frame_height * 0.09), 80):
+            return False
+        return frame_width * 0.20 <= center_x <= frame_width * 0.80
+
+    def _full_frame_text_compatible(self, first: str, second: str) -> bool:
+        first_normalized = self._normalize_text_for_matching(first)
+        second_normalized = self._normalize_text_for_matching(second)
+        if not first_normalized or not second_normalized:
+            return False
+        if first_normalized == second_normalized:
+            return True
+        if self._compact_match_text(first_normalized) == self._compact_match_text(second_normalized):
+            return True
+        if self._ocr_confusable_match_key(first_normalized) == self._ocr_confusable_match_key(second_normalized):
+            return True
+
+        first_length = len(first_normalized)
+        second_length = len(second_normalized)
+        shorter_length = min(first_length, second_length)
+        longer_length = max(first_length, second_length)
+        if shorter_length >= 8 and shorter_length / max(longer_length, 1) >= 0.35:
+            if first_normalized in second_normalized or second_normalized in first_normalized:
+                return True
+
+        if shorter_length >= 10 and self._translation_numbers(first_normalized) == self._translation_numbers(second_normalized):
+            return SequenceMatcher(None, first_normalized, second_normalized).ratio() >= 0.82
+
+        return False
+
+    def _prefer_full_frame_track_text(
+        self,
+        result: OCRFrameResult,
+        previous: _FullFrameTextTrack,
+    ) -> tuple[str, float | None]:
+        current_score = self._full_frame_text_quality_score(result.text, result.confidence)
+        previous_score = self._full_frame_text_quality_score(previous.text, previous.confidence)
+        if current_score >= previous_score + 0.25:
+            return result.text, result.confidence
+        return previous.text, previous.confidence
+
+    def _smoothed_full_frame_rect(
+        self,
+        previous: tuple[int, int, int, int],
+        current: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        if self._rect_size_similarity(previous, current) < 0.72:
+            return current
+        if self._rect_center_proximity(previous, current) < 0.92:
+            return current
+        return (
+            int(round((previous[0] * 0.45) + (current[0] * 0.55))),
+            int(round((previous[1] * 0.45) + (current[1] * 0.55))),
+            max(int(round((previous[2] * 0.45) + (current[2] * 0.55))), 1),
+            max(int(round((previous[3] * 0.45) + (current[3] * 0.55))), 1),
+        )
+
+    @classmethod
+    def _full_frame_text_quality_score(cls, text: str, confidence: float | None) -> float:
+        normalized = cls._normalize_text_for_matching(text)
+        compact = cls._compact_match_text(normalized)
+        alpha_count = sum(character.isalpha() for character in compact)
+        digit_count = sum(character.isdigit() for character in compact)
+        score = len(compact) + (len(normalized.split()) * 2.5)
+        if confidence is not None:
+            score += min(max(confidence, 0.0) / 25.0, 4.0)
+        if ":" in text:
+            score += 1.2
+        score += min(text.count(" "), 5) * 0.6
+        if digit_count and digit_count >= alpha_count:
+            score -= min(digit_count * 1.4, 8.0)
+        return score
 
     def _detection_box_from_frame_ocr_result(
         self,
@@ -2252,6 +2577,8 @@ class TextDetectionPipeline:
             return False
         if self._translation_numbers(current_text) != self._translation_numbers(recent_text):
             return False
+        if self._translation_texts_look_equivalent(current_text, recent_text):
+            return geometry_score >= 0.52
 
         min_chars = max(self.settings.translation_similarity_min_chars, 1)
         if min(len(current_text), len(recent_text)) < min_chars:
@@ -2271,6 +2598,21 @@ class TextDetectionPipeline:
             return False
 
         return similarity >= threshold
+
+    @classmethod
+    def _translation_texts_look_equivalent(cls, current_text: str, recent_text: str) -> bool:
+        current_compact = cls._compact_match_text(current_text)
+        recent_compact = cls._compact_match_text(recent_text)
+        if current_compact and current_compact == recent_compact and len(current_compact) >= 4:
+            return True
+
+        current_key = cls._ocr_confusable_match_key(current_text)
+        recent_key = cls._ocr_confusable_match_key(recent_text)
+        alpha_count = sum(character.isalpha() for character in current_key + recent_key)
+        if current_key and current_key == recent_key and alpha_count >= 4:
+            return True
+
+        return False
 
     def _prioritize_translation_indices(
         self,
@@ -2451,7 +2793,8 @@ class TextDetectionPipeline:
         normalized = " ".join(text.split())
         normalized = self._strip_minor_script_noise(normalized)
         normalized = re.sub(r"\s+([,.;:!?])", r"\1", normalized)
-        normalized = normalized.strip(" |:;.,_-`~[]{}<>")
+        normalized = normalized.strip(" |;.,_-`~[]{}<>")
+        normalized = re.sub(r"^:+", "", normalized).strip()
         return normalized
 
     @staticmethod
@@ -2460,6 +2803,26 @@ class TextDetectionPipeline:
         # Keep alphanumerics, Thai, and common Japanese (Hiragana/Katakana/Kanji)
         normalized = re.sub(r"[^0-9a-z\u0E00-\u0E7F\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+", " ", normalized)
         return " ".join(normalized.split())
+
+    @staticmethod
+    def _compact_match_text(text: str) -> str:
+        return re.sub(r"\s+", "", text.casefold())
+
+    @classmethod
+    def _ocr_confusable_match_key(cls, text: str) -> str:
+        compact = cls._compact_match_text(text)
+        return compact.translate(
+            str.maketrans(
+                {
+                    "0": "o",
+                    "1": "l",
+                    "3": "e",
+                    "5": "s",
+                    "8": "b",
+                    "|": "l",
+                }
+            )
+        )
 
     @staticmethod
     def _translation_numbers(normalized_text: str) -> tuple[str, ...]:
