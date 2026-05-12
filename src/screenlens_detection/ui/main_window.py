@@ -28,9 +28,11 @@ import numpy as np
 from ..capture import ScreenCapturer
 from ..languages import resolve_ocr_language, source_language_options, target_language_options
 from ..models import FrameAnalysis, MonitorSpec, PipelineSettings
+from ..ocr import ocr_backend_options
 from ..overlay import TranslationOverlay, overlay_font_pixel_size, overlay_text_for_box
 from ..overlay_tracker import OverlayTrackingWorker
 from ..recording import RecordingSession, recording_fps_from_settings
+from ..subtitle_cleaner import clean_patch_for_box, normalize_subtitle_render_mode
 from ..text_detectors import text_detector_options
 from ..windows_hotkeys import (
     extract_hotkey_id,
@@ -109,6 +111,8 @@ class MainWindow(QMainWindow):
         self.translation_mode_combo = QComboBox()
         self.translation_region_mode_combo = QComboBox()
         self.translation_block_mode_combo = QComboBox()
+        self.subtitle_render_mode_combo = QComboBox()
+        self.ocr_backend_combo = QComboBox()
         self.translation_stability_checkbox = QCheckBox("Text similarity stability")
         self.translation_stability_checkbox.setChecked(defaults.translation_similarity_stability_enabled)
         self.ocr_checkbox = QCheckBox("Enable OCR")
@@ -134,12 +138,14 @@ class MainWindow(QMainWindow):
         self._recording_session: RecordingSession | None = None
 
         self._build_ui()
+        self._populate_ocr_backend_control()
         self._populate_ocr_device_control()
         self._populate_text_detector_control()
         self._populate_scanline_roi_control()
         self._populate_translation_mode_control()
         self._populate_translation_region_mode_control()
         self._populate_translation_block_mode_control()
+        self._populate_subtitle_render_mode_control()
         self._populate_overlay_tracking_mode_control()
         self._populate_language_controls()
         self._connect_signals()
@@ -175,7 +181,9 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Translation mode", self.translation_mode_combo)
         settings_layout.addRow("Translation region", self.translation_region_mode_combo)
         settings_layout.addRow("Translation grouping", self.translation_block_mode_combo)
+        settings_layout.addRow("Subtitle style", self.subtitle_render_mode_combo)
         settings_layout.addRow("", self.translation_stability_checkbox)
+        settings_layout.addRow("OCR backend", self.ocr_backend_combo)
         settings_layout.addRow("OCR device", self.ocr_device_combo)
         settings_layout.addRow("", self.ocr_checkbox)
         settings_layout.addRow("", self.overlay_tracking_checkbox)
@@ -232,11 +240,18 @@ class MainWindow(QMainWindow):
         self.translation_mode_combo.setEnabled(not locked)
         self.translation_region_mode_combo.setEnabled(not locked)
         self.translation_block_mode_combo.setEnabled(not locked)
+        self.subtitle_render_mode_combo.setEnabled(not locked)
+        self.ocr_backend_combo.setEnabled(not locked)
         self.translation_stability_checkbox.setEnabled(not locked)
         self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
         self.overlay_tracking_checkbox.setEnabled(not locked)
         self.overlay_tracking_mode_combo.setEnabled(not locked)
+
+    def _populate_ocr_backend_control(self) -> None:
+        for option in ocr_backend_options():
+            self.ocr_backend_combo.addItem(option.label, userData=option.code)
+        self.ocr_backend_combo.setCurrentIndex(0)
 
     def _populate_ocr_device_control(self) -> None:
         self.ocr_device_combo.addItem("Auto", userData="auto")
@@ -269,6 +284,11 @@ class MainWindow(QMainWindow):
         self.translation_block_mode_combo.addItem("Line mode", userData="line")
         self.translation_block_mode_combo.addItem("Block mode: Strict", userData="strict")
         self.translation_block_mode_combo.setCurrentIndex(0)
+
+    def _populate_subtitle_render_mode_control(self) -> None:
+        self.subtitle_render_mode_combo.addItem("Bubble overlay", userData="bubble")
+        self.subtitle_render_mode_combo.addItem("Clean patch (experimental)", userData="clean_patch")
+        self.subtitle_render_mode_combo.setCurrentIndex(0)
 
     def _populate_overlay_tracking_mode_control(self) -> None:
         self.overlay_tracking_mode_combo.addItem("Legacy motion", userData="legacy")
@@ -327,13 +347,16 @@ class MainWindow(QMainWindow):
             translation_region_mode=self.translation_region_mode_combo.currentData(),
             translation_block_mode=self.translation_block_mode_combo.currentData(),
             translation_similarity_stability_enabled=self.translation_stability_checkbox.isChecked(),
+            subtitle_render_mode=self.subtitle_render_mode_combo.currentData(),
             ocr_enabled=self.ocr_checkbox.isChecked(),
+            ocr_backend_mode=self.ocr_backend_combo.currentData(),
             ocr_device_preference=self.ocr_device_combo.currentData(),
             ocr_language=resolve_ocr_language(self.source_language_combo.currentData()),
             overlay_tracking_enabled=self.overlay_tracking_checkbox.isChecked(),
             overlay_tracking_mode=self.overlay_tracking_mode_combo.currentData(),
         )
 
+        self._apply_overlay_render_options(settings)
         self.overlay_window.set_tracking_mode(settings.overlay_tracking_mode)
         self.overlay_window.set_tracking_enabled(settings.overlay_tracking_enabled)
         self.worker = ProcessingWorker(monitor=monitor, settings=settings)
@@ -349,6 +372,15 @@ class MainWindow(QMainWindow):
         self.worker.start()
         if self.overlay_active and settings.overlay_tracking_enabled:
             self._start_overlay_tracker(monitor)
+
+    def _apply_overlay_render_options(self, settings: PipelineSettings) -> None:
+        self.overlay_window.set_render_mode(settings.subtitle_render_mode)
+        self.overlay_window.set_clean_patch_options(
+            padding_px=settings.clean_patch_padding_px,
+            mask_dilate_px=settings.clean_patch_mask_dilate_px,
+            inpaint_radius=settings.clean_patch_inpaint_radius,
+            max_crop_area=settings.clean_patch_max_crop_area,
+        )
 
     def _stop_worker(self) -> None:
         self._overlay_started_worker = False
@@ -380,7 +412,15 @@ class MainWindow(QMainWindow):
         self._stop_worker()
 
     def _handle_frame(self, analysis: FrameAnalysis) -> None:
-        translated_preview = self._translated_preview_frame(analysis)
+        render_settings = self.worker.settings if self.worker is not None else PipelineSettings()
+        translated_preview = self._translated_preview_frame(
+            analysis,
+            render_mode=render_settings.subtitle_render_mode,
+            clean_patch_padding_px=render_settings.clean_patch_padding_px,
+            clean_patch_mask_dilate_px=render_settings.clean_patch_mask_dilate_px,
+            clean_patch_inpaint_radius=render_settings.clean_patch_inpaint_radius,
+            clean_patch_max_crop_area=render_settings.clean_patch_max_crop_area,
+        )
         analysis.translated_preview = translated_preview
         self.preview_label.setPixmap(self._frame_to_pixmap(analysis.annotated_frame, self.preview_label))
         self.mask_label.setPixmap(self._frame_to_pixmap(analysis.processed_preview, self.mask_label))
@@ -496,6 +536,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "ScreenLens-Detection", "No monitor selected.")
             return
 
+        render_settings = (
+            self.worker.settings
+            if self.worker is not None
+            else PipelineSettings(subtitle_render_mode=self.subtitle_render_mode_combo.currentData())
+        )
+        self._apply_overlay_render_options(render_settings)
         self.overlay_window.show_for_monitor(monitor)
         self.overlay_window.set_tracking_mode(self.overlay_tracking_mode_combo.currentData())
         self.overlay_window.set_tracking_enabled(self.overlay_tracking_checkbox.isChecked())
@@ -651,13 +697,47 @@ class MainWindow(QMainWindow):
         self.ocr_boxes_value_label.setText(str(value))
 
     @staticmethod
-    def _translated_preview_frame(analysis: FrameAnalysis) -> np.ndarray:
+    def _translated_preview_frame(
+        analysis: FrameAnalysis,
+        *,
+        render_mode: str = "bubble",
+        clean_patch_padding_px: int = 8,
+        clean_patch_mask_dilate_px: int = 4,
+        clean_patch_inpaint_radius: int = 3,
+        clean_patch_max_crop_area: int = 120_000,
+    ) -> np.ndarray:
         frame = analysis.source_frame
         if frame is None:
             frame = analysis.annotated_frame
         preview = np.asarray(frame).copy()
         if preview.ndim != 3 or preview.shape[2] != 3:
             return np.asarray(analysis.annotated_frame).copy()
+
+        normalized_render_mode = normalize_subtitle_render_mode(render_mode)
+        clean_text_rects: dict[tuple[int, int, int, int], QRect] = {}
+        if normalized_render_mode == "clean_patch":
+            for box in analysis.boxes:
+                if not " ".join(box.translated_text.split()):
+                    continue
+                rect = (box.x, box.y, box.w, box.h)
+                patch = clean_patch_for_box(
+                    preview,
+                    rect,
+                    padding_px=clean_patch_padding_px,
+                    mask_dilate_px=clean_patch_mask_dilate_px,
+                    inpaint_radius=clean_patch_inpaint_radius,
+                    max_crop_area=clean_patch_max_crop_area,
+                )
+                if patch is not None:
+                    left, top, patch_width, patch_height = patch.rect
+                    preview[top : top + patch_height, left : left + patch_width] = patch.image
+                    clean_text_rects[rect] = QRect(left, top, patch_width, patch_height)
+                else:
+                    clean_text_rects[rect] = TranslationOverlay._fallback_clean_text_rect(
+                        QRect(box.x, box.y, box.w, box.h),
+                        bounds_width=preview.shape[1],
+                        bounds_height=preview.shape[0],
+                    )
 
         rgb = cv2.cvtColor(np.ascontiguousarray(preview), cv2.COLOR_BGR2RGB)
         height, width, channels = rgb.shape
@@ -677,12 +757,22 @@ class MainWindow(QMainWindow):
                     bounds_width=width,
                     bounds_height=height,
                 )
-                MainWindow._paint_translated_preview_box(
-                    painter,
-                    bubble_rect,
-                    text,
-                    anchor_height=anchor_rect.height(),
-                )
+                if normalized_render_mode == "clean_patch":
+                    if not " ".join(box.translated_text.split()):
+                        continue
+                    MainWindow._paint_clean_preview_text(
+                        painter,
+                        clean_text_rects.get((box.x, box.y, box.w, box.h), anchor_rect),
+                        text,
+                        anchor_height=anchor_rect.height(),
+                    )
+                else:
+                    MainWindow._paint_translated_preview_box(
+                        painter,
+                        bubble_rect,
+                        text,
+                        anchor_height=anchor_rect.height(),
+                    )
         finally:
             painter.end()
 
@@ -727,6 +817,32 @@ class MainWindow(QMainWindow):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap,
             text,
         )
+
+    @staticmethod
+    def _paint_clean_preview_text(
+        painter: QPainter,
+        rect: QRect,
+        text: str,
+        *,
+        anchor_height: int | None = None,
+    ) -> None:
+        font_anchor_height = rect.height() if anchor_height is None else anchor_height
+        horizontal_padding = max(min(rect.height() // 5, 10), 2)
+        vertical_padding = max(min(rect.height() // 10, 5), 1)
+        text_rect = rect.adjusted(horizontal_padding, vertical_padding, -horizontal_padding, -vertical_padding)
+        if text_rect.width() <= 0 or text_rect.height() <= 0:
+            text_rect = rect
+
+        painter.setFont(TranslationOverlay._font_for_text(text, text_rect, overlay_font_pixel_size(font_anchor_height)))
+        flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap
+        shadow = QColor(15, 23, 42, 230)
+        text_color = QColor(248, 250, 252, 245)
+        for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1), (2, 2)):
+            painter.setPen(shadow)
+            painter.drawText(text_rect.translated(offset_x, offset_y), flags, text)
+
+        painter.setPen(text_color)
+        painter.drawText(text_rect, flags, text)
 
     @staticmethod
     def _create_image_label(placeholder: str) -> QLabel:

@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from screenlens_detection.models import DetectionBox, PipelineSettings
-from screenlens_detection.ocr import NoOpOCRBackend, OCRBackend, OCRResult
+from screenlens_detection.ocr import NoOpOCRBackend, OCRBackend, OCRFrameResult, OCRResult
 from screenlens_detection.pipeline import TextDetectionPipeline
 from screenlens_detection.translation import NoOpTranslationBackend, TranslationBackend
 
@@ -306,6 +306,53 @@ class BatchRecordingOCRBackend(RecordingOCRBackend):
             OCRResult(text=f"demo {index}", confidence=95.0)
             for index, _image in enumerate(images, start=1)
         ]
+
+
+class FullFrameRecordingOCRBackend(OCRBackend):
+    def __init__(self) -> None:
+        self.frame_calls: list[tuple[tuple[int, ...], str]] = []
+        self.batch_calls = 0
+
+    def is_available(self) -> bool:
+        return True
+
+    def describe(self) -> str:
+        return "Full frame test OCR"
+
+    def supports_full_frame(self) -> bool:
+        return True
+
+    def recognize_frame(self, frame: np.ndarray, *, language: str) -> list[OCRFrameResult]:
+        self.frame_calls.append((frame.shape, language))
+        return [OCRFrameResult(rect=(20, 30, 120, 28), text="Hello World", confidence=95.0)]
+
+    def recognize_batch(self, images: list[object], *, language: str, psms: list[int]) -> list[OCRResult]:
+        self.batch_calls += 1
+        raise AssertionError("full-frame OCR should bypass crop recognize_batch")
+
+
+def test_pipeline_uses_full_frame_ocr_backend_directly() -> None:
+    backend = FullFrameRecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            min_contour_area=80,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+    frame = np.full((160, 260, 3), 255, dtype=np.uint8)
+
+    analysis = pipeline.process(frame, monitor_label="full-frame")
+
+    assert backend.frame_calls == [((160, 260, 3), "eng")]
+    assert backend.batch_calls == 0
+    assert [box.text for box in analysis.boxes] == ["Hello World"]
+    assert [(box.x, box.y, box.w, box.h) for box in analysis.boxes] == [(20, 30, 120, 28)]
+    assert "Native full-frame OCR detector" in analysis.status
+    assert "Full frame test OCR | full-frame OCR | read 1" in analysis.status
 
 
 class CountingBatchOCRBackend(BatchRecordingOCRBackend):

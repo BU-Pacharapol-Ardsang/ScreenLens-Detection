@@ -16,7 +16,7 @@ from .languages import (
 )
 from .models import DetectionBox, FrameAnalysis, PipelineSettings
 from .motion import estimate_grayscale_offset
-from .ocr import OCRBackend, OCRResult
+from .ocr import OCRBackend, OCRFrameResult, OCRResult
 from .text_detectors import (
     TextDetectorBackend,
     create_deep_text_detector_backend,
@@ -118,7 +118,15 @@ class TextDetectionPipeline:
         detection_frame, detection_scale = self._scale_frame(frame)
         self._active_detection_scale = detection_scale
         detection_gray = self._enhance_grayscale(detection_frame)
-        if self._translation_region_mode() == "hover":
+        if self._full_frame_ocr_enabled():
+            self._reset_scanline_state()
+            self._last_hover_region_status = ""
+            boxes, detection_boxes, line_mask = self._annotate_with_full_frame_ocr(
+                detection_frame,
+                frame.shape,
+                detection_scale,
+            )
+        elif self._translation_region_mode() == "hover":
             self._reset_scanline_state()
             detection_boxes, line_mask, working_boxes = self._hover_detection_pass(
                 detection_frame,
@@ -142,15 +150,16 @@ class TextDetectionPipeline:
             detection_boxes = self._detect_text_boxes(detection_frame, line_mask, mask, detection_gray)
             working_boxes = self._map_boxes_to_source_frame(detection_boxes, frame.shape, detection_scale)
         ocr_gray = self._source_ocr_grayscale(frame, detection_gray, detection_scale)
-        stable_working_boxes = self._stabilize_ocr_boxes(working_boxes)
-        motion_filtered_boxes = self._filter_motion_ocr_boxes(stable_working_boxes, ocr_gray)
+        if not self._full_frame_ocr_enabled():
+            stable_working_boxes = self._stabilize_ocr_boxes(working_boxes)
+            motion_filtered_boxes = self._filter_motion_ocr_boxes(stable_working_boxes, ocr_gray)
+            boxes = self._annotate_with_ocr(motion_filtered_boxes, ocr_gray, frame.shape, 1.0)
         motion_offset_x, motion_offset_y, motion_confidence = self._estimate_frame_offset(
             ocr_gray,
             1.0,
         )
         self._current_motion_offset = (motion_offset_x, motion_offset_y, motion_confidence)
         self._current_scaled_motion_offset = self._current_motion_offset
-        boxes = self._annotate_with_ocr(motion_filtered_boxes, ocr_gray, frame.shape, 1.0)
         boxes = self._apply_translations(boxes)
         self._remember_ocr_translations(boxes)
         if self.settings.overlay_tracking_enabled:
@@ -964,6 +973,151 @@ class TextDetectionPipeline:
             boxes = sorted(boxes, key=self._ocr_candidate_priority, reverse=True)[: self.settings.max_boxes]
         boxes.sort(key=lambda box: (box[1], box[0]))
         return boxes
+
+    def _full_frame_ocr_enabled(self) -> bool:
+        return (
+            self.settings.ocr_enabled
+            and self.ocr_backend.is_available()
+            and self.ocr_backend.supports_full_frame()
+        )
+
+    def _annotate_with_full_frame_ocr(
+        self,
+        detection_frame: np.ndarray,
+        original_shape: tuple[int, int, int],
+        scale: float,
+    ) -> tuple[list[DetectionBox], list[tuple[int, int, int, int]], np.ndarray]:
+        self._ocr_cache_generation += 1
+        self._last_ocr_reuse_count = 0
+        self._last_ocr_candidate_count = 0
+        self._last_ocr_submitted_count = 0
+
+        frame_results = self.ocr_backend.recognize_frame(
+            detection_frame,
+            language=self.settings.ocr_language,
+        )
+        filtered_results = self._filter_full_frame_ocr_results(frame_results, detection_frame.shape)
+        self._last_ocr_candidate_count = len(filtered_results)
+        self._last_ocr_submitted_count = len(filtered_results)
+
+        preview_boxes: list[tuple[int, int, int, int]] = []
+        detected_boxes: list[DetectionBox] = []
+        for result in filtered_results:
+            preview_boxes.append(result.rect)
+            text = self._normalize_recognized_text(result.text)
+            confidence = result.confidence
+            if text and not self._is_usable_text(text, confidence):
+                text = ""
+                confidence = None
+            if not text:
+                continue
+            detected_boxes.append(
+                self._detection_box_from_frame_ocr_result(
+                    result,
+                    original_shape=original_shape,
+                    scale=scale,
+                    text=text,
+                    confidence=confidence,
+                )
+            )
+
+        line_mask = np.zeros(detection_frame.shape[:2], dtype=np.uint8)
+        for x, y, w, h in preview_boxes:
+            cv2.rectangle(line_mask, (x, y), (x + w, y + h), 255, -1)
+
+        detected_boxes.sort(key=lambda box: (box.y, box.x))
+        return detected_boxes, preview_boxes, line_mask
+
+    def _filter_full_frame_ocr_results(
+        self,
+        results: list[OCRFrameResult],
+        frame_shape: tuple[int, ...],
+    ) -> list[OCRFrameResult]:
+        frame_height, frame_width = frame_shape[:2]
+        frame_area = max(frame_height * frame_width, 1)
+        max_box_height = max(
+            int(frame_height * self.settings.max_box_height_ratio),
+            self._scaled_detection_length(72, minimum=36),
+        )
+        min_contour_area = self._scaled_detection_area(self.settings.min_contour_area, minimum=24)
+        min_box_width = self._scaled_detection_length(self.settings.min_box_width, minimum=8)
+        min_box_height = self._scaled_detection_length(self.settings.min_box_height, minimum=4)
+
+        filtered: list[OCRFrameResult] = []
+        for result in results:
+            x, y, w, h = result.rect
+            left = max(int(x), 0)
+            top = max(int(y), 0)
+            right = min(max(int(x + w), left + 1), frame_width)
+            bottom = min(max(int(y + h), top + 1), frame_height)
+            clipped_w = right - left
+            clipped_h = bottom - top
+            area = clipped_w * clipped_h
+            aspect_ratio = clipped_w / max(clipped_h, 1)
+
+            if area < min_contour_area:
+                continue
+            if area > int(frame_area * 0.20):
+                continue
+            if clipped_w < min_box_width or clipped_h < min_box_height:
+                continue
+            if clipped_h > max_box_height:
+                continue
+            if not 0.4 <= aspect_ratio <= 80.0:
+                continue
+
+            filtered.append(
+                OCRFrameResult(
+                    rect=(left, top, clipped_w, clipped_h),
+                    text=result.text,
+                    confidence=result.confidence,
+                )
+            )
+
+        filtered = self._limit_full_frame_ocr_results(filtered)
+        filtered.sort(key=lambda result: (result.rect[1], result.rect[0]))
+        return filtered
+
+    def _limit_full_frame_ocr_results(self, results: list[OCRFrameResult]) -> list[OCRFrameResult]:
+        if len(results) <= self.settings.max_boxes:
+            return results
+        return sorted(
+            results,
+            key=lambda result: self._ocr_candidate_priority(result.rect),
+            reverse=True,
+        )[: self.settings.max_boxes]
+
+    def _detection_box_from_frame_ocr_result(
+        self,
+        result: OCRFrameResult,
+        *,
+        original_shape: tuple[int, int, int],
+        scale: float,
+        text: str,
+        confidence: float | None,
+    ) -> DetectionBox:
+        x, y, w, h = result.rect
+        mapped_x = int(x / scale)
+        mapped_y = int(y / scale)
+        mapped_w = int(w / scale)
+        mapped_h = int(h / scale)
+        mapped_w = min(mapped_w, original_shape[1] - mapped_x)
+        mapped_h = min(mapped_h, original_shape[0] - mapped_y)
+
+        source_language_code, source_language_label = self._resolve_source_language(text)
+        target_language = get_target_language_option(self.settings.target_language_code)
+        return DetectionBox(
+            x=max(mapped_x, 0),
+            y=max(mapped_y, 0),
+            w=max(mapped_w, 1),
+            h=max(mapped_h, 1),
+            text=text,
+            source_language_code=source_language_code,
+            source_language_label=source_language_label,
+            target_language_code=target_language.code,
+            target_language_label=target_language.label,
+            confidence=confidence,
+        )
 
     def _annotate_with_ocr(
         self,
@@ -2365,8 +2519,13 @@ class TextDetectionPipeline:
         detector_status = self._detector_status_message()
         translation_status = self.translation_backend.describe()
         if self.settings.ocr_enabled and self.ocr_backend.is_available():
-            ocr_status = f"{self.ocr_backend.describe()} | {self.settings.max_ocr_boxes_per_frame} new OCR/frame"
-            if self._last_ocr_candidate_count:
+            if self.ocr_backend.supports_full_frame():
+                ocr_status = f"{self.ocr_backend.describe()} | full-frame OCR"
+                if self._last_ocr_candidate_count:
+                    ocr_status = f"{ocr_status} | read {self._last_ocr_submitted_count}"
+            else:
+                ocr_status = f"{self.ocr_backend.describe()} | {self.settings.max_ocr_boxes_per_frame} new OCR/frame"
+            if self._last_ocr_candidate_count and not self.ocr_backend.supports_full_frame():
                 ocr_status = (
                     f"{ocr_status} | submitted {self._last_ocr_submitted_count}, "
                     f"reused {self._last_ocr_reuse_count}/{self._last_ocr_candidate_count}"
@@ -2390,6 +2549,8 @@ class TextDetectionPipeline:
                 scanline_suffix = f" | scanline {band_count} bands"
             else:
                 scanline_suffix = f" | scanline {self._scanline_last_band_index + 1}/{band_count}"
+        if self._full_frame_ocr_enabled():
+            return f"Native full-frame OCR detector{scale_suffix}"
         if mode == "opencv":
             return f"OpenCV morphology detector{scale_suffix}{region_suffix}{scanline_suffix}"
 

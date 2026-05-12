@@ -58,7 +58,11 @@ class ProcessingWorker(QThread):
         frame_queue = _LatestFrameQueue()
         pipeline = TextDetectionPipeline(
             self.settings,
-            create_default_ocr_backend(device_preference=self.settings.ocr_device_preference),
+            create_default_ocr_backend(
+                mode=self.settings.ocr_backend_mode,
+                device_preference=self.settings.ocr_device_preference,
+                language=self.settings.ocr_language,
+            ),
             create_default_translation_backend(mode=self.settings.translation_mode),
         )
         capture_thread = Thread(
