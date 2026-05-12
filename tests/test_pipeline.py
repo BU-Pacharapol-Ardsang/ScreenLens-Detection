@@ -356,6 +356,42 @@ def test_pipeline_hover_region_selects_multiline_subtitle_in_line_mode() -> None
     ]
 
 
+def test_pipeline_hover_region_selects_long_reading_block_in_line_mode() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_region_mode="hover"),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    selected = pipeline._select_hover_source_boxes(
+        [
+            (44, 36, 460, 26),
+            (44, 66, 455, 26),
+            (44, 96, 470, 26),
+            (44, 126, 210, 26),
+            (560, 38, 120, 24),
+        ],
+        (70, 45),
+    )
+
+    assert selected == [
+        (44, 36, 460, 26),
+        (44, 66, 455, 26),
+        (44, 96, 470, 26),
+        (44, 126, 210, 26),
+    ]
+
+
+def test_pipeline_hover_region_uses_wide_horizontal_roi_for_long_text() -> None:
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_region_mode="hover", hover_region_radius=260),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+
+    assert pipeline._hover_source_roi_bounds((80, 300), (720, 1280, 3)) == (0, 40, 600, 560)
+
+
 def test_pipeline_hover_region_splits_mixed_ui_box_to_cursor_row() -> None:
     pipeline = TextDetectionPipeline(
         PipelineSettings(translation_region_mode="hover"),
@@ -1246,6 +1282,34 @@ def test_pipeline_hover_region_translates_multiline_subtitle_as_one_block() -> N
     assert len(translated) == 1
     assert translated[0].text == expected_text
     assert (translated[0].x, translated[0].y, translated[0].w, translated[0].h) == (24, 32, 460, 60)
+    assert translated[0].translated_text == f"tha:{expected_text}"
+    assert backend.calls == [("eng", "tha", [expected_text])]
+
+
+def test_pipeline_hover_region_translates_long_reading_block_as_one_block() -> None:
+    backend = RecordingRouteTranslationBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(translation_region_mode="hover"),
+        NoOpOCRBackend(),
+        backend,
+    )
+
+    lines = [
+        "Cabinet split as Home Secretary",
+        "Shabana Mahmood among ministers",
+        "calling for Starmer to set out timetable",
+        "for resignation",
+    ]
+    boxes = [
+        DetectionBox(x=44, y=36 + (index * 30), w=460 if index < 3 else 210, h=26, text=line, source_language_code="eng")
+        for index, line in enumerate(lines)
+    ]
+
+    translated = pipeline._apply_translations(boxes)
+
+    expected_text = "\n".join(lines)
+    assert len(translated) == 1
+    assert translated[0].text == expected_text
     assert translated[0].translated_text == f"tha:{expected_text}"
     assert backend.calls == [("eng", "tha", [expected_text])]
 

@@ -766,7 +766,7 @@ class TextDetectionPipeline:
             return [anchor]
 
         anchor_center_y = anchor[1] + (anchor[3] / 2.0)
-        vertical_span = max(int(round(anchor_height * 3.0)), 72)
+        vertical_span = max(int(round(anchor_height * 5.5)), 120)
         candidates: list[tuple[int, int, int, int]] = []
         for box in boxes:
             height_ratio = box[3] / anchor_height
@@ -793,7 +793,7 @@ class TextDetectionPipeline:
             if not self._hover_subtitle_lines_are_contiguous(previous, selected[0]):
                 break
             selected.insert(0, previous)
-            if len(selected) >= 3:
+            if len(selected) >= 6:
                 break
 
         for index in range(anchor_index + 1, len(candidates)):
@@ -801,7 +801,7 @@ class TextDetectionPipeline:
             if not self._hover_subtitle_lines_are_contiguous(selected[-1], following):
                 break
             selected.append(following)
-            if len(selected) >= 3:
+            if len(selected) >= 6:
                 break
 
         if len(selected) <= 1 or not self._rects_look_like_hover_subtitle_block(selected):
@@ -838,7 +838,7 @@ class TextDetectionPipeline:
         self,
         boxes: list[tuple[int, int, int, int]],
     ) -> bool:
-        if len(boxes) < 2 or len(boxes) > 3:
+        if len(boxes) < 2 or len(boxes) > 6:
             return False
 
         sorted_boxes = sorted(boxes, key=lambda box: (box[1], box[0]))
@@ -856,7 +856,7 @@ class TextDetectionPipeline:
                 return False
 
         total_height = max(box[1] + box[3] for box in sorted_boxes) - min(box[1] for box in sorted_boxes)
-        return total_height <= max(int(round(median_height * 3.8)), 120)
+        return total_height <= max(int(round(median_height * 6.4)), 220)
 
     def _hover_source_roi_bounds(
         self,
@@ -865,10 +865,11 @@ class TextDetectionPipeline:
     ) -> tuple[int, int, int, int]:
         frame_height, frame_width = source_shape[:2]
         radius = max(self.settings.hover_region_radius, 32)
+        horizontal_radius = max(radius, int(round(radius * 2.0)), 480)
         cursor_x, cursor_y = cursor_position
-        left = max(cursor_x - radius, 0)
+        left = max(cursor_x - horizontal_radius, 0)
         top = max(cursor_y - radius, 0)
-        right = min(cursor_x + radius, frame_width)
+        right = min(cursor_x + horizontal_radius, frame_width)
         bottom = min(cursor_y + radius, frame_height)
         return left, top, right, bottom
 
@@ -2702,7 +2703,7 @@ class TextDetectionPipeline:
         return thai_count + latin_count >= 14 and not self._looks_like_hover_metadata_row(text)
 
     def _combine_hover_subtitle_boxes(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
-        if len(boxes) < 2 or len(boxes) > 3:
+        if len(boxes) < 2 or len(boxes) > 6:
             return list(boxes)
 
         ordered_boxes = sorted(boxes, key=lambda box: (box.y, box.x))
