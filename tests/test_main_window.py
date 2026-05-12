@@ -2,11 +2,12 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QApplication
 
-from screenlens_detection.models import FrameAnalysis, MonitorSpec
+from screenlens_detection.models import DetectionBox, FrameAnalysis, MonitorSpec
 from screenlens_detection.ui import main_window as main_window_module
 
 
@@ -92,6 +93,8 @@ class DummyOverlay:
         self.tracking_mode: str | None = None
         self.tracking_enabled = False
         self.realtime_tracking_active = False
+        self.render_mode: str | None = None
+        self.clean_patch_options: dict[str, int] = {}
 
     def show_for_monitor(self, monitor: MonitorSpec) -> None:
         self.shown_for = monitor
@@ -114,6 +117,24 @@ class DummyOverlay:
 
     def set_tracking_enabled(self, enabled: bool) -> None:
         self.tracking_enabled = enabled
+
+    def set_render_mode(self, mode: str | None) -> None:
+        self.render_mode = mode
+
+    def set_clean_patch_options(
+        self,
+        *,
+        padding_px: int,
+        mask_dilate_px: int,
+        inpaint_radius: int,
+        max_crop_area: int,
+    ) -> None:
+        self.clean_patch_options = {
+            "padding_px": padding_px,
+            "mask_dilate_px": mask_dilate_px,
+            "inpaint_radius": inpaint_radius,
+            "max_crop_area": max_crop_area,
+        }
 
     def set_realtime_tracking_active(self, active: bool) -> None:
         self.realtime_tracking_active = active
@@ -141,6 +162,26 @@ class DummyOverlayTrackingWorker(QObject):
         self.finished.emit()
 
 
+def test_clean_patch_preview_does_not_fallback_to_bubble_when_inpaint_skips() -> None:
+    _app()
+    frame = np.full((90, 180, 3), 220, dtype=np.uint8)
+    cv2_text_color = (35, 35, 35)
+
+    cv2.putText(frame, "OLD", (24, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.8, cv2_text_color, 2, cv2.LINE_AA)
+    rendered = main_window_module.MainWindow._translated_preview_frame(
+        FrameAnalysis(
+            annotated_frame=frame,
+            processed_preview=frame,
+            source_frame=frame,
+            boxes=[DetectionBox(x=20, y=22, w=90, h=34, text="OLD", translated_text="ใหม่")],
+        ),
+        render_mode="clean_patch",
+        clean_patch_max_crop_area=1,
+    )
+
+    assert np.mean(rendered[24, 22]) > 160
+
+
 def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch) -> None:
     DummyWorker.instances.clear()
     monkeypatch.setattr(main_window_module, "ScreenCapturer", FakeScreenCapturer)
@@ -156,18 +197,24 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert google_index >= 0
         easyocr_index = window.text_detector_combo.findData("easyocr")
         assert easyocr_index >= 0
+        rapidocr_ocr_index = window.ocr_backend_combo.findData("rapidocr")
+        assert rapidocr_ocr_index >= 0
         scanline_index = window.scanline_roi_combo.findData(True)
         assert scanline_index >= 0
         hover_region_index = window.translation_region_mode_combo.findData("hover")
         assert hover_region_index >= 0
         strict_block_index = window.translation_block_mode_combo.findData("strict")
         assert strict_block_index >= 0
+        clean_patch_index = window.subtitle_render_mode_combo.findData("clean_patch")
+        assert clean_patch_index >= 0
 
         window.translation_mode_combo.setCurrentIndex(google_index)
         window.text_detector_combo.setCurrentIndex(easyocr_index)
+        window.ocr_backend_combo.setCurrentIndex(rapidocr_ocr_index)
         window.scanline_roi_combo.setCurrentIndex(scanline_index)
         window.translation_region_mode_combo.setCurrentIndex(hover_region_index)
         window.translation_block_mode_combo.setCurrentIndex(strict_block_index)
+        window.subtitle_render_mode_combo.setCurrentIndex(clean_patch_index)
         window.translation_stability_checkbox.setChecked(False)
         window.interval_spin.setValue(1000)
         window.scale_spin.setValue(1.0)
@@ -175,6 +222,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         window.area_spin.setValue(100)
         window.ocr_boxes_slider.setValue(2)
         window.overlay_tracking_checkbox.setChecked(True)
+        window.runtime_debug_checkbox.setChecked(True)
         anchor_index = window.overlay_tracking_mode_combo.findData("anchor")
         assert anchor_index >= 0
         window.overlay_tracking_mode_combo.setCurrentIndex(anchor_index)
@@ -186,21 +234,28 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert worker.started is True
         assert worker.settings.translation_mode == "google"
         assert worker.settings.text_detector_mode == "easyocr"
+        assert worker.settings.ocr_backend_mode == "rapidocr"
         assert worker.settings.detection_scale == 0.50
         assert worker.settings.scanline_roi_enabled is True
         assert worker.settings.translation_region_mode == "hover"
         assert worker.settings.translation_block_mode == "strict"
         assert worker.settings.translation_similarity_stability_enabled is False
+        assert worker.settings.subtitle_render_mode == "clean_patch"
         assert worker.settings.overlay_tracking_enabled is True
         assert worker.settings.overlay_tracking_mode == "anchor"
+        assert worker.settings.runtime_debug_enabled is True
+        assert window.overlay_window.render_mode == "clean_patch"
         assert window.worker is worker
         assert window.text_detector_combo.isEnabled() is False
+        assert window.ocr_backend_combo.isEnabled() is False
         assert window.scanline_roi_combo.isEnabled() is False
         assert window.translation_mode_combo.isEnabled() is False
         assert window.translation_region_mode_combo.isEnabled() is False
         assert window.translation_block_mode_combo.isEnabled() is False
+        assert window.subtitle_render_mode_combo.isEnabled() is False
         assert window.translation_stability_checkbox.isEnabled() is False
         assert window.overlay_tracking_checkbox.isEnabled() is False
+        assert window.runtime_debug_checkbox.isEnabled() is False
         assert window.overlay_tracking_mode_combo.isEnabled() is False
         assert window.stop_button.isEnabled() is True
         assert window.status_label.text() == "Synthetic worker running"
@@ -221,16 +276,35 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert worker.stopped is True
         assert window.worker is None
         assert window.text_detector_combo.isEnabled() is True
+        assert window.ocr_backend_combo.isEnabled() is True
         assert window.scanline_roi_combo.isEnabled() is True
         assert window.translation_mode_combo.isEnabled() is True
         assert window.translation_region_mode_combo.isEnabled() is True
         assert window.translation_block_mode_combo.isEnabled() is True
+        assert window.subtitle_render_mode_combo.isEnabled() is True
         assert window.translation_stability_checkbox.isEnabled() is True
         assert window.stop_button.isEnabled() is False
         assert window.status_label.text() == "Stopped"
+        assert window.runtime_debug_checkbox.isEnabled() is True
     finally:
         window.close()
         app.processEvents()
+
+
+def test_runtime_debug_text_formats_slowest_stage() -> None:
+    text = main_window_module.MainWindow._format_runtime_debug_text(
+        {
+            "scale_frame": 1.25,
+            "opencv_detection": 8.5,
+            "translation": 3.0,
+            "total": 14.0,
+        }
+    )
+
+    assert "total 14.0 ms" in text
+    assert "slowest opencv detect 8.5 ms" in text
+    assert "translation: 3.0 ms" in text
+    assert main_window_module.MainWindow._format_runtime_debug_text({}) == "Off"
 
 
 def test_main_window_f7_starts_hover_overlay_and_arms_hover_target(monkeypatch) -> None:

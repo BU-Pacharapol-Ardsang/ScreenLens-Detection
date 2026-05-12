@@ -8,6 +8,7 @@ import threading
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from math import ceil, floor
 from pathlib import Path
 
 import cv2
@@ -36,6 +37,48 @@ except ImportError:  # pragma: no cover - dependency is declared in pyproject
 class OCRResult:
     text: str = ""
     confidence: float | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class OCRFrameResult:
+    rect: tuple[int, int, int, int]
+    text: str = ""
+    confidence: float | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class OCRBackendOption:
+    code: str
+    label: str
+
+
+OCR_BACKEND_OPTIONS = (
+    OCRBackendOption(code="auto", label="Auto (EasyOCR, then Tesseract)"),
+    OCRBackendOption(code="easyocr", label="EasyOCR crop OCR (Optional)"),
+    OCRBackendOption(code="rapidocr", label="RapidOCR full OCR (Optional)"),
+    OCRBackendOption(code="tesseract", label="Tesseract crop OCR"),
+    OCRBackendOption(code="disabled", label="Disabled"),
+)
+
+
+def ocr_backend_options() -> list[OCRBackendOption]:
+    return list(OCR_BACKEND_OPTIONS)
+
+
+def normalize_ocr_backend_mode(value: str | None) -> str:
+    normalized = (value or "auto").strip().casefold()
+    aliases = {
+        "none": "disabled",
+        "off": "disabled",
+        "false": "disabled",
+        "no": "disabled",
+        "rapid": "rapidocr",
+        "rapidocr-full": "rapidocr",
+        "rapidocr_full": "rapidocr",
+    }
+    normalized = aliases.get(normalized, normalized)
+    available = {option.code for option in OCR_BACKEND_OPTIONS}
+    return normalized if normalized in available else "auto"
 
 
 @dataclass(slots=True, frozen=True)
@@ -76,6 +119,12 @@ class OCRBackend:
             for image, psm in zip(images, psms, strict=False)
         ]
 
+    def supports_full_frame(self) -> bool:
+        return False
+
+    def recognize_frame(self, frame: np.ndarray, *, language: str) -> list[OCRFrameResult]:
+        return []
+
     def close(self) -> None:
         return None
 
@@ -85,6 +134,15 @@ class NoOpOCRBackend(OCRBackend):
 
     def describe(self) -> str:
         return "Detection-only mode"
+
+
+class UnavailableOCRBackend(OCRBackend):
+    def __init__(self, name: str, reason: str) -> None:
+        self.name = name
+        self.reason = reason
+
+    def describe(self) -> str:
+        return f"{self.name} unavailable: {self.reason}"
 
 
 class QueuedOCRBackend(OCRBackend):
@@ -221,6 +279,12 @@ class QueuedOCRBackend(OCRBackend):
                 self._condition.notify_all()
 
         return results
+
+    def supports_full_frame(self) -> bool:
+        return self._underlying.supports_full_frame()
+
+    def recognize_frame(self, frame: np.ndarray, *, language: str) -> list[OCRFrameResult]:
+        return self._underlying.recognize_frame(frame, language=language)
 
     def _trim_queue_locked(self) -> None:
         while len(self._queue) >= self._max_queue_size:
@@ -560,6 +624,106 @@ class EasyOCRBackend(OCRBackend):
         return self._gpu_available
 
 
+class RapidOCRFullBackend(OCRBackend):
+    name = "rapidocr"
+
+    def __init__(self, *, language: str = "eng", device_preference: str = "auto") -> None:
+        try:
+            from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
+        except ImportError as exc:
+            raise RuntimeError("install optional dependencies rapidocr and onnxruntime") from exc
+
+        self._device_preference = normalize_ocr_device_preference(device_preference)
+        self._use_cuda = _rapidocr_onnx_cuda_available(self._device_preference)
+        self._language = language
+        self._engine = self._create_engine(
+            RapidOCR=RapidOCR,
+            EngineType=EngineType,
+            LangDet=LangDet,
+            LangRec=LangRec,
+            ModelType=ModelType,
+            OCRVersion=OCRVersion,
+            language=language,
+        )
+
+    def is_available(self) -> bool:
+        return True
+
+    def supports_full_frame(self) -> bool:
+        return True
+
+    def describe(self) -> str:
+        device = "CUDA" if self._use_cuda else "CPU"
+        return f"RapidOCR full OCR ({device})"
+
+    def runtime_diagnostics(self) -> str:
+        device = "ONNX Runtime CUDA" if self._use_cuda else "ONNX Runtime CPU"
+        return f"RapidOCR full OCR | {device} | detection+recognition"
+
+    def recognize_frame(self, frame: np.ndarray, *, language: str) -> list[OCRFrameResult]:
+        if language != self._language:
+            # RapidOCR language models are selected when the engine is created.
+            # The app recreates the backend when a worker starts, so this only
+            # matters for direct test calls or future dynamic language changes.
+            self._language = language
+
+        try:
+            result = self._engine(np.ascontiguousarray(frame), use_det=True, use_cls=False, use_rec=True)
+        except TypeError:
+            try:
+                result = self._engine(np.ascontiguousarray(frame))
+            except Exception:
+                return []
+        except Exception:
+            return []
+
+        return _rapidocr_frame_results(result)
+
+    def _create_engine(
+        self,
+        *,
+        RapidOCR: type,
+        EngineType: object,
+        LangDet: object,
+        LangRec: object,
+        ModelType: object,
+        OCRVersion: object,
+        language: str,
+    ) -> object:
+        params = {
+            "Global.use_det": True,
+            "Global.use_cls": False,
+            "Global.use_rec": True,
+            "Global.max_side_len": 1280,
+            "Global.text_score": 0.35,
+            "Global.log_level": "error",
+            "Det.engine_type": _enum_value(EngineType, "ONNXRUNTIME", "onnxruntime"),
+            "Det.lang_type": _rapidocr_det_language(LangDet, language),
+            "Det.model_type": _enum_value(ModelType, "MOBILE", "mobile"),
+            "Det.ocr_version": _enum_value(OCRVersion, "PPOCRV4", "PP-OCRv4"),
+            "Det.limit_side_len": 960,
+            "Det.limit_type": "max",
+            "Det.box_thresh": 0.45,
+            "Det.max_candidates": 300,
+            "Det.score_mode": "fast",
+            "Rec.engine_type": _enum_value(EngineType, "ONNXRUNTIME", "onnxruntime"),
+            "Rec.model_type": _enum_value(ModelType, "MOBILE", "mobile"),
+            "Rec.ocr_version": _enum_value(OCRVersion, "PPOCRV4", "PP-OCRv4"),
+            "Rec.rec_batch_num": 8,
+            "EngineConfig.onnxruntime.intra_op_num_threads": 2,
+            "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+            "EngineConfig.onnxruntime.use_cuda": self._use_cuda,
+        }
+        rec_language = _rapidocr_rec_language(LangRec, language)
+        if rec_language is not None:
+            params["Rec.lang_type"] = rec_language
+
+        try:
+            return RapidOCR(params=params)
+        except TypeError:
+            return RapidOCR()
+
+
 class TesseractOCRBackend(OCRBackend):
     name = "tesseract"
 
@@ -818,25 +982,37 @@ class TesseractOCRBackend(OCRBackend):
         return confidence_score + length_bonus
 
 
-def create_default_ocr_backend(*, device_preference: str | None = None) -> OCRBackend:
-    preference = os.getenv("SCREENLENS_OCR_BACKEND", "auto").strip().lower()
+def create_default_ocr_backend(
+    *,
+    mode: str | None = None,
+    device_preference: str | None = None,
+    language: str = "eng",
+) -> OCRBackend:
+    preference = normalize_ocr_backend_mode(mode if mode is not None else os.getenv("SCREENLENS_OCR_BACKEND", "auto"))
     resolved_device_preference = normalize_ocr_device_preference(
         device_preference if device_preference is not None else os.getenv("SCREENLENS_OCR_DEVICE", "auto")
     )
-    if preference in {"disabled", "none", "off"}:
+    if preference == "disabled":
         return NoOpOCRBackend()
 
     if preference == "tesseract":
         backend = TesseractOCRBackend()
         if backend.is_available():
             return _maybe_queue_ocr_backend(backend)
-        return NoOpOCRBackend()
+        return UnavailableOCRBackend("Tesseract OCR", backend.describe())
 
     if preference == "easyocr":
         backend = EasyOCRBackend(device_preference=resolved_device_preference)
         if backend.is_available():
             return _maybe_queue_ocr_backend(backend)
-        return NoOpOCRBackend()
+        return UnavailableOCRBackend("EasyOCR", backend.describe())
+
+    if preference == "rapidocr":
+        return _create_optional_ocr_backend(
+            RapidOCRFullBackend,
+            language=language,
+            device_preference=resolved_device_preference,
+        )
 
     for backend_cls in (EasyOCRBackend, TesseractOCRBackend):
         if backend_cls is EasyOCRBackend:
@@ -848,7 +1024,21 @@ def create_default_ocr_backend(*, device_preference: str | None = None) -> OCRBa
     return NoOpOCRBackend()
 
 
+def _create_optional_ocr_backend(
+    backend_class: type[OCRBackend],
+    *,
+    language: str,
+    device_preference: str,
+) -> OCRBackend:
+    try:
+        return backend_class(language=language, device_preference=device_preference)  # type: ignore[call-arg]
+    except Exception as exc:
+        return UnavailableOCRBackend(backend_class.name, str(exc))
+
+
 def _maybe_queue_ocr_backend(backend: OCRBackend) -> OCRBackend:
+    if backend.supports_full_frame():
+        return backend
     async_setting = os.getenv("SCREENLENS_OCR_ASYNC", "1").strip().lower()
     if async_setting in {"0", "false", "no", "off", "disabled"}:
         return backend
@@ -886,6 +1076,161 @@ def normalize_ocr_device_preference(value: str | None) -> str:
     if normalized == "cpu":
         return "cpu"
     return "auto"
+
+
+def _enum_value(enum_class: object, name: str, fallback: str) -> object:
+    return getattr(enum_class, name, fallback)
+
+
+def _rapidocr_det_language(lang_det_enum: object, language: str) -> object:
+    normalized = language.casefold()
+    if "eng" in normalized and "tha" not in normalized:
+        return _enum_value(lang_det_enum, "EN", "en")
+    if "tha" in normalized and "eng" not in normalized:
+        return _enum_value(lang_det_enum, "MULTI", "multi")
+    return _enum_value(lang_det_enum, "MULTI", "multi")
+
+
+def _rapidocr_rec_language(lang_rec_enum: object, language: str) -> object | None:
+    normalized = language.casefold()
+    if "eng" in normalized and "tha" not in normalized:
+        return _enum_value(lang_rec_enum, "EN", "en")
+    if "tha" in normalized and "eng" not in normalized:
+        return getattr(lang_rec_enum, "TH", None)
+    return None
+
+
+def _rapidocr_onnx_cuda_available(device_preference: str) -> bool:
+    if device_preference not in {"gpu", "cuda"}:
+        return False
+
+    try:
+        import onnxruntime
+    except ImportError:
+        return False
+
+    try:
+        return "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+    except Exception:
+        return False
+
+
+def _rapidocr_frame_results(result: object) -> list[OCRFrameResult]:
+    modern_results = _rapidocr_modern_frame_results(result)
+    if modern_results:
+        return modern_results
+    return _rapidocr_legacy_frame_results(result)
+
+
+def _rapidocr_modern_frame_results(result: object) -> list[OCRFrameResult]:
+    if isinstance(result, tuple) and result:
+        result = result[0]
+
+    boxes = _get_result_field(result, "boxes")
+    texts = _get_result_field(result, "txts")
+    if texts is None:
+        texts = _get_result_field(result, "texts")
+    scores = _get_result_field(result, "scores")
+    if boxes is None or texts is None:
+        return []
+
+    box_list = list(boxes)
+    text_list = list(texts)
+    score_list = _score_sequence(scores)
+    if not score_list:
+        score_list = [None] * len(text_list)
+
+    frame_results: list[OCRFrameResult] = []
+    for polygon, text, score in zip(box_list, text_list, score_list, strict=False):
+        normalized_text = re.sub(r"\s+", " ", str(text)).strip()
+        if not normalized_text:
+            continue
+        rect = _rect_from_polygon(polygon)
+        if rect is None:
+            continue
+        frame_results.append(
+            OCRFrameResult(
+                rect=rect,
+                text=normalized_text,
+                confidence=_confidence_percent(score),
+            )
+        )
+    return frame_results
+
+
+def _rapidocr_legacy_frame_results(result: object) -> list[OCRFrameResult]:
+    if isinstance(result, tuple) and result:
+        result = result[0]
+
+    frame_results: list[OCRFrameResult] = []
+    if not isinstance(result, (list, tuple)):
+        return frame_results
+
+    for item in result:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        rect = _rect_from_polygon(item[0])
+        if rect is None:
+            continue
+
+        text = ""
+        confidence: float | None = None
+        payload = item[1]
+        if isinstance(payload, (list, tuple)) and payload:
+            text = str(payload[0])
+            confidence = _confidence_percent(payload[1] if len(payload) > 1 else None)
+        else:
+            text = str(payload)
+            confidence = _confidence_percent(item[2] if len(item) > 2 else None)
+
+        normalized_text = re.sub(r"\s+", " ", text).strip()
+        if not normalized_text:
+            continue
+        frame_results.append(OCRFrameResult(rect=rect, text=normalized_text, confidence=confidence))
+    return frame_results
+
+
+def _get_result_field(result: object, field_name: str) -> object | None:
+    if isinstance(result, dict):
+        return result.get(field_name)
+    return getattr(result, field_name, None)
+
+
+def _score_sequence(scores: object) -> list[object]:
+    if scores is None:
+        return []
+    if isinstance(scores, np.ndarray):
+        return list(scores.tolist())
+    if isinstance(scores, (list, tuple)):
+        return list(scores)
+    return [scores]
+
+
+def _confidence_percent(score: object) -> float | None:
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return None
+    if value <= 1.0:
+        return value * 100.0
+    return value
+
+
+def _rect_from_polygon(points: object) -> tuple[int, int, int, int] | None:
+    try:
+        polygon = np.asarray(points, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+    if polygon.ndim != 2 or polygon.shape[0] < 2 or polygon.shape[1] < 2:
+        return None
+
+    xs = polygon[:, 0]
+    ys = polygon[:, 1]
+    left = max(int(floor(float(xs.min()))), 0)
+    top = max(int(floor(float(ys.min()))), 0)
+    right = max(int(ceil(float(xs.max()))), left + 1)
+    bottom = max(int(ceil(float(ys.max()))), top + 1)
+    return left, top, right - left, bottom - top
 
 
 def _nvidia_cuda_available() -> bool:

@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from screenlens_detection.models import DetectionBox, PipelineSettings
-from screenlens_detection.ocr import NoOpOCRBackend, OCRBackend, OCRResult
+from screenlens_detection.ocr import NoOpOCRBackend, OCRBackend, OCRFrameResult, OCRResult
 from screenlens_detection.pipeline import TextDetectionPipeline
 from screenlens_detection.translation import NoOpTranslationBackend, TranslationBackend
 
@@ -42,6 +42,40 @@ def test_pipeline_detects_text_like_regions() -> None:
     assert analysis.annotated_frame.shape == canvas.shape
     assert analysis.processed_preview.shape[:2] == canvas.shape[:2]
     assert len(analysis.boxes) >= 1
+    assert analysis.runtime_timings_ms == {}
+
+
+def test_pipeline_runtime_debug_timings_are_opt_in() -> None:
+    canvas = np.full((120, 320, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        canvas,
+        "Runtime Debug",
+        (20, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 0, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+    disabled_pipeline = TextDetectionPipeline(
+        PipelineSettings(upscale_factor=1.0, min_contour_area=80, ocr_enabled=False),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    disabled = disabled_pipeline.process(canvas, monitor_label="debug-off")
+
+    enabled_pipeline = TextDetectionPipeline(
+        PipelineSettings(upscale_factor=1.0, min_contour_area=80, ocr_enabled=False, runtime_debug_enabled=True),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    enabled = enabled_pipeline.process(canvas, monitor_label="debug-on")
+
+    assert disabled.runtime_timings_ms == {}
+    assert enabled.runtime_timings_ms["total"] > 0.0
+    assert "opencv_detection" in enabled.runtime_timings_ms
+    assert "ocr_annotation" in enabled.runtime_timings_ms
 
 
 def test_pipeline_detects_document_lines_without_merging_whole_paragraph() -> None:
@@ -306,6 +340,53 @@ class BatchRecordingOCRBackend(RecordingOCRBackend):
             OCRResult(text=f"demo {index}", confidence=95.0)
             for index, _image in enumerate(images, start=1)
         ]
+
+
+class FullFrameRecordingOCRBackend(OCRBackend):
+    def __init__(self) -> None:
+        self.frame_calls: list[tuple[tuple[int, ...], str]] = []
+        self.batch_calls = 0
+
+    def is_available(self) -> bool:
+        return True
+
+    def describe(self) -> str:
+        return "Full frame test OCR"
+
+    def supports_full_frame(self) -> bool:
+        return True
+
+    def recognize_frame(self, frame: np.ndarray, *, language: str) -> list[OCRFrameResult]:
+        self.frame_calls.append((frame.shape, language))
+        return [OCRFrameResult(rect=(20, 30, 120, 28), text="Hello World", confidence=95.0)]
+
+    def recognize_batch(self, images: list[object], *, language: str, psms: list[int]) -> list[OCRResult]:
+        self.batch_calls += 1
+        raise AssertionError("full-frame OCR should bypass crop recognize_batch")
+
+
+def test_pipeline_uses_full_frame_ocr_backend_directly() -> None:
+    backend = FullFrameRecordingOCRBackend()
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            ocr_enabled=True,
+            ocr_language="eng",
+            min_contour_area=80,
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+    frame = np.full((160, 260, 3), 255, dtype=np.uint8)
+
+    analysis = pipeline.process(frame, monitor_label="full-frame")
+
+    assert backend.frame_calls == [((160, 260, 3), "eng")]
+    assert backend.batch_calls == 0
+    assert [box.text for box in analysis.boxes] == ["Hello World"]
+    assert [(box.x, box.y, box.w, box.h) for box in analysis.boxes] == [(20, 30, 120, 28)]
+    assert "Native full-frame OCR detector" in analysis.status
+    assert "Full frame test OCR | full-frame OCR | read 1" in analysis.status
 
 
 class CountingBatchOCRBackend(BatchRecordingOCRBackend):

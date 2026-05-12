@@ -1,10 +1,21 @@
 import threading
+import sys
+import types
 from pathlib import Path
 from time import sleep
 
 import numpy as np
 
-from screenlens_detection.ocr import EasyOCRBackend, OCRBackend, OCRResult, QueuedOCRBackend, TesseractOCRBackend
+from screenlens_detection.ocr import (
+    EasyOCRBackend,
+    OCRBackend,
+    OCRFrameResult,
+    OCRResult,
+    QueuedOCRBackend,
+    RapidOCRFullBackend,
+    TesseractOCRBackend,
+    normalize_ocr_backend_mode,
+)
 
 
 def test_resolve_binary_prefers_runtime_bundle(monkeypatch, tmp_path: Path) -> None:
@@ -117,6 +128,62 @@ def test_easyocr_backend_batches_pre_detected_crops(monkeypatch) -> None:
     assert FakeReader.recognize_calls == [
         ((38, 30), 2, False, [[0, 30, 0, 10], [0, 20, 26, 38]])
     ]
+
+
+def test_normalize_ocr_backend_mode_accepts_aliases() -> None:
+    assert normalize_ocr_backend_mode("rapid") == "rapidocr"
+    assert normalize_ocr_backend_mode("off") == "disabled"
+    assert normalize_ocr_backend_mode("missing") == "auto"
+
+
+def test_rapidocr_full_backend_reads_modern_output(monkeypatch) -> None:
+    class FakeEnum:
+        ONNXRUNTIME = "onnxruntime"
+        EN = "en"
+        MULTI = "multi"
+        MOBILE = "mobile"
+        PPOCRV4 = "PP-OCRv4"
+
+    class FakeRapidOCR:
+        init_params: list[dict[str, object]] = []
+        calls: list[tuple[tuple[int, ...], bool, bool, bool]] = []
+
+        def __init__(self, *, params: dict[str, object]) -> None:
+            self.init_params.append(params)
+
+        def __call__(self, image: np.ndarray, *, use_det: bool, use_cls: bool, use_rec: bool):
+            self.calls.append((image.shape, use_det, use_cls, use_rec))
+            return types.SimpleNamespace(
+                boxes=np.asarray(
+                    [
+                        [[10, 20], [80, 20], [80, 44], [10, 44]],
+                        [[3, 5], [20, 5], [20, 16], [3, 16]],
+                    ],
+                    dtype=np.float32,
+                ),
+                txts=("Hello", " "),
+                scores=(0.91, 0.2),
+            )
+
+    fake_module = types.SimpleNamespace(
+        EngineType=FakeEnum,
+        LangDet=FakeEnum,
+        LangRec=FakeEnum,
+        ModelType=FakeEnum,
+        OCRVersion=FakeEnum,
+        RapidOCR=FakeRapidOCR,
+    )
+    monkeypatch.setitem(sys.modules, "rapidocr", fake_module)
+    monkeypatch.setattr("screenlens_detection.ocr._rapidocr_onnx_cuda_available", lambda _device: False)
+
+    backend = RapidOCRFullBackend(language="eng", device_preference="cpu")
+    results = backend.recognize_frame(np.zeros((60, 120, 3), dtype=np.uint8), language="eng")
+
+    assert backend.supports_full_frame() is True
+    assert results == [OCRFrameResult(rect=(10, 20, 70, 24), text="Hello", confidence=91.0)]
+    assert FakeRapidOCR.init_params[0]["Global.use_rec"] is True
+    assert FakeRapidOCR.init_params[0]["Rec.lang_type"] == "en"
+    assert FakeRapidOCR.calls == [((60, 120, 3), True, False, True)]
 
 
 class RecordingOCRBackend(OCRBackend):
