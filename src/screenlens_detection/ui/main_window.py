@@ -121,6 +121,19 @@ class MainWindow(QMainWindow):
         self.overlay_tracking_checkbox.setChecked(False)
         self.runtime_debug_checkbox = QCheckBox("Runtime debug timings")
         self.runtime_debug_checkbox.setChecked(defaults.runtime_debug_enabled)
+        self.annotated_preview_checkbox = QCheckBox("Annotated")
+        self.annotated_preview_checkbox.setChecked(defaults.annotated_preview_enabled)
+        self.segmentation_preview_checkbox = QCheckBox("Segmentation")
+        self.segmentation_preview_checkbox.setChecked(defaults.segmentation_preview_enabled)
+        self.translated_preview_checkbox = QCheckBox("Translated")
+        self.translated_preview_checkbox.setChecked(defaults.translated_preview_enabled)
+        self.preview_controls = QWidget()
+        preview_controls_layout = QHBoxLayout(self.preview_controls)
+        preview_controls_layout.setContentsMargins(0, 0, 0, 0)
+        preview_controls_layout.setSpacing(10)
+        preview_controls_layout.addWidget(self.annotated_preview_checkbox)
+        preview_controls_layout.addWidget(self.segmentation_preview_checkbox)
+        preview_controls_layout.addWidget(self.translated_preview_checkbox)
         self.overlay_tracking_mode_combo = QComboBox()
         self.ocr_device_combo = QComboBox()
 
@@ -144,6 +157,7 @@ class MainWindow(QMainWindow):
         self._recording_session: RecordingSession | None = None
 
         self._build_ui()
+        self._sync_preview_visibility()
         self._populate_ocr_backend_control()
         self._populate_ocr_device_control()
         self._populate_text_detector_control()
@@ -194,6 +208,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("", self.ocr_checkbox)
         settings_layout.addRow("", self.overlay_tracking_checkbox)
         settings_layout.addRow("", self.runtime_debug_checkbox)
+        settings_layout.addRow("Previews", self.preview_controls)
         settings_layout.addRow("Overlay tracking", self.overlay_tracking_mode_combo)
 
         stats_box = QGroupBox("Runtime Stats")
@@ -232,6 +247,12 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self._stop_worker)
         self.record_button.clicked.connect(self._toggle_recording)
         self.ocr_boxes_slider.valueChanged.connect(self._update_ocr_boxes_label)
+        for checkbox in (
+            self.annotated_preview_checkbox,
+            self.segmentation_preview_checkbox,
+            self.translated_preview_checkbox,
+        ):
+            checkbox.stateChanged.connect(self._sync_preview_settings)
 
     def _set_runtime_controls_locked(self, locked: bool) -> None:
         self.monitor_combo.setEnabled(not locked)
@@ -366,6 +387,9 @@ class MainWindow(QMainWindow):
             overlay_tracking_enabled=self.overlay_tracking_checkbox.isChecked(),
             overlay_tracking_mode=self.overlay_tracking_mode_combo.currentData(),
             runtime_debug_enabled=self.runtime_debug_checkbox.isChecked(),
+            annotated_preview_enabled=self.annotated_preview_checkbox.isChecked(),
+            segmentation_preview_enabled=self.segmentation_preview_checkbox.isChecked(),
+            translated_preview_enabled=self.translated_preview_checkbox.isChecked(),
         )
 
         self._apply_overlay_render_options(settings)
@@ -428,19 +452,34 @@ class MainWindow(QMainWindow):
 
     def _handle_frame(self, analysis: FrameAnalysis) -> None:
         render_settings = self.worker.settings if self.worker is not None else PipelineSettings()
-        translated_preview = self._translated_preview_frame(
-            analysis,
-            render_mode=render_settings.subtitle_render_mode,
-            clean_patch_padding_px=render_settings.clean_patch_padding_px,
-            clean_patch_mask_dilate_px=render_settings.clean_patch_mask_dilate_px,
-            clean_patch_inpaint_radius=render_settings.clean_patch_inpaint_radius,
-            clean_patch_max_crop_area=render_settings.clean_patch_max_crop_area,
-        )
+        translated_preview = None
+        if render_settings.translated_preview_enabled:
+            translated_preview = self._translated_preview_frame(
+                analysis,
+                render_mode=render_settings.subtitle_render_mode,
+                clean_patch_padding_px=render_settings.clean_patch_padding_px,
+                clean_patch_mask_dilate_px=render_settings.clean_patch_mask_dilate_px,
+                clean_patch_inpaint_radius=render_settings.clean_patch_inpaint_radius,
+                clean_patch_max_crop_area=render_settings.clean_patch_max_crop_area,
+            )
         analysis.translated_preview = translated_preview
-        self.preview_label.setPixmap(self._frame_to_pixmap(analysis.annotated_frame, self.preview_label))
-        self.mask_label.setPixmap(self._frame_to_pixmap(analysis.processed_preview, self.mask_label))
-        self.translated_preview_label.setPixmap(
-            self._frame_to_pixmap(translated_preview, self.translated_preview_label)
+        self._set_preview_frame(
+            self.preview_label,
+            analysis.annotated_frame,
+            render_settings.annotated_preview_enabled,
+            "Annotated preview disabled",
+        )
+        self._set_preview_frame(
+            self.mask_label,
+            analysis.processed_preview,
+            render_settings.segmentation_preview_enabled,
+            "Segmentation preview disabled",
+        )
+        self._set_preview_frame(
+            self.translated_preview_label,
+            translated_preview,
+            render_settings.translated_preview_enabled,
+            "Translated preview disabled",
         )
 
         if analysis.fps < 1.0:
@@ -712,6 +751,35 @@ class MainWindow(QMainWindow):
     def _update_ocr_boxes_label(self, value: int) -> None:
         self.ocr_boxes_value_label.setText(str(value))
 
+    def _sync_preview_settings(self, *_args: object) -> None:
+        if self.worker is not None:
+            self.worker.settings.annotated_preview_enabled = self.annotated_preview_checkbox.isChecked()
+            self.worker.settings.segmentation_preview_enabled = self.segmentation_preview_checkbox.isChecked()
+            self.worker.settings.translated_preview_enabled = self.translated_preview_checkbox.isChecked()
+        self._sync_preview_visibility()
+
+    def _sync_preview_visibility(self) -> None:
+        self.preview_label.setVisible(self.annotated_preview_checkbox.isChecked())
+        self.mask_label.setVisible(self.segmentation_preview_checkbox.isChecked())
+        self.translated_preview_label.setVisible(self.translated_preview_checkbox.isChecked())
+
+    def _set_preview_frame(
+        self,
+        label: QLabel,
+        frame: object | None,
+        enabled: bool,
+        disabled_text: str,
+    ) -> None:
+        if not enabled:
+            label.clear()
+            label.setText(disabled_text)
+            return
+        if frame is None:
+            label.clear()
+            label.setText("Preview unavailable")
+            return
+        label.setPixmap(self._frame_to_pixmap(np.asarray(frame), label))
+
     @staticmethod
     def _format_runtime_debug_text(timings_ms: dict[str, float]) -> str:
         if not timings_ms:
@@ -766,12 +834,16 @@ class MainWindow(QMainWindow):
         clean_patch_mask_dilate_px: int = 4,
         clean_patch_inpaint_radius: int = 3,
         clean_patch_max_crop_area: int = 120_000,
-    ) -> np.ndarray:
+    ) -> np.ndarray | None:
         frame = analysis.source_frame
         if frame is None:
             frame = analysis.annotated_frame
+        if frame is None:
+            return None
         preview = np.asarray(frame).copy()
         if preview.ndim != 3 or preview.shape[2] != 3:
+            if analysis.annotated_frame is None:
+                return None
             return np.asarray(analysis.annotated_frame).copy()
 
         normalized_render_mode = normalize_subtitle_render_mode(render_mode)

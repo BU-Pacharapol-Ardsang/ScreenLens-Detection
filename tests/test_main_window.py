@@ -223,6 +223,9 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         window.ocr_boxes_slider.setValue(2)
         window.overlay_tracking_checkbox.setChecked(True)
         window.runtime_debug_checkbox.setChecked(True)
+        window.annotated_preview_checkbox.setChecked(False)
+        window.segmentation_preview_checkbox.setChecked(False)
+        window.translated_preview_checkbox.setChecked(False)
         anchor_index = window.overlay_tracking_mode_combo.findData("anchor")
         assert anchor_index >= 0
         window.overlay_tracking_mode_combo.setCurrentIndex(anchor_index)
@@ -244,6 +247,9 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert worker.settings.overlay_tracking_enabled is True
         assert worker.settings.overlay_tracking_mode == "anchor"
         assert worker.settings.runtime_debug_enabled is True
+        assert worker.settings.annotated_preview_enabled is False
+        assert worker.settings.segmentation_preview_enabled is False
+        assert worker.settings.translated_preview_enabled is False
         assert window.overlay_window.render_mode == "clean_patch"
         assert window.worker is worker
         assert window.text_detector_combo.isEnabled() is False
@@ -256,6 +262,9 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert window.translation_stability_checkbox.isEnabled() is False
         assert window.overlay_tracking_checkbox.isEnabled() is False
         assert window.runtime_debug_checkbox.isEnabled() is False
+        assert window.annotated_preview_checkbox.isEnabled() is True
+        assert window.segmentation_preview_checkbox.isEnabled() is True
+        assert window.translated_preview_checkbox.isEnabled() is True
         assert window.overlay_tracking_mode_combo.isEnabled() is False
         assert window.stop_button.isEnabled() is True
         assert window.status_label.text() == "Synthetic worker running"

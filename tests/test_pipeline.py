@@ -78,6 +78,41 @@ def test_pipeline_runtime_debug_timings_are_opt_in() -> None:
     assert "ocr_annotation" in enabled.runtime_timings_ms
 
 
+def test_pipeline_skips_disabled_preview_rendering() -> None:
+    canvas = np.full((120, 320, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        canvas,
+        "No preview",
+        (20, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 0, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            upscale_factor=1.0,
+            min_contour_area=80,
+            ocr_enabled=False,
+            runtime_debug_enabled=True,
+            annotated_preview_enabled=False,
+            segmentation_preview_enabled=False,
+            translated_preview_enabled=False,
+        ),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    analysis = pipeline.process(canvas, monitor_label="preview-off")
+
+    assert analysis.annotated_frame is None
+    assert analysis.processed_preview is None
+    assert analysis.source_frame.shape == canvas.shape
+    assert "draw_annotations" not in analysis.runtime_timings_ms
+    assert "draw_mask_preview" not in analysis.runtime_timings_ms
+
+
 def test_deep_text_detector_bypasses_opencv_mask_build(monkeypatch) -> None:
     canvas = np.full((180, 420, 3), 255, dtype=np.uint8)
 

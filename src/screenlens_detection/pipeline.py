@@ -201,12 +201,16 @@ class TextDetectionPipeline:
         if runtime_debug_enabled:
             timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "state_update")
 
-        annotated = self._draw_annotations(frame.copy(), boxes)
-        if runtime_debug_enabled:
-            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "draw_annotations")
-        processed_preview = self._draw_mask_preview(line_mask, detection_boxes, output_shape=frame.shape)
-        if runtime_debug_enabled:
-            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "draw_mask_preview")
+        annotated = None
+        if self.settings.annotated_preview_enabled:
+            annotated = self._draw_annotations(frame.copy(), boxes)
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "draw_annotations")
+        processed_preview = None
+        if self.settings.segmentation_preview_enabled:
+            processed_preview = self._draw_mask_preview(line_mask, detection_boxes, output_shape=frame.shape)
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "draw_mask_preview")
         source_frame = frame.copy()
         if runtime_debug_enabled:
             timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "source_frame_copy")
