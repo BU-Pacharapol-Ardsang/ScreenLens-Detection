@@ -64,6 +64,7 @@ def test_recording_session_writes_three_streams_and_jsonl_log(tmp_path, monkeypa
             fps=5.0,
             ocr_available=True,
             monitor_label="Monitor 1",
+            runtime_timings_ms={"total": 12.5},
         )
     )
     session.close()
@@ -76,6 +77,7 @@ def test_recording_session_writes_three_streams_and_jsonl_log(tmp_path, monkeypa
     events = [json.loads(line) for line in session.log_path.read_text(encoding="utf-8").splitlines()]
     assert [event["event"] for event in events] == ["recording_started", "frame", "recording_stopped"]
     assert events[1]["status"] == "running"
+    assert events[1]["runtime_timings_ms"] == {"total": 12.5}
     assert events[1]["boxes"][0]["translated_text"] == "สวัสดี"
 
 

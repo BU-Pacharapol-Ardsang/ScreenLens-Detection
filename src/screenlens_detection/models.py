@@ -73,6 +73,7 @@ class PipelineSettings:
     motion_changed_ratio_threshold: float = 0.20
     overlay_tracking_enabled: bool = False
     overlay_tracking_mode: str = "legacy"
+    runtime_debug_enabled: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -135,6 +136,7 @@ class FrameAnalysis:
     content_motion_confidence: float = 0.0
     source_frame: object | None = None
     translated_preview: object | None = None
+    runtime_timings_ms: dict[str, float] = field(default_factory=dict)
 
     @property
     def detected_text(self) -> list[str]:

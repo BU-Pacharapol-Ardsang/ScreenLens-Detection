@@ -42,6 +42,40 @@ def test_pipeline_detects_text_like_regions() -> None:
     assert analysis.annotated_frame.shape == canvas.shape
     assert analysis.processed_preview.shape[:2] == canvas.shape[:2]
     assert len(analysis.boxes) >= 1
+    assert analysis.runtime_timings_ms == {}
+
+
+def test_pipeline_runtime_debug_timings_are_opt_in() -> None:
+    canvas = np.full((120, 320, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        canvas,
+        "Runtime Debug",
+        (20, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 0, 0),
+        2,
+        cv2.LINE_AA,
+    )
+
+    disabled_pipeline = TextDetectionPipeline(
+        PipelineSettings(upscale_factor=1.0, min_contour_area=80, ocr_enabled=False),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    disabled = disabled_pipeline.process(canvas, monitor_label="debug-off")
+
+    enabled_pipeline = TextDetectionPipeline(
+        PipelineSettings(upscale_factor=1.0, min_contour_area=80, ocr_enabled=False, runtime_debug_enabled=True),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    enabled = enabled_pipeline.process(canvas, monitor_label="debug-on")
+
+    assert disabled.runtime_timings_ms == {}
+    assert enabled.runtime_timings_ms["total"] > 0.0
+    assert "opencv_detection" in enabled.runtime_timings_ms
+    assert "ocr_annotation" in enabled.runtime_timings_ms
 
 
 def test_pipeline_detects_document_lines_without_merging_whole_paragraph() -> None:

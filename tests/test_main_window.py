@@ -222,6 +222,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         window.area_spin.setValue(100)
         window.ocr_boxes_slider.setValue(2)
         window.overlay_tracking_checkbox.setChecked(True)
+        window.runtime_debug_checkbox.setChecked(True)
         anchor_index = window.overlay_tracking_mode_combo.findData("anchor")
         assert anchor_index >= 0
         window.overlay_tracking_mode_combo.setCurrentIndex(anchor_index)
@@ -242,6 +243,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert worker.settings.subtitle_render_mode == "clean_patch"
         assert worker.settings.overlay_tracking_enabled is True
         assert worker.settings.overlay_tracking_mode == "anchor"
+        assert worker.settings.runtime_debug_enabled is True
         assert window.overlay_window.render_mode == "clean_patch"
         assert window.worker is worker
         assert window.text_detector_combo.isEnabled() is False
@@ -253,6 +255,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert window.subtitle_render_mode_combo.isEnabled() is False
         assert window.translation_stability_checkbox.isEnabled() is False
         assert window.overlay_tracking_checkbox.isEnabled() is False
+        assert window.runtime_debug_checkbox.isEnabled() is False
         assert window.overlay_tracking_mode_combo.isEnabled() is False
         assert window.stop_button.isEnabled() is True
         assert window.status_label.text() == "Synthetic worker running"
@@ -282,9 +285,26 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert window.translation_stability_checkbox.isEnabled() is True
         assert window.stop_button.isEnabled() is False
         assert window.status_label.text() == "Stopped"
+        assert window.runtime_debug_checkbox.isEnabled() is True
     finally:
         window.close()
         app.processEvents()
+
+
+def test_runtime_debug_text_formats_slowest_stage() -> None:
+    text = main_window_module.MainWindow._format_runtime_debug_text(
+        {
+            "scale_frame": 1.25,
+            "opencv_detection": 8.5,
+            "translation": 3.0,
+            "total": 14.0,
+        }
+    )
+
+    assert "total 14.0 ms" in text
+    assert "slowest opencv detect 8.5 ms" in text
+    assert "translation: 3.0 ms" in text
+    assert main_window_module.MainWindow._format_runtime_debug_text({}) == "Off"
 
 
 def test_main_window_f7_starts_hover_overlay_and_arms_hover_target(monkeypatch) -> None:

@@ -114,11 +114,19 @@ class TextDetectionPipeline:
         cursor_position: tuple[int, int] | None = None,
     ) -> FrameAnalysis:
         started = perf_counter()
+        runtime_debug_enabled = self.settings.runtime_debug_enabled
+        timings_ms: dict[str, float] = {}
+        timing_checkpoint = started
 
         detection_frame, detection_scale = self._scale_frame(frame)
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "scale_frame")
         self._active_detection_scale = detection_scale
         detection_gray = self._enhance_grayscale(detection_frame)
-        if self._full_frame_ocr_enabled():
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "enhance_grayscale")
+        full_frame_ocr_enabled = self._full_frame_ocr_enabled()
+        if full_frame_ocr_enabled:
             self._reset_scanline_state()
             self._last_hover_region_status = ""
             boxes, detection_boxes, line_mask = self._annotate_with_full_frame_ocr(
@@ -126,6 +134,8 @@ class TextDetectionPipeline:
                 frame.shape,
                 detection_scale,
             )
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "full_frame_ocr")
         elif self._translation_region_mode() == "hover":
             self._reset_scanline_state()
             detection_boxes, line_mask, working_boxes = self._hover_detection_pass(
@@ -135,6 +145,8 @@ class TextDetectionPipeline:
                 detection_scale,
                 cursor_position,
             )
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "hover_detection")
         elif self.settings.scanline_roi_enabled:
             detection_boxes, line_mask, working_boxes = self._scanline_detection_pass(
                 detection_frame,
@@ -142,6 +154,8 @@ class TextDetectionPipeline:
                 frame.shape,
                 detection_scale,
             )
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "scanline_detection")
         else:
             self._reset_scanline_state()
             self._last_hover_region_status = ""
@@ -149,43 +163,82 @@ class TextDetectionPipeline:
             line_mask = self._build_line_mask(mask)
             detection_boxes = self._detect_text_boxes(detection_frame, line_mask, mask, detection_gray)
             working_boxes = self._map_boxes_to_source_frame(detection_boxes, frame.shape, detection_scale)
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "opencv_detection")
         ocr_gray = self._source_ocr_grayscale(frame, detection_gray, detection_scale)
-        if not self._full_frame_ocr_enabled():
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "ocr_grayscale")
+        if not full_frame_ocr_enabled:
             stable_working_boxes = self._stabilize_ocr_boxes(working_boxes)
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "ocr_box_stability")
             motion_filtered_boxes = self._filter_motion_ocr_boxes(stable_working_boxes, ocr_gray)
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "motion_filter")
             boxes = self._annotate_with_ocr(motion_filtered_boxes, ocr_gray, frame.shape, 1.0)
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "ocr_annotation")
         motion_offset_x, motion_offset_y, motion_confidence = self._estimate_frame_offset(
             ocr_gray,
             1.0,
         )
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "motion_offset")
         self._current_motion_offset = (motion_offset_x, motion_offset_y, motion_confidence)
         self._current_scaled_motion_offset = self._current_motion_offset
         boxes = self._apply_translations(boxes)
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "translation")
         self._remember_ocr_translations(boxes)
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "cache_update")
         if self.settings.overlay_tracking_enabled:
             content_offset_x, content_offset_y, content_motion_confidence = self._current_motion_offset
         else:
             content_offset_x, content_offset_y, content_motion_confidence = 0.0, 0.0, 0.0
         self._previous_motion_gray = ocr_gray.copy()
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "state_update")
 
         annotated = self._draw_annotations(frame.copy(), boxes)
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "draw_annotations")
         processed_preview = self._draw_mask_preview(line_mask, detection_boxes, output_shape=frame.shape)
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "draw_mask_preview")
+        source_frame = frame.copy()
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "source_frame_copy")
+        status = self._status_message()
+        ocr_runtime = self.ocr_backend.runtime_diagnostics()
+        ocr_available = self.ocr_backend.is_available()
+        if runtime_debug_enabled:
+            timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "runtime_metadata")
 
         elapsed = max(perf_counter() - started, 1e-6)
+        if runtime_debug_enabled:
+            timings_ms["total"] = elapsed * 1000.0
         return FrameAnalysis(
             annotated_frame=annotated,
             processed_preview=processed_preview,
             boxes=boxes,
-            source_frame=frame.copy(),
-            status=self._status_message(),
-            ocr_runtime=self.ocr_backend.runtime_diagnostics(),
+            source_frame=source_frame,
+            status=status,
+            ocr_runtime=ocr_runtime,
             fps=1.0 / elapsed,
-            ocr_available=self.ocr_backend.is_available(),
+            ocr_available=ocr_available,
             monitor_label=monitor_label,
             content_offset_x=content_offset_x,
             content_offset_y=content_offset_y,
             content_motion_confidence=content_motion_confidence,
+            runtime_timings_ms=timings_ms,
         )
+
+    @staticmethod
+    def _record_runtime_timing(timings_ms: dict[str, float], checkpoint: float, stage: str) -> float:
+        now = perf_counter()
+        timings_ms[stage] = (now - checkpoint) * 1000.0
+        return now
 
     def _scale_frame(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
         scale = self._effective_detection_scale()

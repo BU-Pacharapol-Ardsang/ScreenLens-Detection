@@ -119,6 +119,8 @@ class MainWindow(QMainWindow):
         self.ocr_checkbox.setChecked(True)
         self.overlay_tracking_checkbox = QCheckBox("Track overlay while scrolling")
         self.overlay_tracking_checkbox.setChecked(False)
+        self.runtime_debug_checkbox = QCheckBox("Runtime debug timings")
+        self.runtime_debug_checkbox.setChecked(defaults.runtime_debug_enabled)
         self.overlay_tracking_mode_combo = QComboBox()
         self.ocr_device_combo = QComboBox()
 
@@ -129,6 +131,10 @@ class MainWindow(QMainWindow):
         self.recording_label = QLabel("Off")
         self.ocr_runtime_label = QLabel("Not running")
         self.ocr_runtime_label.setWordWrap(True)
+        self.runtime_debug_label = QLabel("Off")
+        self.runtime_debug_label.setWordWrap(True)
+        self.runtime_debug_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.runtime_debug_label.setStyleSheet("QLabel { font-family: Consolas, monospace; }")
 
         self.preview_label = self._create_image_label("Annotated preview")
         self.mask_label = self._create_image_label("Segmentation preview")
@@ -187,6 +193,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("OCR device", self.ocr_device_combo)
         settings_layout.addRow("", self.ocr_checkbox)
         settings_layout.addRow("", self.overlay_tracking_checkbox)
+        settings_layout.addRow("", self.runtime_debug_checkbox)
         settings_layout.addRow("Overlay tracking", self.overlay_tracking_mode_combo)
 
         stats_box = QGroupBox("Runtime Stats")
@@ -197,6 +204,7 @@ class MainWindow(QMainWindow):
         stats_layout.addRow("Status", self.status_label)
         stats_layout.addRow("Recording", self.recording_label)
         stats_layout.addRow("OCR runtime", self.ocr_runtime_label)
+        stats_layout.addRow("Pipeline debug", self.runtime_debug_label)
 
         top_row = QHBoxLayout()
         top_row.addWidget(controls, 3)
@@ -246,6 +254,7 @@ class MainWindow(QMainWindow):
         self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
         self.overlay_tracking_checkbox.setEnabled(not locked)
+        self.runtime_debug_checkbox.setEnabled(not locked)
         self.overlay_tracking_mode_combo.setEnabled(not locked)
 
     def _populate_ocr_backend_control(self) -> None:
@@ -317,11 +326,13 @@ class MainWindow(QMainWindow):
         if not self.monitors:
             self._set_base_status("No monitors detected")
             self.ocr_runtime_label.setText("Not running")
+            self.runtime_debug_label.setText("Off")
             self.start_button.setEnabled(False)
             return
 
         self._set_base_status("Ready")
         self.ocr_runtime_label.setText("Not running")
+        self.runtime_debug_label.setText("Off")
         self.start_button.setEnabled(True)
 
     def _start_worker(self) -> None:
@@ -354,6 +365,7 @@ class MainWindow(QMainWindow):
             ocr_language=resolve_ocr_language(self.source_language_combo.currentData()),
             overlay_tracking_enabled=self.overlay_tracking_checkbox.isChecked(),
             overlay_tracking_mode=self.overlay_tracking_mode_combo.currentData(),
+            runtime_debug_enabled=self.runtime_debug_checkbox.isChecked(),
         )
 
         self._apply_overlay_render_options(settings)
@@ -365,6 +377,7 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._on_worker_finished)
         self._set_base_status("Starting OCR/translation...")
         self.ocr_runtime_label.setText("Starting...")
+        self.runtime_debug_label.setText("Waiting for first frame..." if settings.runtime_debug_enabled else "Off")
         self._set_runtime_controls_locked(True)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -404,10 +417,12 @@ class MainWindow(QMainWindow):
         if self._base_status != "Error":
             self._set_base_status("Stopped")
         self.ocr_runtime_label.setText("Stopped")
+        self.runtime_debug_label.setText("Off")
 
     def _handle_error(self, message: str) -> None:
         self._set_base_status("Error")
         self.ocr_runtime_label.setText("Error")
+        self.runtime_debug_label.setText("Error")
         QMessageBox.critical(self, "ScreenLens-Detection", message)
         self._stop_worker()
 
@@ -436,6 +451,7 @@ class MainWindow(QMainWindow):
         self.monitor_label.setText(analysis.monitor_label or "-")
         self._set_base_status(analysis.status)
         self.ocr_runtime_label.setText(analysis.ocr_runtime or "Unavailable")
+        self.runtime_debug_label.setText(self._format_runtime_debug_text(analysis.runtime_timings_ms))
 
         if self.overlay_active:
             self.overlay_window.update_analysis(analysis)
@@ -695,6 +711,50 @@ class MainWindow(QMainWindow):
 
     def _update_ocr_boxes_label(self, value: int) -> None:
         self.ocr_boxes_value_label.setText(str(value))
+
+    @staticmethod
+    def _format_runtime_debug_text(timings_ms: dict[str, float]) -> str:
+        if not timings_ms:
+            return "Off"
+
+        total_ms = timings_ms.get("total")
+        stage_items = [(stage, value) for stage, value in timings_ms.items() if stage != "total"]
+        slowest_stage, slowest_ms = max(stage_items, key=lambda item: item[1], default=("total", total_ms or 0.0))
+
+        header_parts = []
+        if total_ms is not None:
+            header_parts.append(f"total {total_ms:.1f} ms")
+        header_parts.append(f"slowest {MainWindow._runtime_stage_label(slowest_stage)} {slowest_ms:.1f} ms")
+
+        lines = [" | ".join(header_parts)]
+        for stage, value in stage_items:
+            lines.append(f"{MainWindow._runtime_stage_label(stage)}: {value:.1f} ms")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _runtime_stage_label(stage: str) -> str:
+        labels = {
+            "scale_frame": "scale",
+            "enhance_grayscale": "enhance",
+            "full_frame_ocr": "full OCR",
+            "hover_detection": "hover detect",
+            "scanline_detection": "scanline detect",
+            "opencv_detection": "opencv detect",
+            "ocr_grayscale": "OCR gray",
+            "ocr_box_stability": "OCR stability",
+            "motion_filter": "motion filter",
+            "ocr_annotation": "OCR",
+            "motion_offset": "motion offset",
+            "translation": "translation",
+            "cache_update": "cache",
+            "state_update": "state",
+            "draw_annotations": "draw boxes",
+            "draw_mask_preview": "draw mask",
+            "source_frame_copy": "source copy",
+            "runtime_metadata": "metadata",
+            "total": "total",
+        }
+        return labels.get(stage, stage.replace("_", " "))
 
     @staticmethod
     def _translated_preview_frame(
