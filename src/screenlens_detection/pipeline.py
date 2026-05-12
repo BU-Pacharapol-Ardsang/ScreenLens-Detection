@@ -159,12 +159,13 @@ class TextDetectionPipeline:
         else:
             self._reset_scanline_state()
             self._last_hover_region_status = ""
-            mask = self._build_text_mask(detection_frame, detection_gray)
-            line_mask = self._build_line_mask(mask)
-            detection_boxes = self._detect_text_boxes(detection_frame, line_mask, mask, detection_gray)
+            detection_boxes, line_mask, detection_stage = self._text_detection_pass(
+                detection_frame,
+                detection_gray,
+            )
             working_boxes = self._map_boxes_to_source_frame(detection_boxes, frame.shape, detection_scale)
             if runtime_debug_enabled:
-                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "opencv_detection")
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, detection_stage)
         ocr_gray = self._source_ocr_grayscale(frame, detection_gray, detection_scale)
         if runtime_debug_enabled:
             timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "ocr_grayscale")
@@ -335,13 +336,8 @@ class TextDetectionPipeline:
         )
         roi_frame = detection_frame[scan_top:scan_bottom, :]
         roi_gray = detection_gray[scan_top:scan_bottom, :]
-        mask_roi = self._build_text_mask(roi_frame, roi_gray)
-        line_mask_roi = self._build_line_mask(mask_roi)
-
-        roi_boxes = self._detect_text_boxes(
+        roi_boxes, line_mask_roi, _detection_stage = self._text_detection_pass(
             roi_frame,
-            line_mask_roi,
-            mask_roi,
             roi_gray,
             filter_frame_shape=detection_frame.shape,
         )
@@ -474,12 +470,8 @@ class TextDetectionPipeline:
 
         roi_frame = detection_frame[detection_top:detection_bottom, detection_left:detection_right]
         roi_gray = detection_gray[detection_top:detection_bottom, detection_left:detection_right]
-        mask_roi = self._build_text_mask(roi_frame, roi_gray)
-        line_mask_roi = self._build_line_mask(mask_roi)
-        roi_boxes = self._detect_text_boxes(
+        roi_boxes, line_mask_roi, _detection_stage = self._text_detection_pass(
             roi_frame,
-            line_mask_roi,
-            mask_roi,
             roi_gray,
             filter_frame_shape=detection_frame.shape,
         )
@@ -871,26 +863,39 @@ class TextDetectionPipeline:
             keep_values[component_index] = 255
         return keep_values[labels]
 
-    def _detect_text_boxes(
+    def _text_detection_pass(
         self,
         scaled_frame: np.ndarray,
-        line_mask: np.ndarray,
-        text_mask: np.ndarray,
         enhanced_gray: np.ndarray,
         *,
         filter_frame_shape: tuple[int, int, int] | None = None,
-    ) -> list[tuple[int, int, int, int]]:
+    ) -> tuple[list[tuple[int, int, int, int]], np.ndarray, str]:
         threshold_shape = filter_frame_shape if filter_frame_shape is not None else scaled_frame.shape
         mode = normalize_text_detector_mode(self.settings.text_detector_mode)
         if mode == "opencv":
-            return self._extract_text_boxes(line_mask, text_mask, enhanced_gray, threshold_shape)
+            text_mask = self._build_text_mask(scaled_frame, enhanced_gray)
+            line_mask = self._build_line_mask(text_mask)
+            boxes = self._extract_text_boxes(line_mask, text_mask, enhanced_gray, threshold_shape)
+            return boxes, line_mask, "opencv_detection"
 
         detector = self._ensure_deep_text_detector(mode)
         if not detector.is_available():
-            return []
+            return [], np.zeros_like(enhanced_gray), "deep_text_detection"
 
         detected_boxes = detector.detect(scaled_frame)
-        return self._filter_detector_boxes(detected_boxes, threshold_shape)
+        boxes = self._filter_detector_boxes(detected_boxes, threshold_shape)
+        line_mask = self._mask_from_boxes(enhanced_gray.shape, boxes)
+        return boxes, line_mask, "deep_text_detection"
+
+    @staticmethod
+    def _mask_from_boxes(
+        shape: tuple[int, int],
+        boxes: list[tuple[int, int, int, int]],
+    ) -> np.ndarray:
+        mask = np.zeros(shape, dtype=np.uint8)
+        for x, y, w, h in boxes:
+            cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
+        return mask
 
     def _ensure_deep_text_detector(self, mode: str) -> TextDetectorBackend:
         if self._deep_text_detector is None:

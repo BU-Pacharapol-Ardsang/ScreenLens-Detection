@@ -740,6 +740,7 @@ class MainWindow(QMainWindow):
             "hover_detection": "hover detect",
             "scanline_detection": "scanline detect",
             "opencv_detection": "opencv detect",
+            "deep_text_detection": "deep detect",
             "ocr_grayscale": "OCR gray",
             "ocr_box_stability": "OCR stability",
             "motion_filter": "motion filter",

@@ -78,6 +78,48 @@ def test_pipeline_runtime_debug_timings_are_opt_in() -> None:
     assert "ocr_annotation" in enabled.runtime_timings_ms
 
 
+def test_deep_text_detector_bypasses_opencv_mask_build(monkeypatch) -> None:
+    canvas = np.full((180, 420, 3), 255, dtype=np.uint8)
+
+    class FakeDeepDetector:
+        def is_available(self) -> bool:
+            return True
+
+        def describe(self) -> str:
+            return "Fake deep detector"
+
+        def detect(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
+            assert frame.shape == canvas.shape
+            return [(30, 60, 170, 28)]
+
+    monkeypatch.setattr(
+        "screenlens_detection.pipeline.create_deep_text_detector_backend",
+        lambda _mode, **_kwargs: FakeDeepDetector(),
+    )
+
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            text_detector_mode="easyocr",
+            ocr_enabled=False,
+            runtime_debug_enabled=True,
+        ),
+        NoOpOCRBackend(),
+        NoOpTranslationBackend(),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_build_text_mask",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("OpenCV mask should not run")),
+    )
+
+    analysis = pipeline.process(canvas, monitor_label="deep-detector-test")
+
+    assert "deep_text_detection" in analysis.runtime_timings_ms
+    assert "opencv_detection" not in analysis.runtime_timings_ms
+    assert [(box.x, box.y, box.w, box.h) for box in analysis.boxes] == [(30, 60, 170, 28)]
+    assert analysis.processed_preview[70, 40].any()
+
+
 def test_pipeline_detects_document_lines_without_merging_whole_paragraph() -> None:
     canvas = np.full((720, 1280, 3), 255, dtype=np.uint8)
     cv2.rectangle(canvas, (0, 0), (1280, 90), (42, 42, 42), -1)
