@@ -1,8 +1,21 @@
+import threading
+import sys
+import types
 from pathlib import Path
+from time import sleep
 
 import numpy as np
 
-from screenlens_detection.ocr import EasyOCRBackend, TesseractOCRBackend
+from screenlens_detection.ocr import (
+    EasyOCRBackend,
+    OCRBackend,
+    OCRFrameResult,
+    OCRResult,
+    QueuedOCRBackend,
+    RapidOCRFullBackend,
+    TesseractOCRBackend,
+    normalize_ocr_backend_mode,
+)
 
 
 def test_resolve_binary_prefers_runtime_bundle(monkeypatch, tmp_path: Path) -> None:
@@ -115,3 +128,197 @@ def test_easyocr_backend_batches_pre_detected_crops(monkeypatch) -> None:
     assert FakeReader.recognize_calls == [
         ((38, 30), 2, False, [[0, 30, 0, 10], [0, 20, 26, 38]])
     ]
+
+
+def test_normalize_ocr_backend_mode_accepts_aliases() -> None:
+    assert normalize_ocr_backend_mode("rapid") == "rapidocr"
+    assert normalize_ocr_backend_mode("off") == "disabled"
+    assert normalize_ocr_backend_mode("missing") == "auto"
+
+
+def test_rapidocr_full_backend_reads_modern_output(monkeypatch) -> None:
+    class FakeEnum:
+        ONNXRUNTIME = "onnxruntime"
+        EN = "en"
+        MULTI = "multi"
+        MOBILE = "mobile"
+        PPOCRV4 = "PP-OCRv4"
+
+    class FakeRapidOCR:
+        init_params: list[dict[str, object]] = []
+        calls: list[tuple[tuple[int, ...], bool, bool, bool]] = []
+
+        def __init__(self, *, params: dict[str, object]) -> None:
+            self.init_params.append(params)
+
+        def __call__(self, image: np.ndarray, *, use_det: bool, use_cls: bool, use_rec: bool):
+            self.calls.append((image.shape, use_det, use_cls, use_rec))
+            return types.SimpleNamespace(
+                boxes=np.asarray(
+                    [
+                        [[10, 20], [80, 20], [80, 44], [10, 44]],
+                        [[3, 5], [20, 5], [20, 16], [3, 16]],
+                    ],
+                    dtype=np.float32,
+                ),
+                txts=("Hello", " "),
+                scores=(0.91, 0.2),
+            )
+
+    fake_module = types.SimpleNamespace(
+        EngineType=FakeEnum,
+        LangDet=FakeEnum,
+        LangRec=FakeEnum,
+        ModelType=FakeEnum,
+        OCRVersion=FakeEnum,
+        RapidOCR=FakeRapidOCR,
+    )
+    monkeypatch.setitem(sys.modules, "rapidocr", fake_module)
+    monkeypatch.setattr("screenlens_detection.ocr._rapidocr_onnx_cuda_available", lambda _device: False)
+
+    backend = RapidOCRFullBackend(language="eng", device_preference="cpu")
+    results = backend.recognize_frame(np.zeros((60, 120, 3), dtype=np.uint8), language="eng")
+
+    assert backend.supports_full_frame() is True
+    assert results == [OCRFrameResult(rect=(10, 20, 70, 24), text="Hello", confidence=91.0)]
+    assert FakeRapidOCR.init_params[0]["Global.use_rec"] is True
+    assert FakeRapidOCR.init_params[0]["Rec.lang_type"] == "en"
+    assert FakeRapidOCR.calls == [((60, 120, 3), True, False, True)]
+
+
+class RecordingOCRBackend(OCRBackend):
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str, list[int]]] = []
+        self.closed = False
+
+    def is_available(self) -> bool:
+        return True
+
+    def recognize_batch(self, images: list[object], *, language: str, psms: list[int]) -> list[OCRResult]:
+        self.calls.append((len(images), language, list(psms)))
+        return [
+            OCRResult(text=f"text {index}", confidence=95.0)
+            for index, _image in enumerate(images, start=1)
+        ]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_queued_ocr_backend_returns_cached_results_after_background_batch() -> None:
+    backend = RecordingOCRBackend()
+    queued = QueuedOCRBackend(backend, max_batch_size=8, synchronous_batch_size=0)
+
+    try:
+        image = np.full((16, 64), 255, dtype=np.uint8)
+        first = queued.recognize_batch([image], language="eng", psms=[7])
+
+        resolved = []
+        for _attempt in range(20):
+            resolved = queued.recognize_batch([image], language="eng", psms=[7])
+            if resolved[0].text:
+                break
+            sleep(0.05)
+
+        assert first == [OCRResult()]
+        assert resolved == [OCRResult(text="text 1", confidence=95.0)]
+        assert backend.calls == [(1, "eng", [7])]
+    finally:
+        queued.close()
+
+    assert backend.closed is True
+
+
+def test_queued_ocr_backend_processes_small_batches_synchronously() -> None:
+    backend = RecordingOCRBackend()
+    queued = QueuedOCRBackend(backend, max_batch_size=8, synchronous_batch_size=2)
+
+    try:
+        images = [
+            np.full((16, 64), 255, dtype=np.uint8),
+            np.full((18, 72), 255, dtype=np.uint8),
+        ]
+
+        result = queued.recognize_batch(images, language="eng", psms=[7, 7])
+
+        assert result == [
+            OCRResult(text="text 1", confidence=95.0),
+            OCRResult(text="text 2", confidence=95.0),
+        ]
+        assert backend.calls == [(2, "eng", [7, 7])]
+    finally:
+        queued.close()
+
+
+def test_queued_ocr_backend_processes_priority_subset_synchronously() -> None:
+    backend = RecordingOCRBackend()
+    queued = QueuedOCRBackend(backend, max_batch_size=8, synchronous_batch_size=2)
+
+    try:
+        images = [
+            np.full((12, 24), 255, dtype=np.uint8),
+            np.full((32, 240), 255, dtype=np.uint8),
+            np.full((20, 160), 255, dtype=np.uint8),
+        ]
+
+        result = queued.recognize_batch(images, language="eng", psms=[7, 7, 7])
+
+        assert result[0] == OCRResult()
+        assert result[1] == OCRResult(text="text 1", confidence=95.0)
+        assert result[2] == OCRResult(text="text 2", confidence=95.0)
+        assert backend.calls[0] == (2, "eng", [7, 7])
+    finally:
+        queued.close()
+
+
+def test_queued_ocr_backend_reports_configured_worker_count() -> None:
+    backend = RecordingOCRBackend()
+    queued = QueuedOCRBackend(backend, max_batch_size=8, synchronous_batch_size=0, worker_count=2)
+
+    try:
+        assert "async OCR queue, 2 workers" in queued.runtime_diagnostics()
+    finally:
+        queued.close()
+
+
+def test_tesseract_backend_recognizes_batch_in_parallel() -> None:
+    class ParallelTesseractBackend(TesseractOCRBackend):
+        def __init__(self) -> None:
+            self._binary = "tesseract.exe"
+            self._tessdata_dir = None
+            self._available_languages = {"eng"}
+            self._max_workers = 2
+            self._executor = None
+            self._executor_worker_count = 0
+            self._executor_lock = threading.Lock()
+            self.barrier = threading.Barrier(2)
+            self.thread_ids: set[int] = set()
+
+        def is_available(self) -> bool:
+            return True
+
+        def _build_candidates(self, image: np.ndarray) -> list[np.ndarray]:
+            return [image]
+
+        def _recognize_candidate(self, image: np.ndarray, *, language: str, config: str) -> OCRResult:
+            self.thread_ids.add(threading.get_ident())
+            self.barrier.wait(timeout=1.0)
+            return OCRResult(text=str(int(image[0, 0])), confidence=90.0)
+
+    backend = ParallelTesseractBackend()
+    try:
+        results = backend.recognize_batch(
+            [
+                np.full((8, 8), 1, dtype=np.uint8),
+                np.full((8, 8), 2, dtype=np.uint8),
+            ],
+            language="eng",
+            psms=[7, 7],
+        )
+
+        assert [result.text for result in results] == ["1", "2"]
+        assert len(backend.thread_ids) == 2
+    finally:
+        backend.close()

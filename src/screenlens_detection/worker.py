@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from queue import Empty, Full, Queue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import perf_counter
 
 from PySide6.QtCore import QThread, Signal
 
 from .capture import ScreenCapturer
+from .cursor import monitor_relative_cursor_position
 from .models import MonitorSpec, PipelineSettings
 from .ocr import create_default_ocr_backend
 from .pipeline import TextDetectionPipeline
@@ -45,6 +46,10 @@ class ProcessingWorker(QThread):
         self._running = False
         self._smoothed_fps = 0.0
         self._stop_event: Event | None = None
+        self._hover_lock = Lock()
+        self._hover_candidate_position: tuple[int, int] | None = None
+        self._hover_candidate_started_at: float | None = None
+        self._confirmed_hover_position: tuple[int, int] | None = None
 
     def run(self) -> None:
         self._running = True
@@ -53,7 +58,11 @@ class ProcessingWorker(QThread):
         frame_queue = _LatestFrameQueue()
         pipeline = TextDetectionPipeline(
             self.settings,
-            create_default_ocr_backend(device_preference=self.settings.ocr_device_preference),
+            create_default_ocr_backend(
+                mode=self.settings.ocr_backend_mode,
+                device_preference=self.settings.ocr_device_preference,
+                language=self.settings.ocr_language,
+            ),
             create_default_translation_backend(mode=self.settings.translation_mode),
         )
         capture_thread = Thread(
@@ -72,7 +81,11 @@ class ProcessingWorker(QThread):
                     continue
 
                 loop_started = perf_counter()
-                analysis = pipeline.process(frame, monitor_label=self.monitor.label)
+                analysis = pipeline.process(
+                    frame,
+                    monitor_label=self.monitor.label,
+                    cursor_position=self._hover_cursor_position(),
+                )
                 analysis.fps = self._calculate_runtime_fps(loop_started)
                 self.frame_ready.emit(analysis)
         except Exception as exc:  # pragma: no cover - UI thread handles emitted errors
@@ -106,6 +119,72 @@ class ProcessingWorker(QThread):
         if self._stop_event is not None:
             self._stop_event.set()
         self.wait(2000)
+
+    def set_translation_region_mode(self, mode: str) -> None:
+        normalized = (mode or "full").casefold().strip()
+        if normalized in {"hover", "cursor", "hover_region"}:
+            self.settings.translation_region_mode = "hover"
+            return
+
+        self.settings.translation_region_mode = "full"
+        self.reset_hover_target()
+
+    def reset_hover_target(self) -> None:
+        with self._hover_lock:
+            self._reset_hover_target_locked()
+
+    def hover_target_confirmed(self) -> bool:
+        with self._hover_lock:
+            return self._confirmed_hover_position is not None
+
+    def _reset_hover_target_locked(self) -> None:
+        self._hover_candidate_position = None
+        self._hover_candidate_started_at = None
+        self._confirmed_hover_position = None
+
+    def _hover_cursor_position(self) -> tuple[int, int] | None:
+        if (self.settings.translation_region_mode or "full").casefold().strip() != "hover":
+            self.reset_hover_target()
+            return None
+
+        position = monitor_relative_cursor_position(self.monitor)
+        with self._hover_lock:
+            return self._confirmed_hover_position_locked(position, perf_counter())
+
+    def _confirmed_hover_position_locked(
+        self,
+        position: tuple[int, int] | None,
+        now: float,
+    ) -> tuple[int, int] | None:
+        if position is None:
+            self._reset_hover_target_locked()
+            return None
+
+        tolerance = max(int(self.settings.hover_move_tolerance), 1)
+        if (
+            self._hover_candidate_position is None
+            or self._cursor_distance(position, self._hover_candidate_position) > tolerance
+        ):
+            self._hover_candidate_position = position
+            self._hover_candidate_started_at = now
+            self._confirmed_hover_position = None
+            return None
+
+        dwell_seconds = max(self.settings.hover_dwell_ms, 0) / 1000.0
+        if self._hover_candidate_started_at is None:
+            self._hover_candidate_started_at = now
+            return None
+
+        if now - self._hover_candidate_started_at >= dwell_seconds:
+            self._confirmed_hover_position = self._hover_candidate_position
+
+        return self._confirmed_hover_position
+
+    @staticmethod
+    def _cursor_distance(first: tuple[int, int], second: tuple[int, int]) -> float:
+        dx = first[0] - second[0]
+        dy = first[1] - second[1]
+        return float((dx * dx + dy * dy) ** 0.5)
 
     def _calculate_runtime_fps(self, loop_started: float) -> float:
         processing_elapsed = perf_counter() - loop_started

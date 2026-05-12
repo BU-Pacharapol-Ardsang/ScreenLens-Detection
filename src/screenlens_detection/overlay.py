@@ -5,11 +5,12 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 from PySide6.QtCore import QRect, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .models import DetectionBox, FrameAnalysis, MonitorSpec
 from .overlay_tracks import OverlayBox, OverlayTrackManager
+from .subtitle_cleaner import CleanPatch, clean_patch_for_box, normalize_subtitle_render_mode
 from .windows_capture_exclusion import set_window_capture_exclusion
 
 
@@ -34,6 +35,14 @@ class _VisualAnchor:
     last_box: OverlayBox
     missing_frames: int = 0
     confidence: float = 1.0
+
+
+@dataclass(slots=True, frozen=True)
+class _OverlayPaintItem:
+    box: OverlayBox
+    anchor_rect: QRect
+    bubble_rect: QRect
+    clean_rect: QRect | None = None
 
 
 def overlay_text_for_box(box: DetectionBox) -> str:
@@ -89,6 +98,14 @@ class TranslationOverlay(QWidget):
         self._monitor: MonitorSpec | None = None
         self._overlay_boxes: list[OverlayBox] = []
         self._capture_exclusion_applied = False
+        self._subtitle_render_mode = "bubble"
+        self._latest_source_frame: np.ndarray | None = None
+        self._source_frame_generation = 0
+        self._clean_patch_cache: dict[tuple[int, ...], CleanPatch | None] = {}
+        self._clean_patch_padding_px = 8
+        self._clean_patch_mask_dilate_px = 4
+        self._clean_patch_inpaint_radius = 3
+        self._clean_patch_max_crop_area = 120_000
         self._tracking_enabled = False
         self._tracking_mode = "legacy"
         self._realtime_tracking_active = False
@@ -122,6 +139,48 @@ class TranslationOverlay(QWidget):
         self._track_manager.clear()
         self._overlay_boxes = []
         self._visual_anchors = []
+        self._latest_source_frame = None
+        self._clean_patch_cache = {}
+        self.update()
+
+    def set_render_mode(self, mode: str | None) -> None:
+        normalized = normalize_subtitle_render_mode(mode)
+        if normalized == self._subtitle_render_mode:
+            return
+        self._subtitle_render_mode = normalized
+        self._clean_patch_cache = {}
+        self.update()
+
+    def set_clean_patch_options(
+        self,
+        *,
+        padding_px: int,
+        mask_dilate_px: int,
+        inpaint_radius: int,
+        max_crop_area: int,
+    ) -> None:
+        next_options = (
+            max(int(padding_px), 0),
+            max(int(mask_dilate_px), 0),
+            max(int(inpaint_radius), 1),
+            max(int(max_crop_area), 1),
+        )
+        current_options = (
+            self._clean_patch_padding_px,
+            self._clean_patch_mask_dilate_px,
+            self._clean_patch_inpaint_radius,
+            self._clean_patch_max_crop_area,
+        )
+        if next_options == current_options:
+            return
+
+        (
+            self._clean_patch_padding_px,
+            self._clean_patch_mask_dilate_px,
+            self._clean_patch_inpaint_radius,
+            self._clean_patch_max_crop_area,
+        ) = next_options
+        self._clean_patch_cache = {}
         self.update()
 
     def set_tracking_mode(self, mode: str | None) -> None:
@@ -1140,6 +1199,7 @@ class TranslationOverlay(QWidget):
         return tracked
 
     def update_analysis(self, analysis: FrameAnalysis) -> None:
+        self._update_source_frame(analysis.source_frame)
         current_boxes = [
             OverlayBox(
                 box.x,
@@ -1169,6 +1229,18 @@ class TranslationOverlay(QWidget):
             self._track_manager.clear()
             self._overlay_boxes = []
         self.update()
+
+    def _update_source_frame(self, frame: object | None) -> None:
+        if frame is None:
+            return
+
+        source = np.asarray(frame)
+        if source.ndim != 3 or source.shape[2] != 3:
+            return
+
+        self._latest_source_frame = np.ascontiguousarray(source).copy()
+        self._source_frame_generation += 1
+        self._clean_patch_cache = {}
 
     def _predict_tracked_boxes(self, analysis: FrameAnalysis) -> list[OverlayBox]:
         if not self._overlay_boxes:
@@ -1222,8 +1294,10 @@ class TranslationOverlay(QWidget):
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        frame_width = max(self._monitor.width, 1)
-        frame_height = max(self._monitor.height, 1)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        frame_width, frame_height = self._coordinate_frame_size()
+        clean_mode = self._subtitle_render_mode == "clean_patch"
+        items: list[_OverlayPaintItem] = []
 
         for box in self._overlay_boxes:
             scaled = scale_overlay_rect(
@@ -1233,12 +1307,235 @@ class TranslationOverlay(QWidget):
                 frame_width=frame_width,
                 frame_height=frame_height,
             )
-            self._paint_box(painter, QRect(*scaled), box.text)
+            anchor_rect = QRect(*scaled)
+            bubble_rect = self._expanded_bubble_rect(
+                anchor_rect,
+                box.text,
+                bounds_width=max(self.width(), 1),
+                bounds_height=max(self.height(), 1),
+            )
+            clean_rect = None
+            if clean_mode and box.translated:
+                clean_rect = self._clean_patch_overlay_rect(
+                    box,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                )
+                if clean_rect is None:
+                    clean_rect = self._fallback_clean_text_rect(
+                        anchor_rect,
+                        bounds_width=max(self.width(), 1),
+                        bounds_height=max(self.height(), 1),
+                    )
+            items.append(_OverlayPaintItem(box, anchor_rect, bubble_rect, clean_rect))
 
-    def _paint_box(self, painter: QPainter, rect: QRect, text: str) -> None:
+        if clean_mode:
+            clean_items = self._clean_patch_display_items(items)
+            for item in clean_items:
+                self._paint_clean_patch(painter, item.box, frame_width=frame_width, frame_height=frame_height)
+
+            for item in clean_items:
+                self._paint_clean_text(
+                    painter,
+                    item.clean_rect or item.anchor_rect,
+                    item.box.text,
+                    anchor_height=item.anchor_rect.height(),
+                )
+            return
+
+        for item in items:
+            self._paint_box(painter, item.bubble_rect, item.box.text, anchor_height=item.anchor_rect.height())
+
+    def _coordinate_frame_size(self) -> tuple[int, int]:
+        if self._latest_source_frame is not None:
+            height, width = self._latest_source_frame.shape[:2]
+            if width > 0 and height > 0:
+                return width, height
+        if self._monitor is not None:
+            return max(self._monitor.width, 1), max(self._monitor.height, 1)
+        return max(self.width(), 1), max(self.height(), 1)
+
+    def _paint_clean_patch(
+        self,
+        painter: QPainter,
+        box: OverlayBox,
+        *,
+        frame_width: int,
+        frame_height: int,
+    ) -> bool:
+        patch = self._clean_patch_for_overlay_box(box)
+        if patch is None:
+            return False
+
+        patch_rect = self._clean_patch_overlay_rect(
+            box,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        if patch_rect is None or patch_rect.width() <= 0 or patch_rect.height() <= 0:
+            return False
+
+        painter.drawImage(patch_rect, self._bgr_to_qimage(patch.image))
+        return True
+
+    def _clean_patch_overlay_rect(
+        self,
+        box: OverlayBox,
+        *,
+        frame_width: int,
+        frame_height: int,
+    ) -> QRect | None:
+        patch = self._clean_patch_for_overlay_box(box)
+        if patch is None:
+            return None
+
+        scaled = scale_overlay_rect(
+            DetectionBox(
+                x=patch.rect[0],
+                y=patch.rect[1],
+                w=patch.rect[2],
+                h=patch.rect[3],
+            ),
+            overlay_width=max(self.width(), 1),
+            overlay_height=max(self.height(), 1),
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        if scaled[2] <= 0 or scaled[3] <= 0:
+            return None
+        return QRect(*scaled)
+
+    def _clean_patch_for_overlay_box(self, box: OverlayBox) -> CleanPatch | None:
+        if self._latest_source_frame is None:
+            return None
+
+        key = (
+            self._source_frame_generation,
+            box.x,
+            box.y,
+            box.w,
+            box.h,
+            self._clean_patch_padding_px,
+            self._clean_patch_mask_dilate_px,
+            self._clean_patch_inpaint_radius,
+            self._clean_patch_max_crop_area,
+        )
+        if key not in self._clean_patch_cache:
+            if len(self._clean_patch_cache) > 64:
+                self._clean_patch_cache = {}
+            self._clean_patch_cache[key] = clean_patch_for_box(
+                self._latest_source_frame,
+                (box.x, box.y, box.w, box.h),
+                padding_px=self._clean_patch_padding_px,
+                mask_dilate_px=self._clean_patch_mask_dilate_px,
+                inpaint_radius=self._clean_patch_inpaint_radius,
+                max_crop_area=self._clean_patch_max_crop_area,
+            )
+
+        return self._clean_patch_cache[key]
+
+    def _clean_patch_display_items(self, items: list[_OverlayPaintItem]) -> list[_OverlayPaintItem]:
+        candidates = [item for item in items if self._is_clean_patch_display_candidate(item)]
+        candidates.sort(key=self._clean_patch_display_priority, reverse=True)
+
+        kept: list[_OverlayPaintItem] = []
+        for item in candidates:
+            if any(self._clean_patch_items_overlap_too_much(item, existing) for existing in kept):
+                continue
+            kept.append(item)
+
+        kept.sort(key=lambda item: (item.anchor_rect.y(), item.anchor_rect.x()))
+        return kept
+
+    @staticmethod
+    def _is_clean_patch_display_candidate(item: _OverlayPaintItem) -> bool:
+        box = item.box
+        if not box.translated:
+            return False
+
+        text = " ".join(box.text.split())
+        if not text:
+            return False
+
+        width = item.anchor_rect.width()
+        height = item.anchor_rect.height()
+        area = max(width * height, 1)
+        if width < 18 or height < 8:
+            return False
+        if area < 420 and len(text) < 18:
+            return False
+
+        alpha_count = sum(character.isalpha() for character in text)
+        digit_count = sum(character.isdigit() for character in text)
+        if alpha_count == 0 and digit_count >= max(len(text) // 2, 1):
+            return False
+        if len(text) <= 3 and area < 1800:
+            return False
+
+        return True
+
+    @staticmethod
+    def _clean_patch_display_priority(item: _OverlayPaintItem) -> float:
+        text = " ".join(item.box.text.split())
+        area = max(item.anchor_rect.width() * item.anchor_rect.height(), 1)
+        score = min(len(text) * 2.2, 120.0) + min(area / 1200.0, 90.0)
+        if item.clean_rect is not None:
+            score += min(item.clean_rect.width() * item.clean_rect.height() / 4000.0, 25.0)
+        if len(text) <= 3:
+            score -= 70.0
+        if item.box.missing_frames:
+            score -= item.box.missing_frames * 20.0
+        return score
+
+    @classmethod
+    def _clean_patch_items_overlap_too_much(
+        cls,
+        item: _OverlayPaintItem,
+        existing: _OverlayPaintItem,
+    ) -> bool:
+        anchor_overlap = cls._qrect_smaller_overlap_ratio(item.anchor_rect, existing.anchor_rect)
+        if anchor_overlap >= 0.82:
+            return True
+
+        item_clean = item.clean_rect or item.anchor_rect
+        existing_clean = existing.clean_rect or existing.anchor_rect
+        clean_overlap = cls._qrect_smaller_overlap_ratio(item_clean, existing_clean)
+        return clean_overlap >= 0.72
+
+    @staticmethod
+    def _qrect_smaller_overlap_ratio(first: QRect, second: QRect) -> float:
+        left = max(first.left(), second.left())
+        top = max(first.top(), second.top())
+        right = min(first.right(), second.right())
+        bottom = min(first.bottom(), second.bottom())
+        intersection = max(right - left + 1, 0) * max(bottom - top + 1, 0)
+        if intersection <= 0:
+            return 0.0
+
+        first_area = max(first.width() * first.height(), 1)
+        second_area = max(second.width() * second.height(), 1)
+        return intersection / max(min(first_area, second_area), 1)
+
+    @staticmethod
+    def _fallback_clean_text_rect(
+        anchor_rect: QRect,
+        *,
+        bounds_width: int,
+        bounds_height: int,
+    ) -> QRect:
+        pad_x = max(min(anchor_rect.height() // 3, 14), 3)
+        pad_y = max(min(anchor_rect.height() // 4, 10), 2)
+        left = max(anchor_rect.x() - pad_x, 0)
+        top = max(anchor_rect.y() - pad_y, 0)
+        right = min(anchor_rect.right() + pad_x, max(bounds_width - 1, 0))
+        bottom = min(anchor_rect.bottom() + pad_y, max(bounds_height - 1, 0))
+        return QRect(left, top, max(right - left + 1, 1), max(bottom - top + 1, 1))
+
+    def _paint_box(self, painter: QPainter, rect: QRect, text: str, *, anchor_height: int | None = None) -> None:
         accent = QColor(48, 231, 149, 220)
         background = QColor(15, 23, 42, 212)
         text_color = QColor(248, 250, 252)
+        font_anchor_height = rect.height() if anchor_height is None else anchor_height
 
         bubble_rect = rect.adjusted(0, 0, -1, -1)
         radius = max(min(rect.height() // 4, 8), 2)
@@ -1262,7 +1559,7 @@ class TranslationOverlay(QWidget):
         if text_rect.width() <= 0 or text_rect.height() <= 0:
             text_rect = bubble_rect
 
-        font = self._font_for_text(text, text_rect, overlay_font_pixel_size(rect.height()))
+        font = self._font_for_text(text, text_rect, overlay_font_pixel_size(font_anchor_height))
         painter.setFont(font)
         painter.setPen(text_color)
         painter.drawText(
@@ -1270,6 +1567,88 @@ class TranslationOverlay(QWidget):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap,
             text,
         )
+
+    def _paint_clean_text(
+        self,
+        painter: QPainter,
+        rect: QRect,
+        text: str,
+        *,
+        anchor_height: int | None = None,
+    ) -> None:
+        font_anchor_height = rect.height() if anchor_height is None else anchor_height
+        horizontal_padding = max(min(rect.height() // 5, 10), 2)
+        vertical_padding = max(min(rect.height() // 10, 5), 1)
+        text_rect = rect.adjusted(horizontal_padding, vertical_padding, -horizontal_padding, -vertical_padding)
+        if text_rect.width() <= 0 or text_rect.height() <= 0:
+            text_rect = rect
+
+        painter.setFont(self._font_for_text(text, text_rect, overlay_font_pixel_size(font_anchor_height)))
+        flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap
+        shadow = QColor(15, 23, 42, 230)
+        text_color = QColor(248, 250, 252, 245)
+        for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1), (2, 2)):
+            painter.setPen(shadow)
+            painter.drawText(text_rect.translated(offset_x, offset_y), flags, text)
+
+        painter.setPen(text_color)
+        painter.drawText(text_rect, flags, text)
+
+    @staticmethod
+    def _bgr_to_qimage(frame: np.ndarray) -> QImage:
+        rgb = cv2.cvtColor(np.ascontiguousarray(frame), cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb.shape
+        return QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
+
+    @staticmethod
+    def _expanded_bubble_rect(
+        anchor_rect: QRect,
+        text: str,
+        *,
+        bounds_width: int,
+        bounds_height: int,
+    ) -> QRect:
+        normalized = " ".join(text.split())
+        if not normalized or anchor_rect.width() <= 0 or anchor_rect.height() <= 0:
+            return anchor_rect
+
+        horizontal_padding = max(min(anchor_rect.height() // 4, 12), 2)
+        vertical_padding = max(min(anchor_rect.height() // 8, 6), 1)
+        base_pixel_size = overlay_font_pixel_size(anchor_rect.height())
+        if len(normalized) >= 18:
+            base_pixel_size = max(base_pixel_size, 10)
+
+        font = QFont("Segoe UI")
+        font.setWeight(QFont.Weight.DemiBold)
+        font.setPixelSize(max(base_pixel_size, 1))
+        metrics = QFontMetrics(font)
+        flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap
+
+        single_line_width = metrics.horizontalAdvance(normalized)
+        max_bubble_width = min(max(bounds_width - 8, anchor_rect.width()), max(260, int(bounds_width * 0.45)))
+        target_bubble_width = max(anchor_rect.width(), single_line_width + (horizontal_padding * 2) + 4)
+        if target_bubble_width > max_bubble_width:
+            target_bubble_width = max_bubble_width
+        if single_line_width > anchor_rect.width():
+            target_bubble_width = max(target_bubble_width, min(max_bubble_width, max(anchor_rect.width() * 2, 180)))
+
+        target_text_width = max(target_bubble_width - (horizontal_padding * 2), 1)
+        text_bounds = metrics.boundingRect(QRect(0, 0, target_text_width, 10_000), flags, normalized)
+        target_bubble_height = max(
+            anchor_rect.height(),
+            text_bounds.height() + (vertical_padding * 2) + 4,
+        )
+        max_bubble_height = max(anchor_rect.height(), int(bounds_height * 0.28))
+        target_bubble_height = min(target_bubble_height, max_bubble_height)
+
+        left = anchor_rect.x()
+        top = anchor_rect.y()
+        if left + target_bubble_width > bounds_width:
+            left = max(bounds_width - target_bubble_width - 4, 0)
+        if top + target_bubble_height > bounds_height:
+            top = max(bounds_height - target_bubble_height - 4, 0)
+
+        return QRect(left, top, target_bubble_width, target_bubble_height)
 
     @staticmethod
     def _font_for_text(text: str, rect: QRect, max_pixel_size: int) -> QFont:

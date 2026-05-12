@@ -179,10 +179,10 @@ class GoogleTranslateBackend(TranslationBackend):
     def __init__(
         self,
         *,
-        request_timeout_s: float = 0.75,
-        batch_timeout_s: float = 2.0,
-        max_requests_per_batch: int = 4,
-        retry_cooldown_seconds: float = 8.0,
+        request_timeout_s: float = 2.0,
+        batch_timeout_s: float = 8.0,
+        max_requests_per_batch: int = 8,
+        retry_cooldown_seconds: float = 6.0,
     ) -> None:
         self._cache: dict[tuple[str, str, str], str] = {}
         self._retry_after: dict[tuple[str, str, str], float] = {}
@@ -543,11 +543,13 @@ class QueuedTranslationBackend(TranslationBackend):
         self,
         underlying: TranslationBackend,
         *,
-        max_batch_size: int = 24,
-        retry_cooldown_seconds: float = 4.0,
+        max_batch_size: int = 8,
+        synchronous_batch_size: int = 0,
+        retry_cooldown_seconds: float = 1.5,
     ) -> None:
         self._underlying = underlying
         self._max_batch_size = max(max_batch_size, 1)
+        self._synchronous_batch_size = max(synchronous_batch_size, 0)
         self._retry_cooldown_seconds = retry_cooldown_seconds
         self._cache: dict[_TranslationCacheKey, str] = {}
         self._retry_after: dict[_TranslationCacheKey, float] = {}
@@ -605,7 +607,8 @@ class QueuedTranslationBackend(TranslationBackend):
 
         results = [""] * len(texts)
         now = perf_counter()
-        queued_any = False
+        keys: list[_TranslationCacheKey | None] = [None] * len(texts)
+        missing_indices: list[int] = []
 
         with self._condition:
             for index, text in enumerate(normalized_texts):
@@ -613,6 +616,68 @@ class QueuedTranslationBackend(TranslationBackend):
                     continue
 
                 key = _TranslationCacheKey(text, source_language_code, target_language_code)
+                keys[index] = key
+                cached = self._cache.get(key)
+                if cached is not None:
+                    results[index] = cached
+                    continue
+
+                retry_after = self._retry_after.get(key, 0.0)
+                if retry_after > now:
+                    continue
+
+                missing_indices.append(index)
+
+        sync_indices = missing_indices[: self._synchronous_batch_size]
+        if sync_indices:
+            sync_keys = {keys[index] for index in sync_indices if keys[index] is not None}
+            with self._condition:
+                self._remove_queued_keys_locked(sync_keys)
+
+            sync_texts = [normalized_texts[index] for index in sync_indices]
+            try:
+                translated_batch = self._underlying.translate_batch(
+                    sync_texts,
+                    source_language_code=source_language_code,
+                    target_language_code=target_language_code,
+                )
+            except Exception:
+                translated_batch = [""] * len(sync_indices)
+
+            now = perf_counter()
+            with self._condition:
+                for index, translated_text in zip(sync_indices, translated_batch, strict=False):
+                    key = keys[index]
+                    if key is None:
+                        continue
+
+                    normalized = _normalize_text(translated_text)
+                    self._queued_keys.discard(key)
+                    if normalized:
+                        self._cache[key] = normalized
+                        self._retry_after.pop(key, None)
+                        results[index] = normalized
+                    else:
+                        self._retry_after[key] = now + self._retry_cooldown_seconds
+
+                for index in sync_indices[len(translated_batch) :]:
+                    key = keys[index]
+                    if key is not None:
+                        self._retry_after[key] = now + self._retry_cooldown_seconds
+
+        queued_any = False
+        sync_index_set = set(sync_indices)
+        now = perf_counter()
+
+        with self._condition:
+            for index in missing_indices:
+                if index in sync_index_set:
+                    continue
+
+                key = keys[index]
+                if key is None:
+                    continue
+
                 cached = self._cache.get(key)
                 if cached is not None:
                     results[index] = cached
@@ -642,6 +707,14 @@ class QueuedTranslationBackend(TranslationBackend):
 
         self._worker.join(timeout=5.0)
         self._underlying.close()
+
+    def _remove_queued_keys_locked(self, keys: set[_TranslationCacheKey | None]) -> None:
+        resolved_keys = {key for key in keys if key is not None}
+        if not resolved_keys or not self._queue:
+            return
+
+        self._queue = deque(key for key in self._queue if key not in resolved_keys)
+        self._queued_keys.difference_update(resolved_keys)
 
     def _worker_loop(self) -> None:
         while True:
@@ -710,18 +783,31 @@ def create_default_translation_backend(*, mode: str | None = None) -> Translatio
 
     if preference == "google":
         backend = GoogleTranslateBackend()
-        return QueuedTranslationBackend(backend) if backend.is_available() else backend
+        return _maybe_queue_translation_backend(backend) if backend.is_available() else backend
 
     if preference == "argos":
         backend = ArgosTranslateBackend()
-        return QueuedTranslationBackend(backend) if backend.is_available() else backend
+        return _maybe_queue_translation_backend(backend) if backend.is_available() else backend
 
     for backend_factory in (ArgosTranslateBackend, GoogleTranslateBackend):
         backend = backend_factory()
         if backend.is_available():
-            return QueuedTranslationBackend(backend)
+            return _maybe_queue_translation_backend(backend)
 
     return NoOpTranslationBackend("Translation unavailable")
+
+
+def _maybe_queue_translation_backend(backend: TranslationBackend) -> TranslationBackend:
+    async_setting = os.getenv("SCREENLENS_TRANSLATION_ASYNC", "1").strip().lower()
+    if async_setting in {"0", "false", "no", "off", "disabled"}:
+        return backend
+
+    sync_default = 2 if backend.name == "argos-translate" else 0
+    sync_batch_size = _parse_non_negative_int(
+        os.getenv("SCREENLENS_TRANSLATION_SYNC_BATCH_SIZE"),
+        default=sync_default,
+    )
+    return QueuedTranslationBackend(backend, synchronous_batch_size=sync_batch_size)
 
 
 def normalize_translation_mode(value: str | None) -> str:
@@ -737,6 +823,13 @@ def normalize_translation_mode(value: str | None) -> str:
 
 def _normalize_text(text: str) -> str:
     return " ".join((text or "").split())
+
+
+def _parse_non_negative_int(value: str | None, *, default: int) -> int:
+    try:
+        return max(int(value), 0) if value is not None else default
+    except ValueError:
+        return default
 
 
 def _resolve_argos_device() -> str:

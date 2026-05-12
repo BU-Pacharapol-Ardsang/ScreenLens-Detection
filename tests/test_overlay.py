@@ -4,6 +4,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import cv2
 import numpy as np
+from PySide6.QtCore import QRect
 from PySide6.QtWidgets import QApplication
 
 from screenlens_detection.models import DetectionBox, FrameAnalysis, MonitorSpec
@@ -59,6 +60,125 @@ def test_overlay_font_size_tracks_detected_box_height() -> None:
     assert overlay_font_pixel_size(14) < overlay_font_pixel_size(30)
     assert overlay_font_pixel_size(30) < overlay_font_pixel_size(60)
     assert overlay_font_pixel_size(14) <= 10
+
+
+def test_overlay_expands_bubble_for_long_translated_text() -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+
+    _app()
+    anchor_rect = QRect(260, 120, 72, 18)
+    text = "Translated quest objective with enough words to overflow"
+    expanded = TranslationOverlay._expanded_bubble_rect(
+        anchor_rect,
+        text,
+        bounds_width=320,
+        bounds_height=180,
+    )
+
+    assert expanded.width() > anchor_rect.width()
+    assert expanded.height() >= anchor_rect.height()
+    assert expanded.right() <= 320
+
+    text_rect = expanded.adjusted(4, 2, -4, -2)
+    font = TranslationOverlay._font_for_text(text, text_rect, overlay_font_pixel_size(anchor_rect.height()))
+
+    assert font.pixelSize() > 1
+
+
+def test_clean_patch_overlay_paints_all_patches_before_text(monkeypatch) -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+    from screenlens_detection.overlay_tracks import OverlayBox
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 240, 140)
+    overlay.resize(240, 140)
+    overlay.set_render_mode("clean_patch")
+    overlay._overlay_boxes = [
+        OverlayBox(x=20, y=40, w=120, h=28, text="First", translated=True),
+        OverlayBox(x=20, y=54, w=120, h=28, text="Second", translated=True),
+    ]
+
+    calls: list[tuple[str, str]] = []
+
+    def paint_patch(self: object, _painter: object, box: OverlayBox, **_kwargs: object) -> bool:
+        calls.append(("patch", box.text))
+        return True
+
+    def paint_text(self: object, _painter: object, _rect: object, text: str, **_kwargs: object) -> None:
+        calls.append(("text", text))
+
+    monkeypatch.setattr(TranslationOverlay, "_paint_clean_patch", paint_patch)
+    monkeypatch.setattr(TranslationOverlay, "_paint_clean_text", paint_text)
+
+    overlay.paintEvent(None)
+
+    assert calls == [
+        ("patch", "First"),
+        ("patch", "Second"),
+        ("text", "First"),
+        ("text", "Second"),
+    ]
+
+
+def test_clean_patch_overlay_uses_in_place_patch_rect_for_text(monkeypatch) -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+    from screenlens_detection.overlay_tracks import OverlayBox
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 320, 180)
+    overlay.resize(320, 180)
+    overlay.set_render_mode("clean_patch")
+    frame = np.full((180, 320, 3), 210, dtype=np.uint8)
+    cv2.putText(frame, "OLD", (46, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 2, cv2.LINE_AA)
+    overlay._latest_source_frame = frame
+    overlay._source_frame_generation = 1
+    overlay._overlay_boxes = [
+        OverlayBox(
+            x=40,
+            y=58,
+            w=72,
+            h=30,
+            text="This translated sentence is much longer than the source",
+            translated=True,
+        )
+    ]
+
+    painted_rects: list[QRect] = []
+
+    def paint_text(self: object, _painter: object, rect: QRect, _text: str, **_kwargs: object) -> None:
+        painted_rects.append(QRect(rect))
+
+    monkeypatch.setattr(TranslationOverlay, "_paint_clean_text", paint_text)
+
+    overlay.paintEvent(None)
+
+    assert painted_rects
+    assert painted_rects[0].width() < 120
+
+
+def test_clean_patch_overlay_skips_untranslated_source_boxes(monkeypatch) -> None:
+    from screenlens_detection.overlay import TranslationOverlay
+    from screenlens_detection.overlay_tracks import OverlayBox
+
+    _app()
+    overlay = TranslationOverlay()
+    overlay._monitor = MonitorSpec(1, "Synthetic", 0, 0, 240, 140)
+    overlay.resize(240, 140)
+    overlay.set_render_mode("clean_patch")
+    overlay._overlay_boxes = [OverlayBox(x=20, y=40, w=120, h=28, text="Source only", translated=False)]
+
+    calls: list[str] = []
+
+    def paint_box(self: object, _painter: object, _rect: object, text: str, **_kwargs: object) -> None:
+        calls.append(text)
+
+    monkeypatch.setattr(TranslationOverlay, "_paint_box", paint_box)
+
+    overlay.paintEvent(None)
+
+    assert calls == []
 
 
 def test_overlay_tracks_existing_boxes_during_blank_scroll_frame() -> None:

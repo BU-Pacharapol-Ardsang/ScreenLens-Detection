@@ -113,6 +113,7 @@ class RecordingSession:
             "status": analysis.status,
             "ocr_runtime": analysis.ocr_runtime,
             "ocr_available": analysis.ocr_available,
+            "runtime_timings_ms": analysis.runtime_timings_ms,
             "detected_boxes": len(analysis.boxes),
             "content_offset_x": analysis.content_offset_x,
             "content_offset_y": analysis.content_offset_y,

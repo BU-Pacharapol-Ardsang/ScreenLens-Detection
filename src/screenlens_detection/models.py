@@ -24,36 +24,56 @@ class MonitorSpec:
 
 @dataclass(slots=True)
 class PipelineSettings:
-    capture_interval_ms: int = 250
-    upscale_factor: float = 1.5
-    clahe_clip_limit: float = 2.5
-    clahe_grid_size: int = 8
+    capture_interval_ms: int = 40  # Run up to ~25 FPS
+    upscale_factor: float = 1.0  # Full screen game/article is already large, 1.0 reduces lag massively
+    detection_scale: float = 1.00  # Run detection on a smaller image, then OCR high-res source crops.
+    clahe_clip_limit: float = 2.0
+    clahe_grid_size: int = 4
     gaussian_kernel_size: int = 3
-    threshold_block_size: int = 31
-    threshold_c: int = 12
+    threshold_block_size: int = 21  # Smaller block size runs faster
+    threshold_c: int = 8
     morphology_width: int = 11
     morphology_height: int = 3
-    min_contour_area: int = 250
-    min_box_width: int = 24
-    min_box_height: int = 14
+    min_contour_area: int = 150
+    min_box_width: int = 20
+    min_box_height: int = 10
     max_box_height_ratio: float = 0.22
     max_boxes: int = 60
     text_detector_mode: str = "opencv"
+    scanline_roi_enabled: bool = False
+    scanline_roi_band_count: int = 6
+    scanline_roi_overlap_ratio: float = 0.18
     source_language_code: str = "auto"
     target_language_code: str = "tha"
     translation_mode: str = "argos"
+    translation_region_mode: str = "full"
+    hover_region_radius: int = 260
+    hover_box_margin: int = 96
+    hover_dwell_ms: int = 1000
+    hover_move_tolerance: int = 12
+    translation_block_mode: str = "line"
+    translation_similarity_stability_enabled: bool = True
+    translation_similarity_threshold: float = 0.92
+    translation_similarity_min_chars: int = 16
+    subtitle_render_mode: str = "bubble"
+    clean_patch_padding_px: int = 8
+    clean_patch_mask_dilate_px: int = 4
+    clean_patch_inpaint_radius: int = 3
+    clean_patch_max_crop_area: int = 120_000
     ocr_enabled: bool = True
+    ocr_backend_mode: str = "auto"
     ocr_device_preference: str = "auto"
-    ocr_language: str = "tha+eng"
+    ocr_language: str = "tha+eng+jpn"
     ocr_psm: int = 7
-    max_ocr_boxes_per_frame: int = 8
-    stable_ocr_frames: int = 2
+    max_ocr_boxes_per_frame: int = 12
+    stable_ocr_frames: int = 1
     stable_box_iou_threshold: float = 0.45
-    motion_filter_enabled: bool = True
+    motion_filter_enabled: bool = False
     motion_mean_threshold: float = 18.0
     motion_changed_ratio_threshold: float = 0.20
     overlay_tracking_enabled: bool = False
     overlay_tracking_mode: str = "legacy"
+    runtime_debug_enabled: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -116,6 +136,7 @@ class FrameAnalysis:
     content_motion_confidence: float = 0.0
     source_frame: object | None = None
     translated_preview: object | None = None
+    runtime_timings_ms: dict[str, float] = field(default_factory=dict)
 
     @property
     def detected_text(self) -> list[str]:

@@ -23,8 +23,8 @@ The current implementation uses this flow:
 1. Capture a monitor in realtime with `mss`
 2. Convert the frame to grayscale and enhance local contrast with `CLAHE`
 3. Build a dual-polarity mask to detect both dark text on light backgrounds and light text on dark backgrounds
-4. Segment likely text regions with the selected text detector
-5. Run OCR on each detected region when an OCR backend is available
+4. Segment likely text regions with the selected text detector, or use a native full-frame OCR backend
+5. Run OCR on each detected region when using a crop OCR backend
 6. Draw detection boxes and stream the results to the Qt UI
 
 ## Features
@@ -32,7 +32,7 @@ The current implementation uses this flow:
 - Realtime monitor capture
 - Segmentation preview for demonstrations
 - Selectable text detector: classic OpenCV morphology, optional PaddleOCR DBNet, or optional EasyOCR CRAFT
-- Optional OCR with `EasyOCR` or `pytesseract`
+- Optional OCR with `EasyOCR`, `RapidOCR`, or `pytesseract`
 - Selectable translation backend: `Argos Translate (Offline)`, `Google Translate (Online)`, or disabled
 - Adjustable capture interval, scale factor, contour area, and OCR language
 - Clean Python package structure for future translation/overlay features
@@ -48,8 +48,10 @@ By default the app prefers `EasyOCR` when it is installed, then falls back to `T
 You can override that order with:
 
 ```powershell
-$env:SCREENLENS_OCR_BACKEND="easyocr"   # or: tesseract / off
+$env:SCREENLENS_OCR_BACKEND="easyocr"   # or: rapidocr / tesseract / off
 ```
+
+The UI also exposes an `OCR backend` dropdown. `RapidOCR full OCR` runs RapidOCR detection and recognition together on the frame, then sends the recognized text to the selected translation backend.
 
 The Tesseract runtime can be discovered from any of these locations:
 
@@ -83,6 +85,14 @@ If you want NVIDIA CUDA acceleration, use the Windows setup script instead so Py
 
 ```powershell
 .\scripts\setup_windows.ps1 -TorchRuntime gpu
+```
+
+### RapidOCR full OCR
+
+RapidOCR can be selected as a native full-frame OCR backend. It performs detection and recognition in one backend instead of sending detector boxes through EasyOCR crop recognition:
+
+```powershell
+pip install -e ".[ocr_rapid]"
 ```
 
 ### Optional deep text detectors
@@ -237,7 +247,7 @@ Notes:
 - If `vendor/argos/*.argosmodel` exists, the build bundles the offline translation models and installs them automatically at runtime.
 - If no bundled or installed Tesseract is found, the app still opens in detection-only mode.
 - Optional deep detector packages are not required for the classic OpenCV detector.
-- `scripts/setup_windows.ps1` installs EasyOCR and then pins `torch`/`torchvision` from the official PyTorch CPU or CUDA wheel index so the runtime matches your chosen device.
+- `scripts/setup_windows.ps1` installs EasyOCR, RapidOCR/ONNXRuntime, and then pins `torch`/`torchvision` from the official PyTorch CPU or CUDA wheel index so the runtime matches your chosen device.
 - `screenlens.py` and `screenlens.pyw` are still useful for local development, but the built `.exe` is the correct path for blank Windows VMs.
 - `build_screenlens_exe.bat` is the simplest build entrypoint. It creates `.venv` automatically when missing, installs build tools, and then produces `dist\ScreenLens\ScreenLens.exe`.
 
