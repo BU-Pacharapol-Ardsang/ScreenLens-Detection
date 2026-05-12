@@ -136,7 +136,18 @@ class TextDetectionPipeline:
         if runtime_debug_enabled:
             timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "enhance_grayscale")
         full_frame_ocr_enabled = self._full_frame_ocr_enabled()
-        if full_frame_ocr_enabled:
+        hover_region_enabled = self._translation_region_mode() == "hover"
+        if full_frame_ocr_enabled and hover_region_enabled:
+            self._reset_scanline_state()
+            boxes, detection_boxes, line_mask = self._annotate_hover_with_full_frame_ocr(
+                detection_frame,
+                frame.shape,
+                detection_scale,
+                cursor_position,
+            )
+            if runtime_debug_enabled:
+                timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "hover_full_frame_ocr")
+        elif full_frame_ocr_enabled:
             self._reset_scanline_state()
             self._last_hover_region_status = ""
             boxes, detection_boxes, line_mask = self._annotate_with_full_frame_ocr(
@@ -146,7 +157,7 @@ class TextDetectionPipeline:
             )
             if runtime_debug_enabled:
                 timing_checkpoint = self._record_runtime_timing(timings_ms, timing_checkpoint, "full_frame_ocr")
-        elif self._translation_region_mode() == "hover":
+        elif hover_region_enabled:
             self._reset_scanline_state()
             detection_boxes, line_mask, working_boxes = self._hover_detection_pass(
                 detection_frame,
@@ -1052,6 +1063,108 @@ class TextDetectionPipeline:
             and self.ocr_backend.is_available()
             and self.ocr_backend.supports_full_frame()
         )
+
+    def _annotate_hover_with_full_frame_ocr(
+        self,
+        detection_frame: np.ndarray,
+        original_shape: tuple[int, int, int],
+        scale: float,
+        cursor_position: tuple[int, int] | None,
+    ) -> tuple[list[DetectionBox], list[tuple[int, int, int, int]], np.ndarray]:
+        self._ocr_cache_generation += 1
+        self._last_ocr_reuse_count = 0
+        self._last_ocr_candidate_count = 0
+        self._last_ocr_submitted_count = 0
+
+        line_mask = np.zeros(detection_frame.shape[:2], dtype=np.uint8)
+        if cursor_position is None:
+            self._last_hover_region_status = "hover waiting"
+            return [], [], line_mask
+        if not self._cursor_inside_source_frame(cursor_position, original_shape):
+            self._last_hover_region_status = "hover outside"
+            return [], [], line_mask
+
+        source_left, source_top, source_right, source_bottom = self._hover_source_roi_bounds(
+            cursor_position,
+            original_shape,
+        )
+        detection_left = max(int(round(source_left * scale)), 0)
+        detection_top = max(int(round(source_top * scale)), 0)
+        detection_right = min(int(round(source_right * scale)), detection_frame.shape[1])
+        detection_bottom = min(int(round(source_bottom * scale)), detection_frame.shape[0])
+        if detection_right <= detection_left or detection_bottom <= detection_top:
+            self._last_hover_region_status = "hover ROI empty"
+            return [], [], line_mask
+
+        roi_frame = detection_frame[detection_top:detection_bottom, detection_left:detection_right]
+        frame_results = self.ocr_backend.recognize_frame(
+            roi_frame,
+            language=self.settings.ocr_language,
+        )
+        filtered_results = self._filter_full_frame_ocr_results(frame_results, roi_frame.shape)
+        self._last_ocr_candidate_count = len(filtered_results)
+
+        usable_results: list[OCRFrameResult] = []
+        for result in filtered_results:
+            text = self._normalize_recognized_text(result.text)
+            confidence = result.confidence
+            if text and not self._is_usable_text(text, confidence):
+                text = ""
+                confidence = None
+            if not text:
+                continue
+
+            x, y, w, h = result.rect
+            usable_results.append(
+                OCRFrameResult(
+                    rect=(x + detection_left, y + detection_top, w, h),
+                    text=text,
+                    confidence=confidence,
+                )
+            )
+
+        merged_results = self._merge_full_frame_line_results(usable_results)
+        source_rects = self._map_boxes_to_source_frame(
+            [result.rect for result in merged_results],
+            original_shape,
+            scale,
+        )
+        selected_source_rects = self._select_hover_source_boxes(source_rects, cursor_position)
+        selected_source_rect_set = set(selected_source_rects)
+        selected_results = [
+            result
+            for result, source_rect in zip(merged_results, source_rects, strict=False)
+            if source_rect in selected_source_rect_set
+        ]
+        self._last_ocr_submitted_count = len(selected_results)
+
+        preview_boxes = self._map_boxes_to_detection_frame(
+            selected_source_rects,
+            detection_frame.shape,
+            scale,
+        )
+        self._paint_hover_preview_mask(line_mask, preview_boxes)
+
+        if preview_boxes:
+            self._last_hover_region_status = (
+                f"hover ROI {source_right - source_left}x{source_bottom - source_top}"
+            )
+        else:
+            self._last_hover_region_status = "hover ROI none"
+
+        stable_results = self._stabilize_full_frame_ocr_results(selected_results, detection_frame.shape)
+        detected_boxes = [
+            self._detection_box_from_frame_ocr_result(
+                result,
+                original_shape=original_shape,
+                scale=scale,
+                text=result.text,
+                confidence=result.confidence,
+            )
+            for result in stable_results
+        ]
+        detected_boxes.sort(key=lambda box: (box.y, box.x))
+        return detected_boxes, preview_boxes, line_mask
 
     def _annotate_with_full_frame_ocr(
         self,
@@ -2975,7 +3088,7 @@ class TextDetectionPipeline:
             else:
                 scanline_suffix = f" | scanline {self._scanline_last_band_index + 1}/{band_count}"
         if self._full_frame_ocr_enabled():
-            return f"Native full-frame OCR detector{scale_suffix}"
+            return f"Native full-frame OCR detector{scale_suffix}{region_suffix}"
         if mode == "opencv":
             return f"OpenCV morphology detector{scale_suffix}{region_suffix}{scanline_suffix}"
 

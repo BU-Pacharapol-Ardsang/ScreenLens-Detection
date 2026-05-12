@@ -36,7 +36,6 @@ from ..subtitle_cleaner import clean_patch_for_box, normalize_subtitle_render_mo
 from ..text_detectors import text_detector_options
 from ..windows_hotkeys import (
     extract_hotkey_id,
-    hover_lock_hotkey_label,
     overlay_hotkey_labels,
     register_window_hotkeys,
     unregister_window_hotkeys,
@@ -529,10 +528,8 @@ class MainWindow(QMainWindow):
         return super().nativeEvent(event_type, message)
 
     def _handle_hotkey(self, hotkey_id: int) -> None:
-        if hotkey_id in {1, 2}:
+        if hotkey_id == 1:
             self._toggle_overlay_mode()
-        elif hotkey_id == 3:
-            self._toggle_hover_target_mode()
 
     def _toggle_overlay_mode(self) -> None:
         if self.overlay_active:
@@ -606,12 +603,25 @@ class MainWindow(QMainWindow):
         if self.worker is None:
             self._overlay_started_worker = True
             self._start_worker()
+        elif self.overlay_tracking_checkbox.isChecked():
+            self._start_overlay_tracker(monitor)
+
+        self._arm_hover_target_for_selected_region()
+        if not self._overlay_started_worker:
+            self._overlay_started_worker = False
+        self._refresh_status_label()
+
+    def _arm_hover_target_for_selected_region(self) -> None:
+        if self.translation_region_mode_combo.currentData() != "hover":
+            self._hover_target_mode_active = False
+            return
+        if self.worker is None:
             return
 
-        if self.overlay_tracking_checkbox.isChecked():
-            self._start_overlay_tracker(monitor)
-        self._overlay_started_worker = False
-        self._refresh_status_label()
+        self._hover_target_mode_active = True
+        self.worker.set_translation_region_mode("hover")
+        self.worker.reset_hover_target()
+        self._set_base_status("Hover target mode active")
 
     def _disable_overlay_mode(self) -> None:
         owned_worker = self._overlay_started_worker
@@ -743,10 +753,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _hotkey_help_text(*, prefix: str) -> str:
-        return (
-            f"{prefix}: {overlay_hotkey_labels()} toggle live screen overlay; "
-            f"{hover_lock_hotkey_label()} start hover translate overlay"
-        )
+        return f"{prefix}: {overlay_hotkey_labels()} toggle live screen overlay"
 
     def _update_ocr_boxes_label(self, value: int) -> None:
         self.ocr_boxes_value_label.setText(str(value))
@@ -805,6 +812,7 @@ class MainWindow(QMainWindow):
             "scale_frame": "scale",
             "enhance_grayscale": "enhance",
             "full_frame_ocr": "full OCR",
+            "hover_full_frame_ocr": "hover OCR",
             "hover_detection": "hover detect",
             "scanline_detection": "scanline detect",
             "opencv_detection": "opencv detect",

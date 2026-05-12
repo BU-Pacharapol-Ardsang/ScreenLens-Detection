@@ -270,14 +270,13 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert window.status_label.text() == "Synthetic worker running"
         assert window.ocr_runtime_label.text() == "Synthetic OCR runtime"
 
-        window._handle_hotkey(3)
+        window._handle_hotkey(1)
         assert worker.settings.translation_region_mode == "hover"
         assert window.overlay_active is True
         assert "Hover target ON" in window.status_label.text()
 
-        window._handle_hotkey(3)
-        assert worker.hover_reset_count >= 2
-        assert "Hover target ON" in window.status_label.text()
+        window._handle_hotkey(1)
+        assert window.overlay_active is False
 
         window._stop_worker()
         app.processEvents()
@@ -316,7 +315,7 @@ def test_runtime_debug_text_formats_slowest_stage() -> None:
     assert main_window_module.MainWindow._format_runtime_debug_text({}) == "Off"
 
 
-def test_main_window_f7_starts_hover_overlay_and_arms_hover_target(monkeypatch) -> None:
+def test_main_window_f6_starts_hover_overlay_when_hover_region_is_selected(monkeypatch) -> None:
     DummyWorker.instances.clear()
     monkeypatch.setattr(main_window_module, "ScreenCapturer", FakeScreenCapturer)
     monkeypatch.setattr(main_window_module, "ProcessingWorker", DummyWorker)
@@ -327,9 +326,11 @@ def test_main_window_f7_starts_hover_overlay_and_arms_hover_target(monkeypatch) 
     window = main_window_module.MainWindow()
 
     try:
-        assert window.translation_region_mode_combo.currentData() == "full"
+        hover_index = window.translation_region_mode_combo.findData("hover")
+        assert hover_index >= 0
+        window.translation_region_mode_combo.setCurrentIndex(hover_index)
 
-        window._handle_hotkey(3)
+        window._handle_hotkey(1)
         app.processEvents()
 
         worker = DummyWorker.instances[-1]
