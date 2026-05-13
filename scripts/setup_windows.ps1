@@ -9,6 +9,8 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 $argosVendorDir = Join-Path $repoRoot "vendor\argos"
 $argosDownloadScript = Join-Path $repoRoot "scripts\download_argos_models.py"
+$tesseractVendorScript = Join-Path $repoRoot "scripts\install_tesseract_vendor.ps1"
+$tesseractVendorBinary = Join-Path $repoRoot "vendor\tesseract\tesseract.exe"
 $torchVersion = "2.10.0"
 $torchvisionVersion = "0.25.0"
 $torchCpuIndex = "https://download.pytorch.org/whl/cpu"
@@ -163,6 +165,20 @@ function Install-RapidOCR {
     )
 }
 
+function Install-PaddleOCR {
+    param(
+        [string]$PythonPath
+    )
+
+    Write-Host "Installing PaddleOCR dependencies" -ForegroundColor Cyan
+    Invoke-PipInstall -PythonPath $PythonPath -Arguments @(
+        "install",
+        "--upgrade",
+        "paddleocr>=3.0.0",
+        "paddlepaddle>=3.0.0"
+    )
+}
+
 function Install-TorchRuntime {
     param(
         [string]$PythonPath,
@@ -187,6 +203,21 @@ function Install-TorchRuntime {
         "--index-url",
         $indexUrl
     )
+}
+
+function Sync-TesseractRuntime {
+    if (-not (Test-Path $tesseractVendorScript)) {
+        throw "Tesseract vendor install script not found: $tesseractVendorScript"
+    }
+
+    & $tesseractVendorScript
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    if (-not (Test-Path $tesseractVendorBinary)) {
+        throw "Tesseract vendor runtime was not created at $tesseractVendorBinary"
+    }
 }
 
 function Sync-ArgosModels {
@@ -290,6 +321,8 @@ Install-BaseDependencies -PythonPath $pythonPath -WithBuildTools:$IncludeBuildTo
 Install-EasyOCR -PythonPath $pythonPath
 Install-RapidOCR -PythonPath $pythonPath -Runtime $resolvedTorchRuntime
 Install-TorchRuntime -PythonPath $pythonPath -Runtime $resolvedTorchRuntime
+Install-PaddleOCR -PythonPath $pythonPath
+Sync-TesseractRuntime
 Sync-ArgosModels -PythonPath $pythonPath
 
 $diagnostics = Get-TorchDiagnostics -PythonPath $pythonPath

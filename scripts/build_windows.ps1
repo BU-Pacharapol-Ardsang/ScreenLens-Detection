@@ -100,6 +100,5 @@ Write-Host "  $distPath\ScreenLens\ScreenLens.exe"
 if (Test-Path $vendorBinary) {
     Write-Host "Bundled OCR runtime detected from vendor\\tesseract." -ForegroundColor Green
 } else {
-    Write-Host "No bundled Tesseract was found." -ForegroundColor Yellow
-    Write-Host "The app will still run in detection-only mode unless Tesseract is installed on the VM or copied beside the EXE."
+    throw "No bundled Tesseract was found at $vendorBinary."
 }
