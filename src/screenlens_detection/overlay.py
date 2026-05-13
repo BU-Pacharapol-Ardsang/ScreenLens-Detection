@@ -1313,6 +1313,7 @@ class TranslationOverlay(QWidget):
                 box.text,
                 bounds_width=max(self.width(), 1),
                 bounds_height=max(self.height(), 1),
+                compact=box.translated,
             )
             clean_rect = None
             if clean_mode and box.translated:
@@ -1533,7 +1534,7 @@ class TranslationOverlay(QWidget):
 
     def _paint_box(self, painter: QPainter, rect: QRect, text: str, *, anchor_height: int | None = None) -> None:
         accent = QColor(48, 231, 149, 220)
-        background = QColor(15, 23, 42, 212)
+        background = QColor(8, 13, 24, 238)
         text_color = QColor(248, 250, 252)
         font_anchor_height = rect.height() if anchor_height is None else anchor_height
 
@@ -1607,6 +1608,7 @@ class TranslationOverlay(QWidget):
         *,
         bounds_width: int,
         bounds_height: int,
+        compact: bool = False,
     ) -> QRect:
         normalized = " ".join(text.split())
         if not normalized or anchor_rect.width() <= 0 or anchor_rect.height() <= 0:
@@ -1626,7 +1628,14 @@ class TranslationOverlay(QWidget):
 
         single_line_width = metrics.horizontalAdvance(normalized)
         max_bubble_width = min(max(bounds_width - 8, anchor_rect.width()), max(260, int(bounds_width * 0.45)))
-        target_bubble_width = max(anchor_rect.width(), single_line_width + (horizontal_padding * 2) + 4)
+        text_fit_width = single_line_width + (horizontal_padding * 2) + 4
+        if compact and single_line_width <= anchor_rect.width():
+            target_bubble_width = max(
+                min(anchor_rect.width(), text_fit_width),
+                min(anchor_rect.width(), max(anchor_rect.height() * 3, 48)),
+            )
+        else:
+            target_bubble_width = max(anchor_rect.width(), text_fit_width)
         if target_bubble_width > max_bubble_width:
             target_bubble_width = max_bubble_width
         if single_line_width > anchor_rect.width():
@@ -1641,8 +1650,12 @@ class TranslationOverlay(QWidget):
         max_bubble_height = max(anchor_rect.height(), int(bounds_height * 0.28))
         target_bubble_height = min(target_bubble_height, max_bubble_height)
 
-        left = anchor_rect.x()
+        if compact and target_bubble_width < anchor_rect.width():
+            left = anchor_rect.center().x() - (target_bubble_width // 2)
+        else:
+            left = anchor_rect.x()
         top = anchor_rect.y()
+        left = max(left, 0)
         if left + target_bubble_width > bounds_width:
             left = max(bounds_width - target_bubble_width - 4, 0)
         if top + target_bubble_height > bounds_height:
