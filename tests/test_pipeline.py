@@ -567,7 +567,7 @@ def test_pipeline_uses_full_frame_ocr_backend_directly() -> None:
     assert [box.text for box in analysis.boxes] == ["Hello World"]
     assert [(box.x, box.y, box.w, box.h) for box in analysis.boxes] == [(20, 30, 120, 28)]
     assert "Native full-frame OCR detector" in analysis.status
-    assert "Full frame test OCR | full-frame OCR | read 1" in analysis.status
+    assert "Full frame test OCR | full-frame OCR | validation balanced | read 1" in analysis.status
 
 
 def test_pipeline_merges_split_full_frame_ocr_line() -> None:
@@ -663,6 +663,83 @@ def test_pipeline_limits_full_frame_ocr_output_to_ocr_frame_budget() -> None:
         "Important wide subtitle text",
         "Another wide subtitle line",
     ]
+
+
+def test_pipeline_balanced_full_frame_validation_rejects_short_top_ui_noise() -> None:
+    backend = SequencedFullFrameOCRBackend(
+        [
+            [
+                OCRFrameResult(rect=(12, 14, 42, 18), text="UI", confidence=95.0),
+                OCRFrameResult(rect=(24, 72, 248, 28), text="Useful translation line", confidence=95.0),
+            ]
+        ]
+    )
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(ocr_enabled=True, ocr_language="eng", max_ocr_boxes_per_frame=12),
+        backend,
+        NoOpTranslationBackend(),
+    )
+    frame = np.full((180, 360, 3), 255, dtype=np.uint8)
+
+    analysis = pipeline.process(frame, monitor_label="full-frame-balanced")
+
+    assert [box.text for box in analysis.boxes] == ["Useful translation line"]
+    assert "validation balanced" in analysis.status
+
+
+def test_pipeline_fast_full_frame_validation_keeps_raw_ocr_results() -> None:
+    backend = SequencedFullFrameOCRBackend(
+        [
+            [
+                OCRFrameResult(rect=(12, 14, 42, 18), text="UI", confidence=95.0),
+                OCRFrameResult(rect=(24, 72, 248, 28), text="Useful translation line", confidence=95.0),
+            ]
+        ]
+    )
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=12,
+            full_frame_ocr_validation_mode="fast",
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+    frame = np.full((180, 360, 3), 255, dtype=np.uint8)
+
+    analysis = pipeline.process(frame, monitor_label="full-frame-fast")
+
+    assert [box.text for box in analysis.boxes] == ["UI", "Useful translation line"]
+    assert "validation fast" in analysis.status
+
+
+def test_pipeline_strict_full_frame_validation_requires_mask_support() -> None:
+    backend = SequencedFullFrameOCRBackend(
+        [
+            [
+                OCRFrameResult(rect=(18, 54, 184, 38), text="Visible Text", confidence=96.0),
+                OCRFrameResult(rect=(22, 118, 188, 30), text="Phantom Text", confidence=96.0),
+            ]
+        ]
+    )
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(
+            ocr_enabled=True,
+            ocr_language="eng",
+            max_ocr_boxes_per_frame=12,
+            full_frame_ocr_validation_mode="strict",
+        ),
+        backend,
+        NoOpTranslationBackend(),
+    )
+    frame = np.full((180, 360, 3), 255, dtype=np.uint8)
+    cv2.putText(frame, "Visible Text", (24, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
+
+    analysis = pipeline.process(frame, monitor_label="full-frame-strict")
+
+    assert [box.text for box in analysis.boxes] == ["Visible Text"]
+    assert "validation strict" in analysis.status
 
 
 def test_pipeline_hover_region_with_full_frame_ocr_uses_cursor_roi() -> None:
