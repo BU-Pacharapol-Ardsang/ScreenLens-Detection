@@ -85,29 +85,20 @@ def test_overlay_expands_bubble_for_long_translated_text() -> None:
     assert font.pixelSize() > 1
 
 
-def test_overlay_compacts_translated_bubble_for_short_text() -> None:
+def test_overlay_never_shrinks_bubble_below_wide_anchor_rect() -> None:
     from screenlens_detection.overlay import TranslationOverlay
 
     _app()
-    anchor_rect = QRect(20, 40, 260, 24)
-
-    compact = TranslationOverlay._expanded_bubble_rect(
+    anchor_rect = QRect(40, 80, 900, 34)
+    expanded = TranslationOverlay._expanded_bubble_rect(
         anchor_rect,
-        "แปลแล้ว",
-        bounds_width=320,
-        bounds_height=180,
-        compact=True,
-    )
-    normal = TranslationOverlay._expanded_bubble_rect(
-        anchor_rect,
-        "แปลแล้ว",
-        bounds_width=320,
-        bounds_height=180,
+        "คำพูดขาวเป็นสีเทาและมีสีเช่นคาปูชิโน่",
+        bounds_width=1920,
+        bounds_height=1080,
     )
 
-    assert compact.width() < anchor_rect.width()
-    assert abs(compact.center().x() - anchor_rect.center().x()) <= 1
-    assert normal.width() == anchor_rect.width()
+    assert expanded.width() == anchor_rect.width()
+    assert expanded.x() == anchor_rect.x()
 
 
 def test_clean_patch_overlay_paints_all_patches_before_text(monkeypatch) -> None:
