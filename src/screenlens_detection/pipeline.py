@@ -503,6 +503,13 @@ class TextDetectionPipeline:
         detection_boxes = [(x + detection_left, y + detection_top, w, h) for x, y, w, h in roi_boxes]
         source_boxes = self._map_boxes_to_source_frame(detection_boxes, source_shape, detection_scale)
         selected_source_boxes = self._select_hover_source_boxes(source_boxes, cursor_position)
+        selected_source_boxes = self._refine_hover_source_boxes_by_mask_rows(
+            selected_source_boxes,
+            line_mask,
+            source_shape,
+            detection_scale,
+            cursor_position,
+        )
         preview_boxes = self._map_boxes_to_detection_frame(
             selected_source_boxes,
             detection_frame.shape,
@@ -517,6 +524,158 @@ class TextDetectionPipeline:
         else:
             self._last_hover_region_status = "hover ROI none"
         return preview_boxes, line_mask, selected_source_boxes
+
+    def _refine_hover_source_boxes_by_mask_rows(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        line_mask: np.ndarray,
+        source_shape: tuple[int, int, int],
+        detection_scale: float,
+        cursor_position: tuple[int, int],
+    ) -> list[tuple[int, int, int, int]]:
+        if not boxes or line_mask.size == 0:
+            return list(boxes)
+
+        refined: list[tuple[int, int, int, int]] = []
+        for box in boxes:
+            split_rows = self._split_hover_source_box_by_mask_rows(
+                box,
+                line_mask,
+                source_shape,
+                detection_scale,
+            )
+            if len(split_rows) <= 1:
+                refined.extend(split_rows)
+                continue
+
+            if self._split_rows_look_like_hover_subtitle_block(split_rows):
+                refined.extend(self._select_hover_source_boxes(split_rows, cursor_position))
+                continue
+
+            nearest_row = min(
+                split_rows,
+                key=lambda row: (self._cursor_box_distance(cursor_position, row), row[1], row[0]),
+            )
+            refined.append(nearest_row)
+
+        return self._dedupe_rects(refined)
+
+    def _split_hover_source_box_by_mask_rows(
+        self,
+        box: tuple[int, int, int, int],
+        line_mask: np.ndarray,
+        source_shape: tuple[int, int, int],
+        detection_scale: float,
+    ) -> list[tuple[int, int, int, int]]:
+        x, y, w, h = box
+        if h < 42:
+            return [box]
+
+        mask_height, mask_width = line_mask.shape[:2]
+        left = max(int(np.floor(x * detection_scale)), 0)
+        top = max(int(np.floor(y * detection_scale)), 0)
+        right = min(int(np.ceil((x + w) * detection_scale)), mask_width)
+        bottom = min(int(np.ceil((y + h) * detection_scale)), mask_height)
+        if right <= left or bottom <= top:
+            return [box]
+
+        mask_roi = line_mask[top:bottom, left:right]
+        if mask_roi.size == 0:
+            return [box]
+
+        row_segments = self._active_mask_row_segments(mask_roi)
+        if len(row_segments) <= 1:
+            return [box]
+
+        split_detection_boxes: list[tuple[int, int, int, int]] = []
+        for row_start, row_end in row_segments:
+            band_mask = mask_roi[row_start:row_end, :]
+            active_columns = np.flatnonzero(np.any(band_mask > 0, axis=0))
+            if active_columns.size == 0:
+                continue
+
+            column_start = int(active_columns[0])
+            column_end = int(active_columns[-1]) + 1
+            pad_x = max(2, int(round((row_end - row_start) * 0.20)))
+            pad_y = max(2, int(round((row_end - row_start) * 0.18)))
+            split_left = max(left + column_start - pad_x, 0)
+            split_top = max(top + row_start - pad_y, 0)
+            split_right = min(left + column_end + pad_x, mask_width)
+            split_bottom = min(top + row_end + pad_y, mask_height)
+            if split_right <= split_left or split_bottom <= split_top:
+                continue
+            split_detection_boxes.append(
+                (
+                    split_left,
+                    split_top,
+                    split_right - split_left,
+                    split_bottom - split_top,
+                )
+            )
+
+        if len(split_detection_boxes) <= 1:
+            return [box]
+
+        split_source_boxes = self._map_boxes_to_source_frame(
+            split_detection_boxes,
+            source_shape,
+            detection_scale,
+        )
+        split_source_boxes = [
+            split_box
+            for split_box in split_source_boxes
+            if split_box[2] >= max(24, int(round(w * 0.18))) and split_box[3] >= max(8, int(round(h * 0.18)))
+        ]
+        if len(split_source_boxes) <= 1:
+            return [box]
+        return split_source_boxes
+
+    @staticmethod
+    def _active_mask_row_segments(mask_roi: np.ndarray) -> list[tuple[int, int]]:
+        row_counts = np.count_nonzero(mask_roi > 0, axis=1)
+        if row_counts.size == 0:
+            return []
+
+        row_threshold = max(2, int(round(mask_roi.shape[1] * 0.012)))
+        active_rows = row_counts >= row_threshold
+        gap_tolerance = max(2, int(round(mask_roi.shape[0] * 0.04)))
+        index = 0
+        while index < len(active_rows):
+            if active_rows[index]:
+                index += 1
+                continue
+            gap_start = index
+            while index < len(active_rows) and not active_rows[index]:
+                index += 1
+            gap_end = index
+            if gap_start > 0 and gap_end < len(active_rows) and gap_end - gap_start <= gap_tolerance:
+                active_rows[gap_start:gap_end] = True
+
+        segments: list[tuple[int, int]] = []
+        index = 0
+        minimum_height = max(4, int(round(mask_roi.shape[0] * 0.10)))
+        while index < len(active_rows):
+            if not active_rows[index]:
+                index += 1
+                continue
+            start = index
+            while index < len(active_rows) and active_rows[index]:
+                index += 1
+            end = index
+            if end - start >= minimum_height:
+                segments.append((start, end))
+        return segments
+
+    def _split_rows_look_like_hover_subtitle_block(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+    ) -> bool:
+        if not self._rects_look_like_hover_subtitle_block(boxes):
+            return False
+        heights = sorted(box[3] for box in boxes)
+        median_height = heights[len(heights) // 2]
+        minimum_line_width = max(200, median_height * 5)
+        return min(box[2] for box in boxes) >= minimum_line_width
 
     def _hover_cached_source_boxes(self, cursor_position: tuple[int, int]) -> list[tuple[int, int, int, int]]:
         if not self._recent_ocr_results:
@@ -557,10 +716,13 @@ class TextDetectionPipeline:
             return []
 
         anchor = ranked[0][1]
-        if self._translation_block_mode() != "strict" or anchor[2] < 240:
-            return [anchor]
+        if self._translation_block_mode() == "strict" and anchor[2] >= 240:
+            return self._hover_strict_geometry_block(deduped, anchor)
 
-        return self._hover_strict_geometry_block(deduped, anchor)
+        subtitle_block = self._hover_subtitle_geometry_block(deduped, anchor)
+        if len(subtitle_block) > 1:
+            return subtitle_block
+        return [anchor]
 
     def _hover_strict_geometry_block(
         self,
@@ -594,6 +756,108 @@ class TextDetectionPipeline:
         selected.sort(key=lambda box: (box[1], box[0]))
         return selected
 
+    def _hover_subtitle_geometry_block(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+        anchor: tuple[int, int, int, int],
+    ) -> list[tuple[int, int, int, int]]:
+        anchor_height = max(anchor[3], 1)
+        if anchor[2] < max(220, anchor_height * 6):
+            return [anchor]
+
+        anchor_center_y = anchor[1] + (anchor[3] / 2.0)
+        vertical_span = max(int(round(anchor_height * 5.5)), 120)
+        candidates: list[tuple[int, int, int, int]] = []
+        for box in boxes:
+            height_ratio = box[3] / anchor_height
+            if height_ratio < 0.55 or height_ratio > 1.65:
+                continue
+            if box[2] < max(90, anchor_height * 3):
+                continue
+            center_y = box[1] + (box[3] / 2.0)
+            if abs(center_y - anchor_center_y) > vertical_span:
+                continue
+            if not self._hover_subtitle_lines_align(anchor, box):
+                continue
+            candidates.append(box)
+
+        if len(candidates) <= 1:
+            return [anchor]
+
+        candidates.sort(key=lambda box: (box[1], box[0]))
+        anchor_index = candidates.index(anchor)
+        selected = [anchor]
+
+        for index in range(anchor_index - 1, -1, -1):
+            previous = candidates[index]
+            if not self._hover_subtitle_lines_are_contiguous(previous, selected[0]):
+                break
+            selected.insert(0, previous)
+            if len(selected) >= 6:
+                break
+
+        for index in range(anchor_index + 1, len(candidates)):
+            following = candidates[index]
+            if not self._hover_subtitle_lines_are_contiguous(selected[-1], following):
+                break
+            selected.append(following)
+            if len(selected) >= 6:
+                break
+
+        if len(selected) <= 1 or not self._rects_look_like_hover_subtitle_block(selected):
+            return [anchor]
+        return selected
+
+    def _hover_subtitle_lines_align(
+        self,
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> bool:
+        if first == second:
+            return True
+
+        height = max(first[3], second[3], 1)
+        edge_tolerance = max(int(round(height * 2.4)), 48)
+        left_edges_align = abs(first[0] - second[0]) <= edge_tolerance
+        right_edges_align = abs((first[0] + first[2]) - (second[0] + second[2])) <= edge_tolerance
+        horizontal_overlap = self._horizontal_overlap_ratio(first, second)
+        return horizontal_overlap >= 0.35 or left_edges_align or right_edges_align
+
+    def _hover_subtitle_lines_are_contiguous(
+        self,
+        upper: tuple[int, int, int, int],
+        lower: tuple[int, int, int, int],
+    ) -> bool:
+        if lower[1] < upper[1]:
+            upper, lower = lower, upper
+        height = max(upper[3], lower[3], 1)
+        vertical_gap = lower[1] - (upper[1] + upper[3])
+        return -int(round(height * 0.35)) <= vertical_gap <= max(int(round(height * 1.15)), 24)
+
+    def _rects_look_like_hover_subtitle_block(
+        self,
+        boxes: list[tuple[int, int, int, int]],
+    ) -> bool:
+        if len(boxes) < 2 or len(boxes) > 6:
+            return False
+
+        sorted_boxes = sorted(boxes, key=lambda box: (box[1], box[0]))
+        heights = [box[3] for box in sorted_boxes]
+        median_height = sorted(heights)[len(heights) // 2]
+        total_width = max(box[0] + box[2] for box in sorted_boxes) - min(box[0] for box in sorted_boxes)
+        widest_line = max(box[2] for box in sorted_boxes)
+        if widest_line < max(220, median_height * 6) and total_width < max(280, median_height * 8):
+            return False
+
+        for first, second in zip(sorted_boxes, sorted_boxes[1:], strict=False):
+            if not self._hover_subtitle_lines_align(first, second):
+                return False
+            if not self._hover_subtitle_lines_are_contiguous(first, second):
+                return False
+
+        total_height = max(box[1] + box[3] for box in sorted_boxes) - min(box[1] for box in sorted_boxes)
+        return total_height <= max(int(round(median_height * 6.4)), 220)
+
     def _hover_source_roi_bounds(
         self,
         cursor_position: tuple[int, int],
@@ -601,10 +865,11 @@ class TextDetectionPipeline:
     ) -> tuple[int, int, int, int]:
         frame_height, frame_width = source_shape[:2]
         radius = max(self.settings.hover_region_radius, 32)
+        horizontal_radius = max(radius, int(round(radius * 2.0)), 480)
         cursor_x, cursor_y = cursor_position
-        left = max(cursor_x - radius, 0)
+        left = max(cursor_x - horizontal_radius, 0)
         top = max(cursor_y - radius, 0)
-        right = min(cursor_x + radius, frame_width)
+        right = min(cursor_x + horizontal_radius, frame_width)
         bottom = min(cursor_y + radius, frame_height)
         return left, top, right, bottom
 
@@ -1136,6 +1401,29 @@ class TextDetectionPipeline:
             for result, source_rect in zip(merged_results, source_rects, strict=False)
             if source_rect in selected_source_rect_set
         ]
+        if selected_results:
+            hover_line_mask = self._hover_row_line_mask(
+                roi_frame,
+                detection_frame.shape,
+                detection_left,
+                detection_top,
+            )
+            refined_source_rects = self._refine_hover_source_boxes_by_mask_rows(
+                selected_source_rects,
+                hover_line_mask,
+                original_shape,
+                scale,
+                cursor_position,
+            )
+            if refined_source_rects != selected_source_rects:
+                selected_results = self._remap_hover_full_frame_results_to_refined_rects(
+                    selected_results,
+                    selected_source_rects,
+                    refined_source_rects,
+                    detection_frame.shape,
+                    scale,
+                )
+                selected_source_rects = refined_source_rects
         self._last_ocr_submitted_count = len(selected_results)
 
         preview_boxes = self._map_boxes_to_detection_frame(
@@ -1165,6 +1453,91 @@ class TextDetectionPipeline:
         ]
         detected_boxes.sort(key=lambda box: (box.y, box.x))
         return detected_boxes, preview_boxes, line_mask
+
+    def _hover_row_line_mask(
+        self,
+        roi_frame: np.ndarray,
+        detection_shape: tuple[int, int, int],
+        detection_left: int,
+        detection_top: int,
+    ) -> np.ndarray:
+        line_mask = np.zeros(detection_shape[:2], dtype=np.uint8)
+        if roi_frame.size == 0:
+            return line_mask
+
+        roi_gray = self._enhance_grayscale(roi_frame)
+        _boxes, roi_line_mask, _stage = self._text_detection_pass(
+            roi_frame,
+            roi_gray,
+            filter_frame_shape=detection_shape,
+        )
+        bottom = min(detection_top + roi_line_mask.shape[0], line_mask.shape[0])
+        right = min(detection_left + roi_line_mask.shape[1], line_mask.shape[1])
+        if right <= detection_left or bottom <= detection_top:
+            return line_mask
+        line_mask[detection_top:bottom, detection_left:right] = roi_line_mask[
+            : bottom - detection_top,
+            : right - detection_left,
+        ]
+        return line_mask
+
+    def _remap_hover_full_frame_results_to_refined_rects(
+        self,
+        results: list[OCRFrameResult],
+        original_source_rects: list[tuple[int, int, int, int]],
+        refined_source_rects: list[tuple[int, int, int, int]],
+        detection_shape: tuple[int, int, int],
+        scale: float,
+    ) -> list[OCRFrameResult]:
+        if len(results) == 1 and len(refined_source_rects) == 1:
+            refined_detection_rect = self._map_boxes_to_detection_frame(
+                refined_source_rects,
+                detection_shape,
+                scale,
+            )[0]
+            result = results[0]
+            return [
+                OCRFrameResult(
+                    rect=refined_detection_rect,
+                    text=result.text,
+                    confidence=result.confidence,
+                )
+            ]
+
+        if len(results) != len(original_source_rects):
+            return results
+
+        refined_by_original_index: dict[int, tuple[int, int, int, int]] = {}
+        for refined_rect in refined_source_rects:
+            best_index = min(
+                range(len(original_source_rects)),
+                key=lambda index: self._rect_center_distance(refined_rect, original_source_rects[index]),
+            )
+            if self._intersection_area(refined_rect, original_source_rects[best_index]) > 0:
+                refined_by_original_index[best_index] = refined_rect
+
+        if not refined_by_original_index:
+            return results
+
+        remapped: list[OCRFrameResult] = []
+        for index, result in enumerate(results):
+            refined_rect = refined_by_original_index.get(index)
+            if refined_rect is None:
+                remapped.append(result)
+                continue
+            refined_detection_rect = self._map_boxes_to_detection_frame(
+                [refined_rect],
+                detection_shape,
+                scale,
+            )[0]
+            remapped.append(
+                OCRFrameResult(
+                    rect=refined_detection_rect,
+                    text=result.text,
+                    confidence=result.confidence,
+                )
+            )
+        return remapped
 
     def _annotate_with_full_frame_ocr(
         self,
@@ -2217,6 +2590,17 @@ class TextDetectionPipeline:
         return variants
 
     @staticmethod
+    def _rect_center_distance(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+    ) -> float:
+        first_center_x = first[0] + (first[2] / 2.0)
+        first_center_y = first[1] + (first[3] / 2.0)
+        second_center_x = second[0] + (second[2] / 2.0)
+        second_center_y = second[1] + (second[3] / 2.0)
+        return max(abs(first_center_x - second_center_x), abs(first_center_y - second_center_y))
+
+    @staticmethod
     def _rect_center_proximity(
         first: tuple[int, int, int, int],
         second: tuple[int, int, int, int],
@@ -2251,6 +2635,9 @@ class TextDetectionPipeline:
             return boxes
 
         self._blank_translation_frames = 0
+        if self._translation_region_mode() == "hover":
+            boxes = self._filter_hover_metadata_rows(boxes)
+            boxes = self._combine_hover_subtitle_boxes(boxes)
         translated_boxes = self._reuse_recent_translations(boxes)
         line_skip_indices: set[int] = set()
         if self._translation_block_mode() == "strict":
@@ -2259,6 +2646,115 @@ class TextDetectionPipeline:
         translated_boxes = self._apply_line_translations(translated_boxes, skip_indices=line_skip_indices)
         self._remember_translations(translated_boxes)
         return translated_boxes
+
+    def _filter_hover_metadata_rows(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
+        if len(boxes) < 2:
+            return list(boxes)
+
+        text_boxes = [box for box in boxes if box.text]
+        if len(text_boxes) < 2:
+            return list(boxes)
+
+        metadata_boxes = [box for box in text_boxes if self._looks_like_hover_metadata_row(box.text)]
+        if not metadata_boxes:
+            return list(boxes)
+
+        content_boxes = [
+            box
+            for box in text_boxes
+            if box not in metadata_boxes and self._looks_like_hover_content_row(box.text)
+        ]
+        if not content_boxes:
+            return list(boxes)
+
+        metadata_ids = {id(box) for box in metadata_boxes}
+        return [box for box in boxes if id(box) not in metadata_ids]
+
+    def _looks_like_hover_metadata_row(self, text: str) -> bool:
+        normalized = " ".join(text.casefold().split())
+        if not normalized:
+            return False
+
+        metadata_terms = (
+            "ติดตาม",
+            "กำลังติดตาม",
+            "follow",
+            "following",
+            "subscribe",
+            "subscribed",
+            "チャンネル登録",
+            "登録済み",
+        )
+        if any(term in normalized for term in metadata_terms):
+            return True
+        if re.search(r"(^|\s)@[0-9a-z_][0-9a-z_.-]{1,}", normalized):
+            return True
+        if normalized.startswith("@") and len(normalized.split()) <= 3:
+            return True
+        return False
+
+    def _looks_like_hover_content_row(self, text: str) -> bool:
+        normalized = self._normalize_text_for_matching(text)
+        if len(normalized) >= 18 and len(normalized.split()) >= 3:
+            return True
+
+        thai_count = sum("\u0E00" <= character <= "\u0E7F" for character in text)
+        latin_count = sum(character.isascii() and character.isalpha() for character in text)
+        return thai_count + latin_count >= 14 and not self._looks_like_hover_metadata_row(text)
+
+    def _combine_hover_subtitle_boxes(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
+        if len(boxes) < 2 or len(boxes) > 6:
+            return list(boxes)
+
+        ordered_boxes = sorted(boxes, key=lambda box: (box.y, box.x))
+        if any(not box.text or self._looks_like_url(box.text) for box in ordered_boxes):
+            return list(boxes)
+        if any(self._looks_like_hover_metadata_row(box.text) for box in ordered_boxes):
+            return list(boxes)
+
+        first = ordered_boxes[0]
+        language_route = (
+            first.source_language_code,
+            first.target_language_code,
+            first.source_language_label,
+            first.target_language_label,
+        )
+        for box in ordered_boxes[1:]:
+            if (
+                box.source_language_code,
+                box.target_language_code,
+                box.source_language_label,
+                box.target_language_label,
+            ) != language_route:
+                return list(boxes)
+
+        rects = [(box.x, box.y, box.w, box.h) for box in ordered_boxes]
+        if not self._rects_look_like_hover_subtitle_block(rects):
+            return list(boxes)
+
+        combined_text = "\n".join(" ".join(box.text.split()) for box in ordered_boxes)
+        normalized_text = self._normalize_text_for_matching(combined_text)
+        if not normalized_text or len(normalized_text) < 24 or len(normalized_text.split()) < 4:
+            return list(boxes)
+
+        left = min(box.x for box in ordered_boxes)
+        top = min(box.y for box in ordered_boxes)
+        right = max(box.right for box in ordered_boxes)
+        bottom = max(box.bottom for box in ordered_boxes)
+        confidences = [box.confidence for box in ordered_boxes if box.confidence is not None]
+        confidence = float(np.mean(confidences)) if confidences else first.confidence
+        return [
+            replace(
+                first,
+                x=left,
+                y=top,
+                w=right - left,
+                h=bottom - top,
+                text=combined_text,
+                translated_text="",
+                confidence=confidence,
+            )
+        ]
 
     def _apply_line_translations(
         self,
