@@ -1780,7 +1780,7 @@ class TextDetectionPipeline:
                 if self._full_frame_text_compatible(result.text, previous.text):
                     chosen_text, chosen_confidence = self._prefer_full_frame_track_text(result, previous)
                     track = _FullFrameTextTrack(
-                        rect=self._smoothed_full_frame_rect(previous.rect, result.rect),
+                        rect=self._stabilized_full_frame_rect(previous, result.rect),
                         text=chosen_text,
                         confidence=chosen_confidence,
                         stable_frames=previous.stable_frames + 1,
@@ -1827,8 +1827,7 @@ class TextDetectionPipeline:
         )
         self._full_frame_ocr_tracks = next_tracks[: max(self.settings.max_boxes * 2, 64)]
 
-        stable_results.sort(key=lambda result: (result.rect[1], result.rect[0]))
-        return stable_results
+        return self._select_full_frame_output_results(stable_results)
 
     def _find_matching_full_frame_track(
         self,
@@ -1840,14 +1839,41 @@ class TextDetectionPipeline:
         for index, track in enumerate(self._full_frame_ocr_tracks):
             if index in used_indices:
                 continue
+            if not self._full_frame_track_can_match(result, track):
+                continue
             score = self._full_frame_track_score(result, track)
             if score > best_score:
                 best_index = index
                 best_score = score
 
-        if best_index is None or best_score < 0.40:
+        if best_index is None or best_score < 0.46:
             return None
         return best_index
+
+    def _full_frame_track_can_match(self, result: OCRFrameResult, track: _FullFrameTextTrack) -> bool:
+        current_rect = result.rect
+        track_rect = track.rect
+        intersection = self._intersection_area(current_rect, track_rect)
+        current_area = max(current_rect[2] * current_rect[3], 1)
+        track_area = max(track_rect[2] * track_rect[3], 1)
+        mutual_overlap = max(intersection / current_area, intersection / track_area)
+        iou = self._intersection_over_union(current_rect, track_rect)
+        size_similarity = self._rect_size_similarity(current_rect, track_rect)
+        center_distance = self._rect_center_distance(current_rect, track_rect)
+        stable_iou_threshold = max(min(self.settings.stable_box_iou_threshold, 1.0), 0.0)
+
+        if self._full_frame_text_compatible(result.text, track.text):
+            if iou >= stable_iou_threshold:
+                return True
+            if mutual_overlap >= 0.72 and size_similarity >= 0.60:
+                return True
+
+            max_width = max(current_rect[2], track_rect[2], 1)
+            max_height = max(current_rect[3], track_rect[3], 1)
+            center_limit = max(max_height * 2.5, min(max_width * 0.08, 80.0), 16.0)
+            return center_distance <= center_limit and size_similarity >= 0.56
+
+        return iou >= max(stable_iou_threshold + 0.20, 0.72) and size_similarity >= 0.82
 
     def _full_frame_track_score(self, result: OCRFrameResult, track: _FullFrameTextTrack) -> float:
         current_rect = result.rect
@@ -1928,20 +1954,55 @@ class TextDetectionPipeline:
             return result.text, result.confidence
         return previous.text, previous.confidence
 
-    def _smoothed_full_frame_rect(
+    def _select_full_frame_output_results(self, results: list[OCRFrameResult]) -> list[OCRFrameResult]:
+        limit = max(min(self.settings.max_ocr_boxes_per_frame, self.settings.max_boxes), 1)
+        if len(results) > limit:
+            results = sorted(results, key=self._full_frame_output_priority, reverse=True)[:limit]
+        results = list(results)
+        results.sort(key=lambda result: (result.rect[1], result.rect[0]))
+        return results
+
+    def _full_frame_output_priority(self, result: OCRFrameResult) -> float:
+        return self._ocr_candidate_priority(result.rect) + min(
+            self._full_frame_text_quality_score(result.text, result.confidence) * 3.0,
+            120.0,
+        )
+
+    def _stabilized_full_frame_rect(
         self,
-        previous: tuple[int, int, int, int],
+        previous_track: _FullFrameTextTrack,
         current: tuple[int, int, int, int],
     ) -> tuple[int, int, int, int]:
-        if self._rect_size_similarity(previous, current) < 0.72:
+        previous = previous_track.rect
+        size_similarity = self._rect_size_similarity(previous, current)
+        if size_similarity < 0.64:
             return current
-        if self._rect_center_proximity(previous, current) < 0.92:
+
+        iou = self._intersection_over_union(previous, current)
+        stable_iou_threshold = max(min(self.settings.stable_box_iou_threshold, 1.0), 0.0)
+        center_distance = self._rect_center_distance(previous, current)
+        max_width = max(previous[2], current[2], 1)
+        max_height = max(previous[3], current[3], 1)
+        jitter_limit = max(max_height * 0.45, min(max_width * 0.012, 12.0), 4.0)
+        if (
+            previous_track.stable_frames >= 1
+            and iou >= max(stable_iou_threshold, 0.50)
+            and center_distance <= jitter_limit
+            and size_similarity >= 0.86
+        ):
+            return previous
+
+        smoothing_limit = max(max_height * 2.0, 16.0)
+        if iou < stable_iou_threshold or center_distance > smoothing_limit:
             return current
+
+        previous_weight = 0.78 if previous_track.stable_frames >= 2 else 0.65
+        current_weight = 1.0 - previous_weight
         return (
-            int(round((previous[0] * 0.45) + (current[0] * 0.55))),
-            int(round((previous[1] * 0.45) + (current[1] * 0.55))),
-            max(int(round((previous[2] * 0.45) + (current[2] * 0.55))), 1),
-            max(int(round((previous[3] * 0.45) + (current[3] * 0.55))), 1),
+            int(round((previous[0] * previous_weight) + (current[0] * current_weight))),
+            int(round((previous[1] * previous_weight) + (current[1] * current_weight))),
+            max(int(round((previous[2] * previous_weight) + (current[2] * current_weight))), 1),
+            max(int(round((previous[3] * previous_weight) + (current[3] * current_weight))), 1),
         )
 
     @classmethod

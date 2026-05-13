@@ -615,6 +615,56 @@ def test_pipeline_debounces_noisy_full_frame_subtitle_text() -> None:
     assert [box.text for box in third.boxes] == ["Hello"]
 
 
+def test_pipeline_locks_full_frame_ocr_bbox_on_small_jitter() -> None:
+    backend = SequencedFullFrameOCRBackend(
+        [
+            [OCRFrameResult(rect=(60, 70, 220, 26), text="Stable subtitle line", confidence=96.0)],
+            [OCRFrameResult(rect=(62, 71, 222, 27), text="Stable subtitle line", confidence=96.0)],
+            [OCRFrameResult(rect=(59, 69, 221, 26), text="Stable subtitle line", confidence=96.0)],
+        ]
+    )
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(ocr_enabled=True, ocr_language="eng", stable_ocr_frames=1),
+        backend,
+        NoOpTranslationBackend(),
+    )
+    frame = np.full((160, 360, 3), 255, dtype=np.uint8)
+
+    first = pipeline.process(frame, monitor_label="full-frame-stability")
+    second = pipeline.process(frame, monitor_label="full-frame-stability")
+    third = pipeline.process(frame, monitor_label="full-frame-stability")
+
+    assert [(box.x, box.y, box.w, box.h) for box in first.boxes] == [(60, 70, 220, 26)]
+    assert [(box.x, box.y, box.w, box.h) for box in second.boxes] == [(60, 70, 220, 26)]
+    assert [(box.x, box.y, box.w, box.h) for box in third.boxes] == [(60, 70, 220, 26)]
+
+
+def test_pipeline_limits_full_frame_ocr_output_to_ocr_frame_budget() -> None:
+    backend = SequencedFullFrameOCRBackend(
+        [
+            [
+                OCRFrameResult(rect=(12, 16, 40, 18), text="UI", confidence=92.0),
+                OCRFrameResult(rect=(20, 70, 260, 28), text="Important wide subtitle text", confidence=96.0),
+                OCRFrameResult(rect=(20, 110, 240, 28), text="Another wide subtitle line", confidence=96.0),
+                OCRFrameResult(rect=(306, 18, 38, 18), text="HUD", confidence=92.0),
+            ]
+        ]
+    )
+    pipeline = TextDetectionPipeline(
+        PipelineSettings(ocr_enabled=True, ocr_language="eng", max_ocr_boxes_per_frame=2, max_boxes=12),
+        backend,
+        NoOpTranslationBackend(),
+    )
+    frame = np.full((180, 360, 3), 255, dtype=np.uint8)
+
+    analysis = pipeline.process(frame, monitor_label="full-frame-budget")
+
+    assert [box.text for box in analysis.boxes] == [
+        "Important wide subtitle text",
+        "Another wide subtitle line",
+    ]
+
+
 def test_pipeline_hover_region_with_full_frame_ocr_uses_cursor_roi() -> None:
     backend = SequencedFullFrameOCRBackend(
         [
