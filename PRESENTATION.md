@@ -61,7 +61,7 @@ ScreenCapturer
 
 อยู่ใน `src/screenlens_detection/worker.py`
 
-ทำงานเป็น background thread ด้วย `QThread` เพื่อไม่ให้ UI ค้าง โดยแยก capture loop ออกเป็น thread ย่อย และใช้ queue ขนาด 1 เพื่อเก็บเฉพาะ frame ล่าสุด ถ้าประมวลผลไม่ทันจะ drop frame เก่าแทนการปล่อยให้ queue สะสมจน latency สูง
+ทำงานเป็น background thread ด้วย `QThread` เพื่อไม่ให้ UI ค้าง โดยแยก capture loop ออกเป็น thread ย่อย และใช้ queue ขนาด 1 เพื่อเก็บเฉพาะ frame ล่าสุด ถ้า pipeline ยังประมวลผล frame ก่อนหน้าไม่เสร็จตอน capture frame ใหม่เข้ามา ระบบจะ drop frame เก่าที่รออยู่ใน queue แทนการปล่อยให้ queue สะสมจน latency สูง
 
 ### `TextDetectionPipeline`
 
