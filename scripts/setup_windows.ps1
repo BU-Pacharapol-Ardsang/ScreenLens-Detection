@@ -160,7 +160,12 @@ function Install-RapidOCR {
     Invoke-PipInstall -PythonPath $PythonPath -Arguments @(
         "install",
         "--upgrade",
-        "rapidocr>=3.0.0",
+        "rapidocr>=3.0.0"
+    )
+    Invoke-PipInstall -PythonPath $PythonPath -Arguments @(
+        "install",
+        "--upgrade",
+        "--force-reinstall",
         $onnxPackage
     )
 }
