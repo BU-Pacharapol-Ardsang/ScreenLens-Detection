@@ -1424,6 +1424,15 @@ class TextDetectionPipeline:
                     scale,
                 )
                 selected_source_rects = refined_source_rects
+
+        validated_results = self._validate_full_frame_ocr_results(selected_results, detection_frame)
+        validated_result_ids = {id(result) for result in validated_results}
+        selected_source_rects = [
+            source_rect
+            for result, source_rect in zip(selected_results, selected_source_rects, strict=False)
+            if id(result) in validated_result_ids
+        ]
+        selected_results = validated_results
         self._last_ocr_submitted_count = len(selected_results)
 
         preview_boxes = self._map_boxes_to_detection_frame(
@@ -1556,7 +1565,6 @@ class TextDetectionPipeline:
         )
         filtered_results = self._filter_full_frame_ocr_results(frame_results, detection_frame.shape)
         self._last_ocr_candidate_count = len(filtered_results)
-        self._last_ocr_submitted_count = len(filtered_results)
 
         preview_boxes: list[tuple[int, int, int, int]] = []
         usable_results: list[OCRFrameResult] = []
@@ -1577,8 +1585,13 @@ class TextDetectionPipeline:
                 )
             )
 
-        stable_results = self._stabilize_full_frame_ocr_results(
+        validated_results = self._validate_full_frame_ocr_results(
             self._merge_full_frame_line_results(usable_results),
+            detection_frame,
+        )
+        self._last_ocr_submitted_count = len(validated_results)
+        stable_results = self._stabilize_full_frame_ocr_results(
+            validated_results,
             detection_frame.shape,
         )
 
@@ -1659,6 +1672,153 @@ class TextDetectionPipeline:
             key=lambda result: self._ocr_candidate_priority(result.rect),
             reverse=True,
         )[: self.settings.max_boxes]
+
+    def _validate_full_frame_ocr_results(
+        self,
+        results: list[OCRFrameResult],
+        frame: np.ndarray,
+    ) -> list[OCRFrameResult]:
+        mode = self._full_frame_ocr_validation_mode()
+        if mode == "fast" or not results:
+            return list(results)
+
+        validation_masks = self._full_frame_validation_masks(frame) if mode == "strict" else None
+        return [
+            result
+            for result in results
+            if self._full_frame_ocr_result_is_valid(
+                result,
+                frame.shape,
+                mode=mode,
+                validation_masks=validation_masks,
+            )
+        ]
+
+    def _full_frame_ocr_result_is_valid(
+        self,
+        result: OCRFrameResult,
+        frame_shape: tuple[int, ...],
+        *,
+        mode: str,
+        validation_masks: tuple[np.ndarray, np.ndarray] | None,
+    ) -> bool:
+        normalized = self._normalize_text_for_matching(result.text)
+        compact = self._compact_match_text(normalized)
+        if not compact:
+            return False
+
+        quality_score = self._full_frame_text_quality_score(result.text, result.confidence)
+        subtitle_like = self._is_subtitle_like_full_frame_rect(result.rect, frame_shape)
+        track_evidence = self._has_full_frame_track_evidence(result)
+        confidence = result.confidence
+
+        if self._looks_like_full_frame_ui_noise(result, frame_shape) and not subtitle_like and not track_evidence:
+            return False
+
+        if subtitle_like:
+            base_valid = quality_score >= 6.5 and (confidence is None or confidence >= 18.0)
+        elif track_evidence:
+            base_valid = quality_score >= 5.0 and (confidence is None or confidence >= 15.0)
+        else:
+            token_count = len(normalized.split())
+            if len(compact) <= 3:
+                return False
+            if len(compact) <= 5 and token_count <= 1:
+                return False
+            base_valid = quality_score >= 15.0 and (confidence is None or confidence >= 30.0)
+
+        if not base_valid:
+            return False
+
+        if mode != "strict":
+            return True
+
+        mask_score = self._full_frame_mask_support_score(result.rect, validation_masks)
+        if track_evidence and mask_score >= 0.025:
+            return True
+        required_mask_score = 0.050 if subtitle_like else 0.075
+        return mask_score >= required_mask_score
+
+    def _full_frame_ocr_validation_mode(self) -> str:
+        mode = (self.settings.full_frame_ocr_validation_mode or "balanced").casefold().strip()
+        if mode in {"fast", "raw", "off", "disabled", "none"}:
+            return "fast"
+        if mode in {"strict", "preprocess", "preprocessing"}:
+            return "strict"
+        return "balanced"
+
+    def _full_frame_validation_masks(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        gray = self._enhance_grayscale(frame)
+        text_mask = self._build_text_mask(frame, gray)
+        line_mask = self._build_line_mask(text_mask)
+        return text_mask, line_mask
+
+    def _has_full_frame_track_evidence(self, result: OCRFrameResult) -> bool:
+        for track in self._full_frame_ocr_tracks:
+            if track.missing_frames > 1 or track.stable_frames < 2:
+                continue
+            if self._full_frame_track_can_match(result, track):
+                return True
+        return False
+
+    def _looks_like_full_frame_ui_noise(
+        self,
+        result: OCRFrameResult,
+        frame_shape: tuple[int, ...],
+    ) -> bool:
+        frame_height, frame_width = frame_shape[:2]
+        if frame_height <= 0 or frame_width <= 0:
+            return False
+
+        x, y, w, h = result.rect
+        normalized = self._normalize_text_for_matching(result.text)
+        compact = self._compact_match_text(normalized)
+        token_count = len(normalized.split())
+        top_region = y <= int(frame_height * 0.18)
+        side_region = x <= int(frame_width * 0.12) or x + w >= int(frame_width * 0.88)
+        small_box = w <= int(frame_width * 0.26) and h <= max(int(frame_height * 0.08), 34)
+
+        if len(compact) <= 2 and not self._is_subtitle_like_full_frame_rect(result.rect, frame_shape):
+            return True
+        if top_region and small_box and len(compact) <= 8:
+            return True
+        if side_region and small_box and token_count <= 1 and len(compact) <= 5:
+            return True
+        if top_region and self._looks_like_url(result.text):
+            return True
+        return False
+
+    def _full_frame_mask_support_score(
+        self,
+        rect: tuple[int, int, int, int],
+        validation_masks: tuple[np.ndarray, np.ndarray] | None,
+    ) -> float:
+        if validation_masks is None:
+            return 0.0
+
+        text_mask, line_mask = validation_masks
+        mask_height, mask_width = line_mask.shape[:2]
+        x, y, w, h = rect
+        left = max(x, 0)
+        top = max(y, 0)
+        right = min(x + w, mask_width)
+        bottom = min(y + h, mask_height)
+        if right <= left or bottom <= top:
+            return 0.0
+
+        area = max((right - left) * (bottom - top), 1)
+        text_roi = text_mask[top:bottom, left:right]
+        line_roi = line_mask[top:bottom, left:right]
+        text_ratio = cv2.countNonZero(text_roi) / area
+        line_ratio = cv2.countNonZero(line_roi) / area
+        active_rows = np.count_nonzero(np.any(line_roi > 0, axis=1)) / max(line_roi.shape[0], 1)
+        active_columns = np.count_nonzero(np.any(line_roi > 0, axis=0)) / max(line_roi.shape[1], 1)
+        return max(
+            float(line_ratio),
+            min(float(text_ratio) * 4.0, 1.0),
+            float(active_rows) * 0.20,
+            float(active_columns) * 0.08,
+        )
 
     def _merge_full_frame_line_results(self, results: list[OCRFrameResult]) -> list[OCRFrameResult]:
         if len(results) <= 1:
@@ -1780,7 +1940,7 @@ class TextDetectionPipeline:
                 if self._full_frame_text_compatible(result.text, previous.text):
                     chosen_text, chosen_confidence = self._prefer_full_frame_track_text(result, previous)
                     track = _FullFrameTextTrack(
-                        rect=self._smoothed_full_frame_rect(previous.rect, result.rect),
+                        rect=self._stabilized_full_frame_rect(previous, result.rect),
                         text=chosen_text,
                         confidence=chosen_confidence,
                         stable_frames=previous.stable_frames + 1,
@@ -1827,8 +1987,7 @@ class TextDetectionPipeline:
         )
         self._full_frame_ocr_tracks = next_tracks[: max(self.settings.max_boxes * 2, 64)]
 
-        stable_results.sort(key=lambda result: (result.rect[1], result.rect[0]))
-        return stable_results
+        return self._select_full_frame_output_results(stable_results)
 
     def _find_matching_full_frame_track(
         self,
@@ -1840,14 +1999,41 @@ class TextDetectionPipeline:
         for index, track in enumerate(self._full_frame_ocr_tracks):
             if index in used_indices:
                 continue
+            if not self._full_frame_track_can_match(result, track):
+                continue
             score = self._full_frame_track_score(result, track)
             if score > best_score:
                 best_index = index
                 best_score = score
 
-        if best_index is None or best_score < 0.40:
+        if best_index is None or best_score < 0.46:
             return None
         return best_index
+
+    def _full_frame_track_can_match(self, result: OCRFrameResult, track: _FullFrameTextTrack) -> bool:
+        current_rect = result.rect
+        track_rect = track.rect
+        intersection = self._intersection_area(current_rect, track_rect)
+        current_area = max(current_rect[2] * current_rect[3], 1)
+        track_area = max(track_rect[2] * track_rect[3], 1)
+        mutual_overlap = max(intersection / current_area, intersection / track_area)
+        iou = self._intersection_over_union(current_rect, track_rect)
+        size_similarity = self._rect_size_similarity(current_rect, track_rect)
+        center_distance = self._rect_center_distance(current_rect, track_rect)
+        stable_iou_threshold = max(min(self.settings.stable_box_iou_threshold, 1.0), 0.0)
+
+        if self._full_frame_text_compatible(result.text, track.text):
+            if iou >= stable_iou_threshold:
+                return True
+            if mutual_overlap >= 0.72 and size_similarity >= 0.60:
+                return True
+
+            max_width = max(current_rect[2], track_rect[2], 1)
+            max_height = max(current_rect[3], track_rect[3], 1)
+            center_limit = max(max_height * 2.5, min(max_width * 0.08, 80.0), 16.0)
+            return center_distance <= center_limit and size_similarity >= 0.56
+
+        return iou >= max(stable_iou_threshold + 0.20, 0.72) and size_similarity >= 0.82
 
     def _full_frame_track_score(self, result: OCRFrameResult, track: _FullFrameTextTrack) -> float:
         current_rect = result.rect
@@ -1928,20 +2114,55 @@ class TextDetectionPipeline:
             return result.text, result.confidence
         return previous.text, previous.confidence
 
-    def _smoothed_full_frame_rect(
+    def _select_full_frame_output_results(self, results: list[OCRFrameResult]) -> list[OCRFrameResult]:
+        limit = max(min(self.settings.max_ocr_boxes_per_frame, self.settings.max_boxes), 1)
+        if len(results) > limit:
+            results = sorted(results, key=self._full_frame_output_priority, reverse=True)[:limit]
+        results = list(results)
+        results.sort(key=lambda result: (result.rect[1], result.rect[0]))
+        return results
+
+    def _full_frame_output_priority(self, result: OCRFrameResult) -> float:
+        return self._ocr_candidate_priority(result.rect) + min(
+            self._full_frame_text_quality_score(result.text, result.confidence) * 3.0,
+            120.0,
+        )
+
+    def _stabilized_full_frame_rect(
         self,
-        previous: tuple[int, int, int, int],
+        previous_track: _FullFrameTextTrack,
         current: tuple[int, int, int, int],
     ) -> tuple[int, int, int, int]:
-        if self._rect_size_similarity(previous, current) < 0.72:
+        previous = previous_track.rect
+        size_similarity = self._rect_size_similarity(previous, current)
+        if size_similarity < 0.64:
             return current
-        if self._rect_center_proximity(previous, current) < 0.92:
+
+        iou = self._intersection_over_union(previous, current)
+        stable_iou_threshold = max(min(self.settings.stable_box_iou_threshold, 1.0), 0.0)
+        center_distance = self._rect_center_distance(previous, current)
+        max_width = max(previous[2], current[2], 1)
+        max_height = max(previous[3], current[3], 1)
+        jitter_limit = max(max_height * 0.45, min(max_width * 0.012, 12.0), 4.0)
+        if (
+            previous_track.stable_frames >= 1
+            and iou >= max(stable_iou_threshold, 0.50)
+            and center_distance <= jitter_limit
+            and size_similarity >= 0.86
+        ):
+            return previous
+
+        smoothing_limit = max(max_height * 2.0, 16.0)
+        if iou < stable_iou_threshold or center_distance > smoothing_limit:
             return current
+
+        previous_weight = 0.78 if previous_track.stable_frames >= 2 else 0.65
+        current_weight = 1.0 - previous_weight
         return (
-            int(round((previous[0] * 0.45) + (current[0] * 0.55))),
-            int(round((previous[1] * 0.45) + (current[1] * 0.55))),
-            max(int(round((previous[2] * 0.45) + (current[2] * 0.55))), 1),
-            max(int(round((previous[3] * 0.45) + (current[3] * 0.55))), 1),
+            int(round((previous[0] * previous_weight) + (current[0] * current_weight))),
+            int(round((previous[1] * previous_weight) + (current[1] * current_weight))),
+            max(int(round((previous[2] * previous_weight) + (current[2] * current_weight))), 1),
+            max(int(round((previous[3] * previous_weight) + (current[3] * current_weight))), 1),
         )
 
     @classmethod
@@ -3555,6 +3776,7 @@ class TextDetectionPipeline:
         if self.settings.ocr_enabled and self.ocr_backend.is_available():
             if self.ocr_backend.supports_full_frame():
                 ocr_status = f"{self.ocr_backend.describe()} | full-frame OCR"
+                ocr_status = f"{ocr_status} | validation {self._full_frame_ocr_validation_mode()}"
                 if self._last_ocr_candidate_count:
                     ocr_status = f"{ocr_status} | read {self._last_ocr_submitted_count}"
             else:

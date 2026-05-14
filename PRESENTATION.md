@@ -9,9 +9,9 @@
 ## 2. จุดเด่นของระบบ
 
 - จับภาพหน้าจอแบบต่อเนื่องด้วย `mss`
-- ตรวจจับบริเวณข้อความด้วย OpenCV หรือ optional deep detector
+- ตรวจจับบริเวณข้อความด้วย OpenCV, RapidOCR, PaddleOCR หรือ EasyOCR detector
 - รองรับข้อความสีเข้มบนพื้นหลังสว่าง และข้อความสีสว่างบนพื้นหลังมืด
-- รองรับ OCR ผ่าน EasyOCR หรือ Tesseract
+- รองรับ OCR ผ่าน EasyOCR, RapidOCR full-frame OCR หรือ Tesseract
 - รองรับการแปลภาษาแบบ offline ด้วย Argos Translate และ online ด้วย Google Translate
 - มี Qt UI สำหรับ preview ภาพจริง, segmentation mask, translated preview และรายการข้อความ
 - มี on-screen overlay สำหรับแสดงผลแปลทับบนหน้าจอ
@@ -61,7 +61,7 @@ ScreenCapturer
 
 อยู่ใน `src/screenlens_detection/worker.py`
 
-ทำงานเป็น background thread ด้วย `QThread` เพื่อไม่ให้ UI ค้าง โดยแยก capture loop ออกเป็น thread ย่อย และใช้ queue ขนาด 1 เพื่อเก็บเฉพาะ frame ล่าสุด ถ้าประมวลผลไม่ทันจะ drop frame เก่าแทนการปล่อยให้ queue สะสมจน latency สูง
+ทำงานเป็น background thread ด้วย `QThread` เพื่อไม่ให้ UI ค้าง โดยแยก capture loop ออกเป็น thread ย่อย และใช้ queue ขนาด 1 เพื่อเก็บเฉพาะ frame ล่าสุด ถ้า pipeline ยังประมวลผล frame ก่อนหน้าไม่เสร็จตอน capture frame ใหม่เข้ามา ระบบจะ drop frame เก่าที่รออยู่ใน queue แทนการปล่อยให้ queue สะสมจน latency สูง
 
 ### `TextDetectionPipeline`
 
@@ -79,11 +79,11 @@ ScreenCapturer
 
 ### 5.1 Capture Frame
 
-ระบบจับภาพจาก monitor ที่เลือกเป็น frame ต่อเนื่องตาม `capture_interval_ms` ค่า default คือ 250 ms หรือประมาณ 4 FPS สำหรับลดภาระ CPU/GPU และให้ OCR/translation มีเวลาทำงาน
+ระบบจับภาพจาก monitor ที่เลือกเป็น frame ต่อเนื่องตาม `capture_interval_ms` ค่า default คือ 40 ms หรือประมาณ 25 FPS โดย worker จะเก็บเฉพาะ frame ล่าสุดเพื่อลด latency เมื่อ OCR/translation ทำงานช้ากว่า capture loop
 
 ### 5.2 Scale Frame
 
-ภาพถูก upscale ตาม `upscale_factor` ค่า default คือ 1.5 เพื่อช่วยให้ OCR และการ detect ข้อความขนาดเล็กมีข้อมูลมากขึ้น
+ภาพถูกประมวลผลตาม `upscale_factor` ค่า default คือ 1.0 เพื่อคุม latency ในงาน realtime และยังสามารถปรับเพิ่มได้เมื่อต้องอ่านข้อความขนาดเล็ก
 
 ### 5.3 Grayscale + CLAHE
 
@@ -116,9 +116,10 @@ ScreenCapturer
 
 ## 6. Text Detector Modes
 
-ระบบรองรับ detector 3 แบบ:
+ระบบรองรับ detector 4 แบบ:
 
 - `Classic OpenCV (Morphology)` เป็นค่า default ใช้ thresholding, morphology และ connected components
+- `RapidOCR ONNX DBNet (Optional)` ใช้ detector ONNX จาก RapidOCR พร้อมรองรับ CPU/GPU ผ่าน ONNX Runtime
 - `PaddleOCR DBNet (Optional)` ใช้ deep text detector จาก PaddleOCR เมื่อติดตั้ง dependency พร้อม
 - `EasyOCR CRAFT (Optional)` ใช้ detector ของ EasyOCR เมื่อติดตั้ง EasyOCR พร้อม
 
@@ -129,10 +130,11 @@ ScreenCapturer
 ระบบ OCR ถูกออกแบบเป็น backend interface:
 
 - `EasyOCRBackend`
+- `RapidOCRFullBackend`
 - `TesseractOCRBackend`
 - `NoOpOCRBackend`
 
-โดย default จะพยายามใช้ EasyOCR ก่อนถ้ามี จากนั้น fallback ไป Tesseract ถ้าพบ binary หรือ environment ที่ถูกต้อง และถ้าไม่มี backend ใดพร้อมใช้งาน แอปยังรันได้ใน detection-only mode
+โดย default จะพยายามใช้ EasyOCR ก่อนถ้ามี จากนั้น fallback ไป Tesseract ถ้าพบ binary หรือ environment ที่ถูกต้อง ผู้ใช้สามารถเลือก `RapidOCR full OCR` เพื่อให้ RapidOCR ตรวจจับและอ่านข้อความทั้ง frame ใน backend เดียวได้ และถ้าไม่มี backend ใดพร้อมใช้งาน แอปยังรันได้ใน detection-only mode
 
 ก่อน OCR ระบบจะเลือกเฉพาะกล่องที่สำคัญตาม priority และจำกัดจำนวนด้วย `max_ocr_boxes_per_frame` เพื่อลดภาระประมวลผล
 
@@ -199,7 +201,7 @@ src/screenlens_detection/
   models.py                     # dataclass หลักของระบบ
   pipeline.py                   # image processing + OCR + translation pipeline
   text_detectors.py             # detector backend options
-  ocr.py                        # EasyOCR/Tesseract/NoOp OCR backend
+  ocr.py                        # EasyOCR/RapidOCR/Tesseract/NoOp OCR backend
   translation.py                # Argos/Google/NoOp translation backend
   worker.py                     # background processing worker
   overlay.py                    # on-screen translated overlay
@@ -234,26 +236,33 @@ queue ของ worker เก็บเฉพาะ frame ล่าสุด เ�
 
 overlay window ถูก exclude จาก screen capture บน Windows เพื่อป้องกันระบบเห็นข้อความแปลของตัวเอง
 
-## 16. Flow สำหรับ Demo
+## 16. Windows Build สำหรับ Clean VM
 
-1. เปิดแอปด้วย `python screenlens.py` หรือ `screenlens`
+สำหรับเครื่อง Windows ที่สะอาดมาก สามารถใช้ `build_screenlens_exe.bat` เป็น entrypoint หลักได้ script จะสร้าง `.venv` เมื่อยังไม่มี, ติดตั้ง dependency ที่ต้องใช้, เตรียม EasyOCR/RapidOCR/PaddleOCR, ดาวน์โหลด Argos model สำหรับ offline translation และเตรียม bundled Tesseract runtime ใน `vendor/tesseract`
+
+ผลลัพธ์ build อยู่ที่ `dist/ScreenLens/ScreenLens.exe` และต้องย้ายทั้งโฟลเดอร์ `dist/ScreenLens/` ไปทดสอบ ไม่ใช่ย้ายเฉพาะไฟล์ exe เพราะ build เป็น PyInstaller แบบ onedir
+
+## 17. Flow สำหรับ Demo
+
+1. เปิดแอปด้วย `dist/ScreenLens/ScreenLens.exe` สำหรับ clean VM หรือ `python screenlens.py` / `screenlens` สำหรับ local development
 2. เลือก monitor ที่ต้องการจับภาพ
 3. เลือก detector เป็น `Classic OpenCV (Morphology)` เพื่อ demo แบบไม่ต้องพึ่ง deep dependency
-4. เลือก OCR backend/device ตามเครื่อง เช่น EasyOCR CPU/GPU
+4. เลือก OCR backend/device ตามเครื่อง เช่น RapidOCR full OCR, EasyOCR CPU/GPU หรือ Tesseract
 5. เลือก translation mode เช่น Argos Offline
 6. กด Start เพื่อเริ่ม capture และดู preview
 7. เปิด on-screen overlay เพื่อแสดงผลแปลบนจอจริง
 8. เปิด Recording หากต้องการเก็บวิดีโอและ log
 
-## 17. ข้อจำกัด
+## 18. ข้อจำกัด
 
 - ความแม่นยำของ OCR ขึ้นกับขนาดตัวอักษร, font, contrast, motion blur และภาษา
-- Deep detector และ EasyOCR ต้องใช้ dependency เพิ่ม และอาจต้องใช้ GPU เพื่อความเร็วที่ดี
+- Deep detector, EasyOCR และ PaddleOCR ต้องใช้ dependency/model เพิ่ม และอาจต้องใช้ GPU เพื่อความเร็วที่ดี
+- EasyOCR อาจดาวน์โหลด model weights ครั้งแรกบนเครื่องใหม่ แต่ clean VM ที่มี internet ใช้งานได้
 - Google Translate mode ต้องใช้อินเทอร์เน็ต และมีโอกาสโดน rate limit
 - Overlay capture exclusion ใช้ Windows API จึงมีผลเฉพาะบน Windows
 - การจับภาพเป็นระดับ monitor ยังไม่ใช่ region selection แบบลากพื้นที่เอง
 
-## 18. แนวทางพัฒนาต่อ
+## 19. แนวทางพัฒนาต่อ
 
 - เพิ่ม region selection เพื่อจำกัดพื้นที่ OCR
 - เพิ่ม profile settings สำหรับงานแต่ละประเภท เช่น subtitle, game UI, document
@@ -262,7 +271,7 @@ overlay window ถูก exclude จาก screen capture บน Windows เพ�
 - เพิ่ม model/engine benchmark ระหว่าง OpenCV, PaddleOCR และ EasyOCR
 - เพิ่ม UI สำหรับตรวจสอบ translation cache และ recording history
 
-## 19. สรุป
+## 20. สรุป
 
 ScreenLens-Detection เป็นระบบ Vision + AI Integration ที่รวม screen capture, image processing, text detection, OCR, translation และ desktop overlay เข้าไว้ใน workflow เดียว จุดแข็งของระบบคือทำงานแบบ realtime ได้จริง มี fallback เมื่อ dependency ไม่พร้อม และมีโครงสร้าง backend ที่ขยายต่อได้ง่าย
 

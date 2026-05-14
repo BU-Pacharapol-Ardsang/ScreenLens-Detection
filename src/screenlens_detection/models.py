@@ -66,6 +66,7 @@ class PipelineSettings:
     ocr_language: str = "tha+eng+jpn"
     ocr_psm: int = 7
     max_ocr_boxes_per_frame: int = 12
+    full_frame_ocr_validation_mode: str = "balanced"
     stable_ocr_frames: int = 1
     stable_box_iou_threshold: float = 0.45
     motion_filter_enabled: bool = False
