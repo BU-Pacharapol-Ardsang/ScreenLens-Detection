@@ -112,6 +112,7 @@ class MainWindow(QMainWindow):
         self.translation_block_mode_combo = QComboBox()
         self.subtitle_render_mode_combo = QComboBox()
         self.ocr_backend_combo = QComboBox()
+        self.full_frame_ocr_validation_combo = QComboBox()
         self.translation_stability_checkbox = QCheckBox("Text similarity stability")
         self.translation_stability_checkbox.setChecked(defaults.translation_similarity_stability_enabled)
         self.ocr_checkbox = QCheckBox("Enable OCR")
@@ -165,6 +166,7 @@ class MainWindow(QMainWindow):
         self._populate_translation_region_mode_control()
         self._populate_translation_block_mode_control()
         self._populate_subtitle_render_mode_control()
+        self._populate_full_frame_ocr_validation_control()
         self._populate_overlay_tracking_mode_control()
         self._populate_language_controls()
         self._connect_signals()
@@ -203,6 +205,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Subtitle style", self.subtitle_render_mode_combo)
         settings_layout.addRow("", self.translation_stability_checkbox)
         settings_layout.addRow("OCR backend", self.ocr_backend_combo)
+        settings_layout.addRow("Full OCR validation", self.full_frame_ocr_validation_combo)
         settings_layout.addRow("OCR device", self.ocr_device_combo)
         settings_layout.addRow("", self.ocr_checkbox)
         settings_layout.addRow("", self.overlay_tracking_checkbox)
@@ -270,6 +273,7 @@ class MainWindow(QMainWindow):
         self.translation_block_mode_combo.setEnabled(not locked)
         self.subtitle_render_mode_combo.setEnabled(not locked)
         self.ocr_backend_combo.setEnabled(not locked)
+        self.full_frame_ocr_validation_combo.setEnabled(not locked)
         self.translation_stability_checkbox.setEnabled(not locked)
         self.ocr_device_combo.setEnabled(not locked)
         self.ocr_checkbox.setEnabled(not locked)
@@ -318,6 +322,12 @@ class MainWindow(QMainWindow):
         self.subtitle_render_mode_combo.addItem("Bubble overlay", userData="bubble")
         self.subtitle_render_mode_combo.addItem("Clean patch (experimental)", userData="clean_patch")
         self.subtitle_render_mode_combo.setCurrentIndex(0)
+
+    def _populate_full_frame_ocr_validation_control(self) -> None:
+        self.full_frame_ocr_validation_combo.addItem("Balanced", userData="balanced")
+        self.full_frame_ocr_validation_combo.addItem("Fast (raw)", userData="fast")
+        self.full_frame_ocr_validation_combo.addItem("Strict", userData="strict")
+        self.full_frame_ocr_validation_combo.setCurrentIndex(0)
 
     def _populate_overlay_tracking_mode_control(self) -> None:
         self.overlay_tracking_mode_combo.addItem("Legacy motion", userData="legacy")
@@ -381,6 +391,7 @@ class MainWindow(QMainWindow):
             subtitle_render_mode=self.subtitle_render_mode_combo.currentData(),
             ocr_enabled=self.ocr_checkbox.isChecked(),
             ocr_backend_mode=self.ocr_backend_combo.currentData(),
+            full_frame_ocr_validation_mode=self.full_frame_ocr_validation_combo.currentData(),
             ocr_device_preference=self.ocr_device_combo.currentData(),
             ocr_language=resolve_ocr_language(self.source_language_combo.currentData()),
             overlay_tracking_enabled=self.overlay_tracking_checkbox.isChecked(),

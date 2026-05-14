@@ -1625,7 +1625,9 @@ class TranslationOverlay(QWidget):
         flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap
 
         single_line_width = metrics.horizontalAdvance(normalized)
-        max_bubble_width = min(max(bounds_width - 8, anchor_rect.width()), max(260, int(bounds_width * 0.45)))
+        available_width = max(bounds_width - 8, 1)
+        expansion_limit = min(max(260, int(bounds_width * 0.45)), available_width)
+        max_bubble_width = min(max(anchor_rect.width(), expansion_limit), available_width)
         target_bubble_width = max(anchor_rect.width(), single_line_width + (horizontal_padding * 2) + 4)
         if target_bubble_width > max_bubble_width:
             target_bubble_width = max_bubble_width

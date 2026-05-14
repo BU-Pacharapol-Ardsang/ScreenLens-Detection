@@ -199,6 +199,8 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert easyocr_index >= 0
         rapidocr_ocr_index = window.ocr_backend_combo.findData("rapidocr")
         assert rapidocr_ocr_index >= 0
+        strict_validation_index = window.full_frame_ocr_validation_combo.findData("strict")
+        assert strict_validation_index >= 0
         scanline_index = window.scanline_roi_combo.findData(True)
         assert scanline_index >= 0
         hover_region_index = window.translation_region_mode_combo.findData("hover")
@@ -211,6 +213,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         window.translation_mode_combo.setCurrentIndex(google_index)
         window.text_detector_combo.setCurrentIndex(easyocr_index)
         window.ocr_backend_combo.setCurrentIndex(rapidocr_ocr_index)
+        window.full_frame_ocr_validation_combo.setCurrentIndex(strict_validation_index)
         window.scanline_roi_combo.setCurrentIndex(scanline_index)
         window.translation_region_mode_combo.setCurrentIndex(hover_region_index)
         window.translation_block_mode_combo.setCurrentIndex(strict_block_index)
@@ -238,6 +241,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert worker.settings.translation_mode == "google"
         assert worker.settings.text_detector_mode == "easyocr"
         assert worker.settings.ocr_backend_mode == "rapidocr"
+        assert worker.settings.full_frame_ocr_validation_mode == "strict"
         assert worker.settings.detection_scale == 0.50
         assert worker.settings.scanline_roi_enabled is True
         assert worker.settings.translation_region_mode == "hover"
@@ -254,6 +258,7 @@ def test_main_window_start_stop_preserves_selected_translation_mode(monkeypatch)
         assert window.worker is worker
         assert window.text_detector_combo.isEnabled() is False
         assert window.ocr_backend_combo.isEnabled() is False
+        assert window.full_frame_ocr_validation_combo.isEnabled() is False
         assert window.scanline_roi_combo.isEnabled() is False
         assert window.translation_mode_combo.isEnabled() is False
         assert window.translation_region_mode_combo.isEnabled() is False
