@@ -1,393 +1,339 @@
 # ScreenLens-Detection - สรุปโครงการ
 
+เอกสารนี้อ้างอิงโค้ดปัจจุบันบน branch `feature-optimization-efficency-4` ที่ HEAD `5f1cf9c` และสรุป pipeline, module, feature และ runtime flow ที่มีอยู่จริงใน repository ตอนนี้
+
 ## ภาพรวมโครงการ
 
-**ScreenLens-Detection** เป็นแอปเดสก์ท็อปที่พัฒนาด้วย Python + Qt สำหรับจับภาพหน้าจอแบบเรียลไทม์ ตรวจจับบริเวณที่น่าจะเป็นข้อความด้วย OpenCV หรือ optional deep detector และสามารถทำ OCR กับแปลภาษาเพิ่มเติมผ่าน backend ที่เลือกได้
+**ScreenLens-Detection** เป็นแอปเดสก์ท็อป Python + Qt สำหรับจับภาพหน้าจอแบบเรียลไทม์ ตรวจจับข้อความบนภาพ ทำ OCR แปลภาษา และแสดงผลกลับเป็น preview หรือ overlay บนหน้าจอ ระบบถูกออกแบบให้เลือก backend ได้หลายแบบ เพื่อเทียบความเร็ว/ความแม่นยำของ OpenCV, EasyOCR, RapidOCR, PaddleOCR, Tesseract, Argos และ Google Translate
 
-องค์ประกอบหลักของระบบในโค้ดปัจจุบันมีดังนี้:
+องค์ประกอบหลักในโค้ดปัจจุบัน:
 
-- **การจับภาพหน้าจอ**: ใช้ `mss` สำหรับดึงภาพจากจอภาพที่เลือก
-- **การประมวลผลภาพ**: ใช้ OpenCV สำหรับ grayscale, CLAHE, thresholding, morphology และการคัดกรองกล่องข้อความ พร้อม optional detector จาก RapidOCR, PaddleOCR และ EasyOCR
-- **OCR**: รองรับ EasyOCR, RapidOCR full-frame OCR และ `pytesseract` ร่วมกับ Tesseract OCR
-- **การแปลภาษา**: รองรับ Argos Translate แบบ offline และ Google Translate ผ่าน `deep-translator`
-- **Desktop UI**: ใช้ PySide6 สำหรับแสดงภาพ preview, mask preview, translated preview, overlay และข้อความที่ตรวจจับได้
+- **Screen capture**: ใช้ `mss` ผ่าน `ScreenCapturer` เพื่อจับภาพ monitor ที่เลือก
+- **Realtime worker**: ใช้ `ProcessingWorker(QThread)` และ capture thread แยก พร้อม `_LatestFrameQueue` ขนาด 1 ที่ทิ้ง frame เก่าเมื่อ process ไม่ทัน
+- **Text detection**: ใช้ OpenCV morphology เป็น default และเลือก deep detector ได้ผ่าน RapidOCR ONNX DBNet, PaddleOCR DBNet หรือ EasyOCR CRAFT
+- **OCR**: รองรับ crop OCR ผ่าน EasyOCR/Tesseract พร้อม `QueuedOCRBackend` และรองรับ RapidOCR full-frame OCR ผ่าน `recognize_frame()`
+- **Translation**: รองรับ Argos Translate offline และ Google Translate online พร้อม queue/cache/reuse
+- **Overlay**: แสดงคำแปลบนหน้าจอด้วย bubble mode หรือ clean patch mode พร้อม overlay tracking แบบ legacy motion หรือ visual anchor
+- **Recording/debug**: บันทึก annotated/segmentation/translated preview และ `session_log.jsonl` พร้อม runtime timings ต่อ stage
+- **Windows integration**: มี Windows hotkeys, overlay capture exclusion และ build flow สำหรับ PyInstaller onedir
 
 **เวอร์ชัน**: 0.1.0  
 **Python**: 3.11+  
-**ลักษณะการรัน**:
+**Runtime ที่รองรับ**:
 
-- ตัว package หลักรันได้ผ่าน `python -m screenlens_detection` หรือคำสั่ง `screenlens`
-- launcher ไฟล์ `screenlens.py` และ `screenlens.pyw` ถูกเขียนให้พึ่งพา `.venv\Scripts\python(.w).exe` จึงเป็น flow ที่เน้น Windows
-- สำหรับเครื่อง Windows ใหม่ให้ใช้ `build_screenlens_exe.bat` เพื่อสร้าง `dist\ScreenLens\ScreenLens.exe` พร้อม runtime ที่จำเป็น
+- `python -m screenlens_detection`
+- `screenlens` หรือ `screenlens-detection`
+- `python screenlens.py`
+- double-click `screenlens.pyw` บน Windows เมื่อมี `.venv`
+- `build_screenlens_exe.bat` สำหรับสร้าง `dist\ScreenLens\ScreenLens.exe`
 
----
+## Pipeline การทำงานปัจจุบัน
 
-## Pipeline การทำงาน
-
-ลำดับการประมวลผลในโค้ดปัจจุบัน:
+ลำดับหลักใน `TextDetectionPipeline.process()`:
 
 ```text
-1. Capture Frame
-   ดึงภาพจาก monitor ที่ผู้ใช้เลือก
-
-2. Preprocessing
-   แปลงภาพเป็น grayscale และเพิ่ม contrast ด้วย CLAHE
-
-3. Text Mask Detection
-   สร้าง mask สำหรับข้อความทั้งแบบตัวอักษรมืดบนพื้นหลังสว่าง
-   และตัวอักษรสว่างบนพื้นหลังมืด
-
-4. Line Mask / Region Grouping
-   ใช้ morphology เพื่อรวมกลุ่มพิกเซลที่น่าจะเป็นบรรทัดข้อความ
-
-5. Text Box Extraction
-   คัดกรอง candidate boxes ตามขนาด, aspect ratio,
-   edge density และ foreground ratio
-
-6. OCR Recognition
-   เรียก OCR backend ที่เลือก เช่น EasyOCR, RapidOCR full OCR หรือ Tesseract
-
-7. Translation
-   แปลข้อความที่ OCR ได้ตาม source/target language ที่เลือก
-
-8. Visualization
-   วาดกรอบบนภาพจริง, แสดง segmentation preview
-   และสรุปผลข้อความใน UI
+Capture selected monitor
+  -> LatestFrameQueue keeps only newest frame
+  -> ProcessingWorker receives frame
+  -> Scale frame by effective detection_scale/upscale_factor
+  -> Enhance grayscale
+  -> Choose detection/OCR path
+       A. hover + RapidOCR full-frame OCR
+       B. RapidOCR full-frame OCR
+       C. hover ROI + detector + crop OCR
+       D. scanline ROI + detector + crop OCR
+       E. full-frame detector + crop OCR
+  -> Crop path: stabilize boxes + optional motion filter + queued OCR
+  -> Full-frame path: filter/merge/validate/stabilize OCR frame results
+  -> Estimate frame motion offset
+  -> Translation reuse/cache + line or strict block translation
+  -> Build previews, status, runtime timings and FrameAnalysis
+  -> UI / overlay / recording
 ```
 
----
+decision path สำคัญ:
+
+- `ocr_backend.supports_full_frame()` และ `translation_region_mode == "hover"`: ใช้ `_annotate_hover_with_full_frame_ocr()`
+- `ocr_backend.supports_full_frame()` และ full-screen mode: ใช้ `_annotate_with_full_frame_ocr()`
+- hover mode ที่ไม่ใช่ full-frame OCR: ใช้ `_hover_detection_pass()` แล้ว crop OCR
+- `scanline_roi_enabled=True`: ใช้ `_scanline_detection_pass()` เพื่อแบ่ง frame เป็น vertical bands
+- default: ใช้ `_text_detection_pass()` โดยเลือก OpenCV หรือ deep detector ตาม `text_detector_mode`
+
+ผลลัพธ์คือ `FrameAnalysis` ที่มี `boxes`, `source_frame`, preview frames, FPS, OCR runtime status, motion offset และ `runtime_timings_ms`
 
 ## โครงสร้างโครงการ
 
 ```text
 ScreenLens-Detection/
-├── build_screenlens_exe.bat         # Build entrypoint สำหรับ Windows exe
-├── screenlens.py                    # Launcher แบบมี console
-├── screenlens.pyw                   # Launcher แบบไม่มี console บน Windows
-├── screenlens.spec                  # PyInstaller spec
-├── pyproject.toml                   # Project metadata และ dependencies
-├── requirements.txt                 # Runtime dependencies
-├── README.md                        # เอกสารภาพรวม
-├── PROJECT_SUMMARY.md               # เอกสารสรุปโครงการ
+├── build_screenlens_exe.bat
+├── screenlens.py
+├── screenlens.pyw
+├── screenlens.spec
+├── pyproject.toml
+├── requirements.txt
+├── README.md
+├── PROJECT_SUMMARY.md
+├── ARCHITECTURE_EVOLUTION.md
+├── PIPELINE_MERMAID.md
+├── PRESENTATION.md
 ├── scripts/
-│   ├── setup_windows.ps1            # ติดตั้ง dependency, OCR runtimes และ model ที่ต้องใช้
-│   ├── build_windows.ps1            # สร้าง PyInstaller onedir build
-│   ├── install_tesseract_vendor.ps1 # เตรียม bundled Tesseract runtime
-│   └── download_argos_models.py     # ดาวน์โหลด Argos model สำหรับ offline translation
+│   ├── setup_windows.ps1
+│   ├── build_windows.ps1
+│   ├── install_tesseract_vendor.ps1
+│   └── download_argos_models.py
 ├── vendor/
-│   ├── argos/                       # bundled Argos model files
-│   └── tesseract/                   # bundled Tesseract runtime สำหรับ packaged exe
+│   ├── argos/
+│   └── tesseract/
 ├── src/
-│   ├── screenlens_detection/
-│   │   ├── __init__.py
-│   │   ├── __main__.py              # python -m screenlens_detection
-│   │   ├── main.py                  # Qt application entry point
-│   │   ├── launcher.py              # ตรวจและบังคับใช้ interpreter ใน .venv
-│   │   ├── capture.py               # Screen capture
-│   │   ├── pipeline.py              # Text detection pipeline
-│   │   ├── ocr.py                   # OCR backends
-│   │   ├── translation.py           # Translation backends
-│   │   ├── worker.py                # Background processing thread
-│   │   ├── languages.py             # Language options และ language mapping
-│   │   ├── models.py                # Data models
-│   │   └── ui/
-│   │       ├── __init__.py
-│   │       └── main_window.py       # Main window UI
-│   └── screenlens_detection.egg-info/
+│   └── screenlens_detection/
+│       ├── app_entry.py
+│       ├── capture.py
+│       ├── cursor.py
+│       ├── languages.py
+│       ├── launcher.py
+│       ├── main.py
+│       ├── models.py
+│       ├── motion.py
+│       ├── ocr.py
+│       ├── onnxruntime_utils.py
+│       ├── overlay.py
+│       ├── overlay_tracker.py
+│       ├── overlay_tracks.py
+│       ├── pipeline.py
+│       ├── recording.py
+│       ├── runtime.py
+│       ├── subtitle_cleaner.py
+│       ├── text_detectors.py
+│       ├── translation.py
+│       ├── windows_capture_exclusion.py
+│       ├── windows_hotkeys.py
+│       ├── worker.py
+│       └── ui/main_window.py
 └── tests/
-    ├── test_languages.py
-    ├── test_launcher.py
-    └── test_pipeline.py
+    ├── test_pipeline.py
+    ├── test_ocr.py
+    ├── test_translation.py
+    ├── test_text_detectors.py
+    ├── test_overlay.py
+    ├── test_motion.py
+    ├── test_recording.py
+    ├── test_subtitle_cleaner.py
+    ├── test_main_window.py
+    └── tests อื่นสำหรับ launcher/languages/motion/windows utilities
 ```
-
----
 
 ## โมดูลหลัก
 
-### 1. `capture.py`
+### `models.py`
 
-- ใช้ `mss` สำหรับ enumerate monitor และจับภาพจาก monitor ที่เลือก
-- คืนค่า frame ในรูปแบบ OpenCV BGR
+- `PipelineSettings` รวม setting ทั้ง pipeline เช่น detection scale, scanline ROI, hover ROI, translation block mode, subtitle render mode, OCR backend/device, full-frame validation, overlay tracking และ runtime debug
+- `DetectionBox` เก็บตำแหน่งกล่อง, OCR text, translated text, language route และ confidence
+- `FrameAnalysis` เป็น payload ที่ worker ส่งให้ UI/overlay/recording
 
-### 2. `pipeline.py`
+### `worker.py`
 
-ศูนย์กลางของการประมวลผลภาพ ประกอบด้วย:
+- แยก UI ออกจาก processing ด้วย `QThread`
+- แยก capture loop เป็น thread ชื่อ `ScreenLensCapture`
+- `_LatestFrameQueue(maxsize=1)` จะ drop frame เก่าเพื่อให้ latency ต่ำ
+- hover mode ใช้ dwell/tolerance ก่อนยืนยัน cursor target
 
-- ปรับขนาดภาพด้วย `upscale_factor`
-- แปลงเป็น grayscale และเพิ่ม contrast ด้วย CLAHE
-- ตรวจจับข้อความแบบ **dual-polarity**
-  - ตัวอักษรมืดบนพื้นหลังสว่าง
-  - ตัวอักษรสว่างบนพื้นหลังมืด
-- ใช้ morphology และ connected components เพื่อรวม/คัดกรองบริเวณข้อความ
-- merge กล่องที่อยู่บรรทัดเดียวกัน และ suppress กล่องที่ซ้อนกัน
-- เรียก OCR และแปลภาษาเมื่อเปิดใช้งาน
-- สร้าง annotated frame และ segmentation preview
+### `pipeline.py`
 
-### 3. `ocr.py`
+- ทำ scale-aware preprocessing และ detection
+- รองรับ OpenCV/deep detector path, scanline ROI, hover ROI, crop OCR และ full-frame OCR
+- มี OCR cache จาก crop fingerprint + geometry + motion-adjusted matching
+- full-frame OCR มี filter, merge line, validation mode, track stabilization และ output limit
+- translation มี recent reuse, hover metadata filtering, subtitle line combining, strict block translation และ line translation
 
-- มี backend หลักคือ `EasyOCRBackend`, `RapidOCRFullBackend` และ `TesseractOCRBackend`
-- รองรับ queued OCR เพื่อลด latency และลดการ OCR ซ้ำ
-- fallback เป็น `NoOpOCRBackend` ถ้าไม่มี OCR backend พร้อมใช้งาน
-- รองรับ bundled Tesseract runtime, `TESSERACT_CMD` และ `TESSDATA_PREFIX`
+### `ocr.py`
 
-### 4. `translation.py`
+- backend หลัก: `EasyOCRBackend`, `RapidOCRFullBackend`, `TesseractOCRBackend`
+- `QueuedOCRBackend` ทำ cache และ worker queue สำหรับ crop OCR backend
+- Tesseract ใช้ bundled runtime ได้จาก `vendor/tesseract` หรือ environment variables
+- RapidOCR full OCR ใช้ ONNX Runtime CPU/CUDA ตาม provider ที่ติดตั้ง
 
-- มี backend หลักคือ `ArgosTranslateBackend` สำหรับ offline translation และ `GoogleTranslateBackend` สำหรับ online translation
-- ติดตั้ง bundled Argos `en<->th` model ที่ runtime เมื่อพบไฟล์ใน `vendor/argos`
-- fallback เป็น `NoOpTranslationBackend` ถ้าไม่มี translation backend พร้อมใช้งาน
-- มี cache และ queue สำหรับลดการแปลข้อความซ้ำ
+### `text_detectors.py`
 
-### 5. `models.py`
+- OpenCV detector อยู่ใน `pipeline.py`
+- optional deep detector อยู่ใน `text_detectors.py`: RapidOCR ONNX DBNet, PaddleOCR DBNet และ EasyOCR CRAFT
+- RapidOCR detector มี CUDA fallback เป็น CPU ถ้า ONNX Runtime CUDA init ไม่สำเร็จ
 
-- `MonitorSpec`: ข้อมูลของ monitor
-- `PipelineSettings`: ค่าตั้งต้นของ pipeline
-- `DetectionBox`: กล่องข้อความพร้อมผล OCR/translation
-- `FrameAnalysis`: ผลลัพธ์ที่ worker ส่งกลับไปยัง UI
+### `translation.py`
 
-### 6. `worker.py`
+- `ArgosTranslateBackend` สำหรับ offline translation และ bundled model `en<->th`
+- `GoogleTranslateBackend` สำหรับ online translation ผ่าน `deep-translator`
+- `QueuedTranslationBackend` ทำ cache, queue, sync budget และ batch ตาม route ภาษา
 
-- ใช้ `QThread` เพื่อประมวลผลแบบ background
-- จับภาพ -> ส่งเข้า pipeline -> ส่งผลกลับ UI ผ่าน signal
+### `overlay.py`, `overlay_tracks.py`, `overlay_tracker.py`
 
-### 7. `languages.py`
+- `TranslationOverlay` วาดคำแปลบนหน้าจอ
+- bubble mode ขยายกล่องให้พอดีข้อความยาวและลด font เมื่อพื้นที่จำกัด
+- clean patch mode ใช้ source frame เพื่อทำ patch ลบ subtitle เดิมก่อนวาดคำแปล
+- `OverlayTrackManager` associate track จาก text similarity, IoU และ proximity
+- `OverlayTrackingWorker` จับ frame grayscale ความละเอียดลดลงเพื่อช่วย track overlay ระหว่าง frame หลัก
 
-- จัดการ source/target language options
-- map รหัสภาษาสำหรับ OCR และ translation
-- ตรวจภาษาแบบง่ายจากตัวอักษรไทย/อังกฤษ
+### `subtitle_cleaner.py`
 
-### 8. `ui/main_window.py`
+- สร้าง text mask จาก contrast, edge, HSV และ local delta
+- ใช้ `cv2.inpaint()` เมื่อ mask เหมาะสม
+- fallback เป็น soft background patch เมื่อ mask ratio ไม่เหมาะกับ inpainting
 
-- มี control สำหรับเลือก monitor และเริ่ม/หยุด worker
-- แสดง annotated preview, segmentation preview และข้อความที่ตรวจจับได้
-- แสดง runtime stats เช่น FPS, จำนวนกล่อง, monitor และสถานะระบบ
+### `recording.py`
 
----
+- สร้าง directory ใต้ `recordings/`
+- เขียน `annotated_preview.mp4`, `segmentation_preview.mp4`, `translated_preview.mp4`
+- เขียน `session_log.jsonl` พร้อม FPS, timings, OCR runtime, motion offset และ boxes ต่อ frame
 
-## ฟีเจอร์ที่มีอยู่ในโค้ดปัจจุบัน
+### `ui/main_window.py`
 
-✅ **Realtime Monitor Capture** - จับภาพจาก monitor ที่เลือกเป็นช่วงเวลา  
-✅ **Dual-Polarity Text Detection** - ตรวจจับข้อความทั้งแบบตัวอักษรมืดบนพื้นหลังสว่าง และตัวอักษรสว่างบนพื้นหลังมืด  
-✅ **Selectable Deep Detectors** - รองรับ RapidOCR ONNX DBNet, PaddleOCR DBNet และ EasyOCR CRAFT  
-✅ **Segmentation Preview** - แสดง mask preview พร้อมกรอบของ region ที่ผ่านการคัดกรอง  
-✅ **Selectable OCR** - รองรับ EasyOCR, RapidOCR full OCR และ Tesseract OCR  
-✅ **Offline/Online Translation** - แปลผ่าน Argos Translate แบบ offline หรือ Google Translate แบบ online  
-✅ **Language Routing** - รองรับ source language แบบ `Auto detect`, `English`, `Thai`, `Thai + English` และ target language แบบ `Thai` / `English`  
-✅ **Adjustable Runtime Settings** - ปรับค่าได้จาก UI ได้แก่ detector, OCR backend/device, translation mode, source/target language, preview และ overlay/recording  
-✅ **Clean Windows Build** - `build_screenlens_exe.bat` สร้าง PyInstaller onedir build พร้อม bundled Tesseract และ Argos model  
-✅ **Windows Convenience Launchers** - ใช้งานผ่าน `screenlens.py` หรือ `screenlens.pyw` ได้เมื่อมี `.venv` ตามโครงสร้างที่โค้ดคาดไว้
+- รวม control สำหรับ monitor, detector, OCR backend/device, full-frame validation, translation mode, hover/full region, strict block, subtitle render mode, overlay tracking, preview และ runtime debug
+- รองรับ Windows hotkeys สำหรับ toggle overlay / hover target mode
+- เชื่อม worker, overlay, overlay tracker และ recording session
 
----
+## ฟีเจอร์ปัจจุบัน
+
+- Realtime monitor capture พร้อม frame dropping
+- OpenCV text detection แบบ dual-polarity และ scale-aware filtering
+- Selectable deep detector: RapidOCR, PaddleOCR, EasyOCR
+- Crop OCR queue/cache สำหรับ EasyOCR/Tesseract
+- RapidOCR full-frame OCR พร้อม validation mode `fast`, `balanced`, `strict`
+- Hover region translation และ scanline ROI
+- Strict block translation สำหรับ paragraph/subtitle หลายบรรทัด
+- Translation cache/reuse และ queued translation
+- Bubble overlay ที่ขยายตามข้อความและไม่เล็กกว่า anchor
+- Clean patch subtitle rendering แบบ experimental
+- Overlay tracking แบบ legacy motion และ visual anchor lock
+- Optional annotated/segmentation/translated previews
+- Recording เป็น 3 video streams + JSONL session log
+- Runtime debug timings ต่อ stage
+- Windows hotkeys และ capture exclusion สำหรับ overlay window
+- Windows setup/build ที่ตรวจ Torch และ ONNX Runtime provider หลังติดตั้ง
 
 ## Technology Stack
 
 ### Core Dependencies
 
 | Library | Version | Purpose |
-|---------|---------|---------|
+| --- | --- | --- |
 | `PySide6` | `>=6.8.0` | Qt GUI framework |
-| `opencv-python` | `>=4.10.0.84` | Computer vision |
+| `opencv-python` | `>=4.10.0.84` | Computer vision, masks, tracking, recording |
 | `numpy` | `>=2.1.0` | Numerical processing |
 | `mss` | `>=10.0.0` | Screen capture |
 | `Pillow` | `>=10.4.0` | Image bridge for OCR |
-| `pytesseract` | `>=0.3.13` | Python wrapper สำหรับ Tesseract |
+| `pytesseract` | `>=0.3.13` | Tesseract wrapper |
 | `argostranslate` | `>=1.11.0` | Offline translation |
-| `deep-translator` | `>=1.11.4` | Translation backend |
+| `deep-translator` | `>=1.11.4` | Google translation backend |
 
 ### Optional / Build-time
 
-- `pytest>=8.3.0` สำหรับ test suite
-- `pyinstaller>=6.14.0` สำหรับสร้าง Windows exe
-- `easyocr`, `rapidocr`, `onnxruntime`, `paddleocr`, `paddlepaddle`, `torch`, `torchvision` ถูกติดตั้งโดย `scripts/setup_windows.ps1`
-- Tesseract OCR runtime ถูกเตรียมเข้า `vendor/tesseract` โดย `scripts/install_tesseract_vendor.ps1`
-
----
+- `easyocr>=1.7.2`
+- `rapidocr>=3.0.0`
+- `onnxruntime>=1.20.0` หรือ `onnxruntime-gpu>=1.20.0`
+- `paddleocr>=3.0.0`, `paddlepaddle>=3.0.0`
+- `torch==2.10.0`, `torchvision==0.25.0` ผ่าน setup script
+- `pyinstaller>=6.14.0`
+- `pytest>=8.3.0`
 
 ## Installation & Setup
-
-### 1. Clone Repository
-
-```bash
-git clone <repository-url>
-cd ScreenLens-Detection
-```
-
-### 2. Create Virtual Environment
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-```
-
-### 3. Install Runtime Dependencies
-
-```powershell
 pip install -e .
 ```
 
-### 4. Windows Setup สำหรับ backend ครบ
+สำหรับ Windows setup ที่ติดตั้ง optional backend ครบ:
 
 ```powershell
 .\scripts\setup_windows.ps1 -TorchRuntime cpu
 ```
 
-ใช้ `-TorchRuntime gpu` เมื่อต้องการ build/runtime ที่ target CUDA และเครื่อง build มี NVIDIA GPU พร้อม driver ที่รองรับ
+สำหรับ GPU runtime:
 
-### 5. Build Windows EXE สำหรับ Clean VM
+```powershell
+.\scripts\setup_windows.ps1 -TorchRuntime gpu
+```
+
+`setup_windows.ps1` จะติดตั้ง project, EasyOCR, RapidOCR, Torch, PaddleOCR, bundled Tesseract และ Argos models จากนั้นตรวจ diagnostics ของ Torch และ ONNX Runtime ถ้าเลือก GPU แต่ `torch.cuda.is_available()` หรือ `CUDAExecutionProvider` ไม่พร้อม script จะ fail ทันที
+
+## Build Windows EXE
 
 ```powershell
 .\build_screenlens_exe.bat -TorchRuntime cpu
 ```
 
-ผลลัพธ์อยู่ที่ `dist\ScreenLens\ScreenLens.exe` และต้องย้ายทั้งโฟลเดอร์ `dist\ScreenLens\` ไปทดสอบ เพราะเป็น PyInstaller แบบ onedir
-
-ขั้นตอน build จะเตรียม bundled Tesseract runtime ใน `vendor\tesseract`, ดาวน์โหลด Argos model ไป `vendor\argos`, ติดตั้ง EasyOCR/RapidOCR/PaddleOCR และตรวจ runtime หลักก่อน build
-
-### 6. Optional: Install Dev Dependencies
+หรือ:
 
 ```powershell
-pip install -e ".[dev]"
-pytest
+.\build_screenlens_exe.bat -TorchRuntime gpu
 ```
 
----
+build flow:
 
-## วิธีใช้งาน
+- `build_screenlens_exe.bat` forward option ไป `scripts\build_windows.ps1`
+- `build_windows.ps1` สร้าง/ใช้ `.venv`, run setup และเรียก PyInstaller
+- `setup_windows.ps1` ติดตั้ง `rapidocr>=3.0.0` แยกก่อน แล้ว force reinstall ONNX Runtime package ที่ตรงกับ CPU/GPU runtime
+- output อยู่ที่ `dist\ScreenLens\ScreenLens.exe` แบบ onedir
 
-### วิธีที่ 1: รันแบบ package entry point
+## การตั้งค่าหลักใน UI
 
-```powershell
-screenlens
-```
-
-หรือ
-
-```powershell
-screenlens-detection
-```
-
-### วิธีที่ 2: รันเป็น Python module
-
-```powershell
-python -m screenlens_detection
-```
-
-### วิธีที่ 3: ใช้ launcher ใน root project
-
-```powershell
-python screenlens.py
-```
-
-หมายเหตุ:
-
-- วิธีนี้อ้างอิง `.venv\Scripts\python.exe` ตาม logic ใน `launcher.py`
-- เหมาะกับ Windows workflow ของโปรเจกต์นี้
-
-### วิธีที่ 4: Double-click `screenlens.pyw` บน Windows
-
-- เปิด GUI โดยไม่โชว์ console
-- ต้องมี `.venv` และ dependencies ครบตามที่ launcher คาดไว้
-
----
+- Text Detector: OpenCV, RapidOCR, PaddleOCR, EasyOCR
+- Scanline ROI: Full frame หรือ Sliding bands
+- OCR Backend: Auto, EasyOCR, RapidOCR, Tesseract, Disabled
+- OCR Device: Auto, CPU, GPU/CUDA
+- Full-frame OCR Validation: Balanced, Fast, Strict
+- Translation Mode: Argos Offline, Google Online, Disabled
+- Translation Region: Full screen หรือ Hover cursor region
+- Translation Block: Line mode หรือ Strict block
+- Subtitle Render: Bubble overlay หรือ Clean patch
+- Overlay Tracking: Legacy motion หรือ Visual anchor lock
+- Runtime Debug: เปิด timings ต่อ stage
+- Preview toggles: annotated, segmentation, translated
 
 ## Test Suite
 
-ชุดทดสอบที่มีอยู่ใน repo:
+รันทั้งหมด:
 
 ```powershell
 pytest
-pytest tests/test_pipeline.py -v
 ```
 
-ไฟล์ test หลัก:
-
-- `test_languages.py` - ตรวจ logic การแยกภาษาและ mapping ภาษา
-- `test_launcher.py` - ตรวจ logic ของ launcher
-- `test_pipeline.py` - ตรวจ text-region detection pipeline
-- `test_ocr.py`, `test_translation.py`, `test_text_detectors.py` - ตรวจ OCR, translation และ detector backend behavior
-
-สถานะที่ตรวจล่าสุดสำหรับชุด OCR/translation/text detector: `25 passed`
-
----
-
-## Configuration
-
-### Environment Variables
+รันเฉพาะกลุ่มสำคัญ:
 
 ```powershell
-$env:TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
-$env:TESSDATA_PREFIX="C:\Program Files\Tesseract-OCR\tessdata"
+pytest tests/test_pipeline.py -v
+pytest tests/test_ocr.py tests/test_translation.py tests/test_text_detectors.py -v
+pytest tests/test_overlay.py tests/test_motion.py tests/test_recording.py -v
 ```
 
-สำหรับ packaged build ระบบจะ prefer bundled runtime ใต้ `dist\ScreenLens\_internal\vendor\tesseract` โดยอัตโนมัติ จึงไม่ต้องตั้ง environment variables บนเครื่อง clean VM
-
-### Settings ผ่าน UI
-
-- **Capture Interval**: ความถี่ในการจับภาพ
-- **Upscale Factor**: ปรับขนาดภาพก่อนประมวลผล
-- **Min Contour Area**: ค่าต่ำสุดของกล่องข้อความที่ยอมรับ
-- **Text Detector**: เลือก OpenCV, RapidOCR, PaddleOCR หรือ EasyOCR detector
-- **OCR Backend**: เลือก Auto, EasyOCR, RapidOCR, Tesseract หรือ Disabled
-- **Translation Mode**: เลือก Argos Offline, Google Online หรือ Disabled
-- **Source Language**: `Auto detect`, `English`, `Thai`, `Thai + English`
-- **Target Language**: `Thai` หรือ `English`
-- **Enable OCR**: เปิดหรือปิดการเรียก OCR
-
----
+test ครอบคลุม pipeline path, full-frame OCR validation, hover ROI, strict block translation, OCR queue, Tesseract batch, text detector, translation cache, overlay rendering/tracking, clean patch, recording, launcher, hotkeys และ Windows capture exclusion
 
 ## สถานะโครงการ
 
-- มี pipeline สำหรับ text-region detection ใช้งานได้แล้ว
-- มี Qt UI สำหรับ preview แบบเรียลไทม์
-- มี OCR backend, text detector backend และ translation backend แบบ selectable
-- มี Windows build flow สำหรับ clean VM ผ่าน `build_screenlens_exe.bat`
-- มี test suite สำหรับ launcher, language logic และ pipeline
-- โค้ดปัจจุบันเหมาะกับการสาธิตงานด้าน screen text detection + OCR/translation workflow
-
----
+- โค้ดปัจจุบันเป็น realtime OCR/translation desktop app ที่มี pipeline หลาย path สำหรับ benchmark ได้
+- Full-frame OCR และ crop OCR อยู่ร่วมกันใน pipeline เดียว โดยตัดสินจาก backend capability
+- Overlay/recording/runtime debug ทำให้ใช้ทดสอบ workflow จริงและเก็บ log เพื่อวิเคราะห์ latency ได้
+- Build flow ปัจจุบันเน้น Windows clean VM และแยก CPU/GPU dependency ชัดเจนขึ้น โดยเฉพาะ ONNX Runtime provider
 
 ## ข้อจำกัดที่ควรทราบ
 
-1. **OCR quality ยังขึ้นกับสภาพภาพจริง**  
-   ความแม่นยำขึ้นกับขนาดตัวอักษร, font, contrast, motion blur และภาษา แม้ backend จะถูก bundle ครบแล้ว
-
-2. **Launcher ใน root project เน้น Windows**  
-   `screenlens.py` และ `screenlens.pyw` อิง `.venv\Scripts\...` โดยตรง
-
-3. **EasyOCR อาจต้องดาวน์โหลด model ครั้งแรก**  
-   clean VM ที่มี internet สามารถดาวน์โหลด weights ได้ แต่ถ้าต้อง offline เต็มรูปแบบควรเตรียม EasyOCR model cache เพิ่มเติม
-
-4. **Language options ใน UI ยังจำกัด**  
-   ชุดภาษาที่เปิดให้เลือกใน UI ปัจจุบันเน้น Thai/English
-
-5. **ประสิทธิภาพขึ้นกับเครื่อง**  
-   ความเร็วจริงขึ้นกับความละเอียดจอ, capture interval และภาระของ OCR/translation
-
-6. **จับภาพในระดับ monitor**  
-   workflow ปัจจุบันยังไม่ได้รองรับการเลือกเฉพาะ region ด้วยเมาส์
-
----
-
-## ความสอดคล้องกับโจทย์โครงการ
-
-**Track**: Vision + AI Integration
-
-องค์ประกอบที่มีในระบบ:
-
-- Screen capture แบบต่อเนื่อง
-- Image preprocessing
-- Segmentation และ text-region detection
-- OCR inference
-- Desktop UI สำหรับ realtime visualization
-
----
+1. OCR quality ยังขึ้นกับภาพจริง เช่น font, contrast, motion blur, resolution และภาษา
+2. Clean patch เป็น experimental และมี budget limit ผ่าน `clean_patch_max_crop_area`
+3. Hover mode ต้องรอ cursor dwell ก่อน lock target ตาม `hover_dwell_ms`
+4. Full-frame OCR แบบ strict ลด false positive ได้ แต่เพิ่มงาน OpenCV validation mask
+5. GPU setup ต้องให้ Torch CUDA และ ONNX Runtime CUDA provider พร้อมทั้งคู่
+6. Root launcher `screenlens.py` และ `screenlens.pyw` เน้น Windows `.venv\Scripts\...`
 
 ## เอกสารอ้างอิงภายใน repo
 
-- ดูภาพรวมเพิ่มเติมใน [README.md](README.md)
-- โค้ด entry point อยู่ที่ `src/screenlens_detection/main.py`
-- โค้ด pipeline อยู่ที่ `src/screenlens_detection/pipeline.py`
+- [README.md](README.md)
+- [ARCHITECTURE_EVOLUTION.md](ARCHITECTURE_EVOLUTION.md)
+- [PIPELINE_MERMAID.md](PIPELINE_MERMAID.md)
+- `src/screenlens_detection/pipeline.py`
+- `src/screenlens_detection/worker.py`
+- `src/screenlens_detection/overlay.py`
 
 ---
 
 *Last Updated: May 2026*  
-*Version: 0.1.0*
+*Code reference: `feature-optimization-efficency-4` / `5f1cf9c`*

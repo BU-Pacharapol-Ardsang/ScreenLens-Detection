@@ -1,31 +1,31 @@
 # ScreenLens Pipeline Mermaid Diagrams
 
-เอกสารนี้สรุป pipeline ด้านในของ ScreenLens-Detection สำหรับใช้เทียบก่อน/หลัง optimize และใช้เลือก commit ไป benchmark FPS/latency ได้ตรงจุด
+เอกสารนี้สรุป pipeline ปัจจุบันของ ScreenLens-Detection จากโค้ดบน branch `feature-optimization-efficency-4` ที่ HEAD `5f1cf9c` พร้อม diagram สำหรับใช้ benchmark FPS/latency และอธิบาย path สำคัญของ OCR, translation, overlay, recording และ build/runtime provider
 
-ข้อมูลอ้างอิง git ล่าสุดที่ตรวจจาก repo:
+## Git Reference
 
 | Label | Branch / ref | Commit | ใช้เทียบอะไร |
 | --- | --- | --- | --- |
-| Current feature | `origin/feature-optimization-efficiency3` | `35737c77c3dbf6c69c21b6f35a467c6389473d60` | Logic hover/full-frame OCR ล่าสุดบน feature branch |
-| Current main | `origin/main` | `852565db13494210c339ae7b86dd011108ea6ce8` | Merge PR #19 จาก `stably-for-dev`; มี optimization ล่าสุดรวมเข้า main แล้ว |
-| V2.1 base | `ver2.1` | `ebbe24a` | จุดก่อน feature-optimization-efficiency3 |
-| V2.0 base | `ver2.0` | `fc03faa` | จุดก่อน optimization ชุด queued OCR / scanline / hover |
+| Current feature-4 | `feature-optimization-efficency-4` | `5f1cf9c` | setup/build แยก RapidOCR กับ ONNX Runtime provider และตรวจ diagnostics |
+| Overlay bubble tuning | `feature-optimization-efficency-4` | `175fbd2`, `2650e9a` | compact/expanded bubble และ font fitting ใน overlay |
+| Full-frame validation | `feature-optimization-efficency-4` | `3e2dc96` | validation mode `fast` / `balanced` / `strict` |
+| Full-frame output stability | `feature-optimization-efficency-4` | `e0ec945` | output limit และ stability สำหรับ RapidOCR full-frame OCR |
+| Main optimized merge | `origin/main` | `852565d` | merge optimization ชุดก่อนหน้าเข้า main |
+| Feature 3 baseline | `origin/feature-optimization-efficiency3` | `35737c7` | hover/full-frame OCR และ subtitle block logic ก่อน feature-4 |
+| V2.1 base | `ver2.1` | `ebbe24a` | จุดก่อน full-frame OCR tuning ชุดใหญ่ |
+| V2.0 base | `ver2.0` | `fc03faa` | จุดก่อน queued OCR / scanline / hover optimization |
 
-คำสั่ง checkout สำหรับ benchmark:
+ตัวอย่าง checkout สำหรับ benchmark:
 
 ```powershell
-git checkout 35737c77c3dbf6c69c21b6f35a467c6389473d60
-git checkout 852565db13494210c339ae7b86dd011108ea6ce8
-git checkout ebbe24a
+git checkout 5f1cf9c
+git checkout 3e2dc96
+git checkout e0ec945
+git checkout 852565d
 git checkout fc03faa
 ```
 
 ## 1. Runtime Pipeline ปัจจุบัน
-
-ใช้กับ branch/commit:
-
-- `origin/feature-optimization-efficiency3` at `35737c77c3dbf6c69c21b6f35a467c6389473d60`
-- `origin/main` at `852565db13494210c339ae7b86dd011108ea6ce8`
 
 ไฟล์หลัก:
 
@@ -34,354 +34,334 @@ git checkout fc03faa
 - `src/screenlens_detection/ocr.py`
 - `src/screenlens_detection/translation.py`
 - `src/screenlens_detection/overlay.py`
+- `src/screenlens_detection/recording.py`
 
 ```mermaid
 flowchart TD
     A["Input: selected monitor"] --> B["ScreenCapturer.grab()"]
-    B --> C["LatestFrameQueue size 1"]
-    C --> D["ProcessingWorker.run()"]
+    B --> C["_LatestFrameQueue maxsize=1"]
+    C --> C1{"Queue full?"}
+    C1 -->|Yes| C2["Drop old frame, keep newest"]
+    C1 -->|No| D["ProcessingWorker.run()"]
+    C2 --> D
+
     D --> E["TextDetectionPipeline.process(frame)"]
+    E --> F["Scale frame by effective detection_scale/upscale_factor"]
+    F --> G["Enhance grayscale"]
+    G --> H{"Choose detection/OCR path"}
 
-    E --> F["Scale frame by detection_scale / upscale_factor"]
-    F --> G["Enhance grayscale with CLAHE + blur"]
-    G --> H{"Select detection/OCR path"}
+    H -->|Full OCR + hover| I["_annotate_hover_with_full_frame_ocr()"]
+    H -->|Full OCR + full screen| J["_annotate_with_full_frame_ocr()"]
+    H -->|Hover + crop OCR| K["_hover_detection_pass()"]
+    H -->|Scanline ROI| L["_scanline_detection_pass()"]
+    H -->|Default| M["_text_detection_pass()"]
 
-    H -->|RapidOCR full-frame OCR enabled| I["Full-frame OCR path"]
-    H -->|Hover mode + full-frame OCR| J["Hover full-frame OCR path"]
-    H -->|Hover mode + crop OCR| K["Hover ROI detection path"]
-    H -->|Scanline ROI enabled| L["Scanline ROI detection path"]
-    H -->|Default| M["Full-frame detector path"]
-
-    I --> N["DetectionBox list with OCR text"]
+    I --> N["Filter, merge, validate, stabilize OCRFrameResult"]
     J --> N
-    K --> O["Detected source boxes"]
+    K --> O["Source boxes"]
     L --> O
     M --> O
+    O --> P["_stabilize_ocr_boxes()"]
+    P --> Q["_filter_motion_ocr_boxes()"]
+    Q --> R["_annotate_with_ocr() via QueuedOCRBackend"]
+    R --> S["DetectionBox list with OCR text"]
+    N --> S
 
-    O --> P["Stabilize OCR boxes"]
-    P --> Q["Optional motion filter"]
-    Q --> R["Crop OCR annotation"]
-    R --> N
+    S --> T["_estimate_frame_offset()"]
+    T --> U["_apply_translations()"]
+    U --> V["_remember_ocr_translations()"]
+    V --> W["Build FrameAnalysis"]
 
-    N --> S["Estimate frame motion offset"]
-    S --> T["Apply translation / reuse translation cache"]
-    T --> U["Remember OCR + translation cache"]
-    U --> V["Build FrameAnalysis"]
+    W --> X["MainWindow previews and text panel"]
+    W --> Y["TranslationOverlay"]
+    W --> Z["RecordingSession"]
 
-    V --> W["MainWindow previews and text panel"]
-    V --> X["TranslationOverlay boxes"]
-    V --> Y["Recording log/video when enabled"]
-
-    X --> Z["Output: translated overlay on screen"]
-    W --> AA["Output: annotated preview / mask preview / runtime debug"]
-    Y --> AB["Output: session_log JSONL + videos"]
+    X --> X1["Annotated / segmentation / translated preview"]
+    Y --> Y1["Bubble or clean patch overlay"]
+    Z --> Z1["MP4 streams + session_log.jsonl"]
 ```
 
-Input หลักคือ frame จาก monitor ที่เลือก ส่วน output คือ `FrameAnalysis` ที่มี `boxes`, preview frames, FPS, runtime timings, OCR status, motion offset และข้อมูลที่ overlay/recording ใช้ต่อ
+Output หลักคือ `FrameAnalysis` ซึ่งมี `boxes`, `source_frame`, `annotated_frame`, `processed_preview`, `translated_preview`, `fps`, `ocr_runtime`, `content_offset_*` และ `runtime_timings_ms`
 
-## 2. Current Detection Decision Tree
-
-ใช้กับ branch/commit:
-
-- `origin/feature-optimization-efficiency3` at `35737c77c3dbf6c69c21b6f35a467c6389473d60`
-
-จุดประสงค์: ใช้ดูว่า test run แต่ละรอบกำลังเข้า path ไหน เพราะ FPS ต่างกันมากตาม path
+## 2. Detection Decision Tree
 
 ```mermaid
 flowchart TD
-    A["Pipeline.process(frame)"] --> B["Build detection_frame + detection_gray"]
-    B --> C{"ocr_backend.supports_full_frame()?"}
+    A["Pipeline.process(frame)"] --> B["detection_frame + detection_gray"]
+    B --> C{"ocr_enabled and backend.supports_full_frame()?"}
 
     C -->|Yes| D{"translation_region_mode == hover?"}
-    D -->|Yes| E["Path A: _annotate_hover_with_full_frame_ocr()"]
-    D -->|No| F["Path B: _annotate_with_full_frame_ocr()"]
+    D -->|Yes| E["Path A: Hover RapidOCR full-frame OCR on ROI"]
+    D -->|No| F["Path B: RapidOCR full-frame OCR on detection frame"]
 
     C -->|No| G{"translation_region_mode == hover?"}
-    G -->|Yes| H["Path C: _hover_detection_pass()"]
+    G -->|Yes| H["Path C: Hover ROI detector + crop OCR"]
     G -->|No| I{"scanline_roi_enabled?"}
-    I -->|Yes| J["Path D: _scanline_detection_pass()"]
-    I -->|No| K["Path E: _text_detection_pass()"]
+    I -->|Yes| J["Path D: Scanline vertical band detector + crop OCR"]
+    I -->|No| K{"text_detector_mode"}
 
-    H --> L["working_boxes in source frame"]
-    J --> L
-    K --> L
+    K -->|opencv| L["Path E1: OpenCV text mask + line mask + components"]
+    K -->|rapidocr/paddleocr/easyocr| M["Path E2: Deep detector backend"]
 
-    L --> M["_stabilize_ocr_boxes()"]
-    M --> N["_filter_motion_ocr_boxes()"]
-    N --> O["_annotate_with_ocr()"]
-    O --> P["DetectionBox(text, confidence)"]
+    E --> N["Full-frame result pipeline"]
+    F --> N
+    H --> O["Crop result pipeline"]
+    J --> O
+    L --> O
+    M --> O
 
-    E --> P
-    F --> P
-
-    P --> Q["_apply_translations()"]
-    Q --> R["FrameAnalysis.boxes"]
+    N --> P["DetectionBox list"]
+    O --> P
+    P --> Q["Translation and FrameAnalysis"]
 ```
 
 Benchmark hint:
 
-- Path A/B วัดผล RapidOCR full-frame OCR
-- Path C วัดผล hover ROI ที่ลดพื้นที่ detect/OCR
-- Path D วัดผล scanline ROI ที่แบ่ง frame เป็น bands
-- Path E วัดผล default full-screen detector + crop OCR
+- Path A/B วัด RapidOCR full-frame OCR และ validation mode
+- Path C วัด hover ROI ที่ลดพื้นที่ detector/OCR
+- Path D วัด scanline ROI ที่แบ่งงาน detector ข้ามหลาย frame
+- Path E1/E2 วัด OpenCV detector เทียบ deep detector
 
-## 3. Crop OCR Queue และ Cache
+## 3. Full-frame OCR Validation
 
-เริ่มมีใน:
-
-- `origin/feature-optimization-efficiency` at `2351918514534be0d0e1b46339996e26d0435e66`
-
-ปรับแรงขึ้นใน:
-
-- `origin/feature-optimization-efficiency2` at `846290e7d22f8b92a9f5d1f483645be8ffb32d5c`
-- `origin/feature-optimization-efficiency2` at `95e538a67114f8843b58d5cc537f0c0528fab52e`
-
-ยังอยู่ใน current:
-
-- `origin/feature-optimization-efficiency3` at `35737c77c3dbf6c69c21b6f35a467c6389473d60`
+ใช้เมื่อ OCR backend เป็น `RapidOCRFullBackend` หรือ backend อื่นที่ `supports_full_frame()` เป็น `True`
 
 ```mermaid
 flowchart TD
-    A["Input: working text boxes"] --> B["_prepare_ocr_candidates()"]
-    B --> C["Crop source grayscale by box"]
+    A["ocr_backend.recognize_frame(frame_or_roi)"] --> B["OCRFrameResult rect/text/confidence"]
+    B --> C["_filter_full_frame_ocr_results()"]
+    C --> D["_limit_full_frame_ocr_results()"]
+    D --> E["Normalize and _is_usable_text()"]
+    E --> F["_merge_full_frame_line_results()"]
+    F --> G{"full_frame_ocr_validation_mode"}
+
+    G -->|fast| H["Return raw filtered/merged results"]
+    G -->|balanced| I["Reject UI noise, short text and low confidence"]
+    G -->|strict| J["Build OpenCV text_mask + line_mask"]
+    J --> K["_full_frame_mask_support_score()"]
+    K --> L["Keep only boxes with mask support"]
+
+    H --> M["_stabilize_full_frame_ocr_results()"]
+    I --> M
+    L --> M
+    M --> N["Track evidence, bbox smoothing, text quality preference"]
+    N --> O["_select_full_frame_output_results()"]
+    O --> P["DetectionBox output"]
+```
+
+Mode summary:
+
+- `fast`: เหมาะกับวัด raw recall/latency เพราะไม่ใช้ validation หนัก
+- `balanced`: default, ลด false positive จาก UI noise โดยไม่สร้าง mask เพิ่ม
+- `strict`: เพิ่ม OpenCV validation mask เหมาะกับลด OCR หลุดจากภาพที่มี UI noise เยอะ
+
+## 4. Crop OCR Queue และ Cache
+
+```mermaid
+flowchart TD
+    A["Detected source boxes"] --> B["_prepare_ocr_candidates()"]
+    B --> C["Crop high-res OCR grayscale"]
     C --> D["Create crop fingerprint"]
-    D --> E{"Cached OCR result matches rect + fingerprint?"}
+    D --> E{"Pipeline recent OCR cache hit?"}
 
-    E -->|Hit| F["Reuse cached text/confidence"]
+    E -->|Hit| F["Reuse text/confidence/translation metadata"]
     E -->|Miss| G["_select_pending_ocr_candidates()"]
-
     G --> H["Limit by max_ocr_boxes_per_frame and priority"]
-    H --> I["OCRBackend.prepare_image(crop)"]
+    H --> I["ocr_backend.prepare_image(crop)"]
     I --> J["QueuedOCRBackend.recognize_batch()"]
 
-    J --> K{"Cache key exists?"}
-    K -->|Hit| L["Return cached OCRResult immediately"]
-    K -->|Miss and within sync budget| M["Run underlying OCR synchronously"]
-    K -->|Miss and outside sync budget| N["Append to OCR queue"]
+    J --> K{"Backend digest cache hit?"}
+    K -->|Hit| L["Return cached OCRResult"]
+    K -->|Miss + sync budget| M["Run OCR synchronously"]
+    K -->|Miss + no sync budget| N["Append to OCR worker queue"]
 
-    N --> O["Worker thread pops language-compatible batch"]
-    O --> P["Underlying OCR recognize_batch()"]
+    N --> O["OCR worker pops language-compatible batch"]
+    O --> P["Underlying OCR backend recognize_batch()"]
     M --> P
-
-    P --> Q["Store result in OCR cache"]
-    Q --> R["Normalize recognized text"]
+    P --> Q["Store digest cache"]
+    Q --> R["Normalize and filter OCR text"]
     F --> R
-    R --> S["Filter unusable/noisy text"]
-    S --> T["Output: DetectionBox with text"]
+    R --> S["DetectionBox with OCR text"]
 ```
 
-Performance idea:
+Crop OCR path ใช้กับ EasyOCR/Tesseract และ deep detector ที่คืนเฉพาะ boxes ส่วน RapidOCR full-frame OCR จะข้าม path นี้
 
-- commit `2351918` เหมาะใช้เทียบก่อน/หลัง async queue
-- commit `846290e` เหมาะใช้เทียบผล `SCREENLENS_OCR_WORKERS`
-- commit `95e538a` เหมาะใช้เทียบผล detection scale + OCR cache reuse
-
-## 4. Full-frame OCR และ Hover Full-frame OCR
-
-เริ่ม full-frame tracking/merge ใน:
-
-- `origin/feature-optimization-efficiency3` at `28b5202ee4b80dd09e983258859e14e45801dd00`
-
-เพิ่ม hover full-frame OCR ใน:
-
-- `origin/feature-optimization-efficiency3` at `db63a8a8bf1ad756706df2eca60a212966ebb14d`
-
-เพิ่ม multiline subtitle filtering/merge ใน:
-
-- `origin/feature-optimization-efficiency3` at `6768a5310dde03011f77ea1fda4489f5df87432f`
-- `origin/feature-optimization-efficiency3` at `35737c77c3dbf6c69c21b6f35a467c6389473d60`
+## 5. Translation Pipeline
 
 ```mermaid
 flowchart TD
-    A["Input: detection_frame"] --> B{"Mode"}
+    A["DetectionBox list with OCR text"] --> B["_apply_translations()"]
+    B --> C{"Any boxes?"}
+    C -->|No| D["Keep recent translations briefly, then clear if no overlay tracking"]
+    C -->|Yes| E{"translation_region_mode == hover?"}
 
-    B -->|Full screen| C["ocr_backend.recognize_frame(full frame)"]
-    B -->|Hover| D["Wait for confirmed hover cursor"]
+    E -->|Yes| F["_filter_hover_metadata_rows()"]
+    F --> G["_combine_hover_subtitle_boxes()"]
+    E -->|No| H["Use boxes as-is"]
 
-    D --> E["Compute hover ROI bounds"]
-    E --> F["Crop ROI frame"]
-    F --> G["ocr_backend.recognize_frame(ROI)"]
-
-    C --> H["OCRFrameResult(rect, text, confidence)"]
-    G --> I["Map ROI rect back to source frame"]
-    I --> H
-
-    H --> J["_filter_full_frame_ocr_results()"]
-    J --> K["_merge_full_frame_line_results()"]
-    K --> L{"Hover mode?"}
-
-    L -->|Yes| M["_select_hover_source_boxes()"]
-    M --> N["_hover_row_line_mask()"]
-    N --> O["_refine_hover_source_boxes_by_mask_rows()"]
-    O --> P["_remap_hover_full_frame_results_to_refined_rects()"]
-
-    L -->|No| Q["Use merged full-frame OCR results"]
-    P --> R["_stabilize_full_frame_ocr_results()"]
-    Q --> R
-
-    R --> S["Smooth rects and prefer better text"]
-    S --> T["_detection_box_from_frame_ocr_result()"]
-    T --> U["Output: DetectionBox list, no crop OCR pass"]
-```
-
-Performance idea:
-
-- ถ้าเลือก `RapidOCR full OCR` จะเข้าทางนี้และไม่ต้อง crop OCR ทีละกล่อง
-- เหมาะกับ benchmark ว่า full-frame OCR เร็วกว่า crop OCR หรือไม่ในวิดีโอเดียวกัน
-- Hover full-frame OCR ลดพื้นที่ input แต่ยังใช้ full-frame OCR backend ใน ROI
-
-## 5. Text Detector Modes
-
-เริ่ม selectable detector ใน:
-
-- `origin/feature-change-language-onscreen` at `3e3ac1e34b6f9b64ae6dec196160a037fd5be805`
-
-เพิ่ม RapidOCR DBNet detector ใน:
-
-- `origin/feature-optimization-efficiency` at `590419ee41a0e2c8f46ca69ad0131f5f920efcab`
-
-ยังอยู่ใน current:
-
-- `origin/feature-optimization-efficiency3` at `35737c77c3dbf6c69c21b6f35a467c6389473d60`
-
-```mermaid
-flowchart TD
-    A["Input: detection_frame + detection_gray"] --> B{"text_detector_mode"}
-
-    B -->|opencv| C["_build_text_mask()"]
-    C --> D["_build_line_mask()"]
-    D --> E["_extract_text_boxes()"]
-
-    B -->|rapidocr| F["RapidOCRTextDetector.detect(frame)"]
-    B -->|paddleocr| G["PaddleOCRDbTextDetector.detect(frame)"]
-    B -->|easyocr| H["EasyOCRCraftTextDetector.detect(frame)"]
-
-    F --> I["_filter_detector_boxes()"]
-    G --> I
+    G --> I["_reuse_recent_translations()"]
     H --> I
+    I --> J{"translation_block_mode == strict?"}
+    J -->|Yes| K["_apply_strict_block_translations()"]
+    J -->|No| L["_apply_line_translations()"]
+    K --> L
 
-    E --> J["_merge_text_boxes()"]
-    I --> J
-    J --> K["_limit_detected_boxes()"]
-    K --> L["Output: detection boxes"]
-```
-
-Performance idea:
-
-- OpenCV path เป็น baseline ที่ dependency เบา
-- Deep detector path อาจแม่นขึ้นในบางภาพ แต่มี overhead สูงกว่า
-- RapidOCR detector path ขึ้นกับ ONNX Runtime CPU/CUDA
-
-## 6. Translation Queue, Cache และ Reuse
-
-เพิ่ม translation backend/cache ชุดใหญ่ใน:
-
-- `origin/feature-optimization-efficiency` at `590419ee41a0e2c8f46ca69ad0131f5f920efcab`
-
-ยังอยู่ใน current:
-
-- `origin/feature-optimization-efficiency3` at `35737c77c3dbf6c69c21b6f35a467c6389473d60`
-
-```mermaid
-flowchart TD
-    A["Input: DetectionBox list with OCR text"] --> B["_apply_translations()"]
-    B --> C{"translation_region_mode == hover?"}
-    C -->|Yes| D["_filter_hover_metadata_rows()"]
-    D --> E["_combine_hover_subtitle_boxes()"]
-    C -->|No| F["Use line boxes as-is"]
-
-    E --> G{"translation_block_mode"}
-    F --> G
-
-    G -->|line| H["_apply_line_translations()"]
-    G -->|strict block| I["_apply_strict_block_translations()"]
-
-    H --> J["_reuse_recent_translations()"]
-    I --> J
-    J --> K{"Recent/cache match?"}
-
-    K -->|Hit| L["Reuse translated_text"]
-    K -->|Miss| M["translation_backend.translate_batch()"]
-
+    L --> M["translation_backend.translate_batch()"]
     M --> N["QueuedTranslationBackend"]
-    N --> O{"Translation cache hit?"}
-    O -->|Hit| P["Return cached translation"]
-    O -->|Miss and sync budget available| Q["Translate synchronously"]
-    O -->|Miss| R["Queue translation key"]
-
-    R --> S["Translation worker batches same route"]
-    S --> T["Argos offline or Google online backend"]
+    N --> O{"Cache hit?"}
+    O -->|Hit| P["Return cached translated_text"]
+    O -->|Miss + sync budget| Q["Translate immediately"]
+    O -->|Miss| R["Queue by source/target route"]
+    R --> S["Worker batches same route"]
+    S --> T["Argos offline or Google online"]
     Q --> T
     T --> U["Store translation cache"]
-
-    L --> V["Output: DetectionBox.translated_text"]
-    P --> V
+    P --> V["DetectionBox.translated_text"]
     U --> V
     V --> W["_remember_translations()"]
 ```
 
-Performance idea:
+Strict block mode รวมกล่องที่ดูเป็น paragraph/subtitle หลายบรรทัดเป็น block เดียวก่อนแปล แล้วข้าม line translation ซ้ำของ member lines
 
-- Argos offline default มี sync budget มากกว่า Google online
-- Google online มี request budget, timeout และ retry cooldown
-- Recent translation reuse ช่วยมากเมื่อ OCR text/ตำแหน่งใกล้เคียงกันหลาย frame
-
-## 7. Optimization Evolution Timeline
-
-Diagram นี้ใช้เป็นแผนที่เลือก commit สำหรับ benchmark เป็นรุ่น ๆ
+## 6. Overlay, Clean Patch และ Tracking
 
 ```mermaid
 flowchart TD
-    A["4282d9e<br/>feature-build-screenlens<br/>OCR + translation + overlay support"] --> B["2c9dc68<br/>stably-for-dev<br/>recent translation reuse"]
-    B --> C["3e3ac1e<br/>feature-change-language-onscreen<br/>selectable text detectors"]
-    C --> D["fc03faa<br/>tag ver2.0<br/>base before optimization set"]
+    A["FrameAnalysis"] --> B["TranslationOverlay.update_analysis()"]
+    B --> C["Convert DetectionBox to OverlayBox"]
+    C --> D{"overlay_tracking_enabled?"}
 
-    D --> E["2351918<br/>feature-optimization-efficiency<br/>queued OCR + OCR cache"]
-    E --> F["590419e<br/>feature-optimization-efficiency<br/>RapidOCR detector + translation backend"]
-    F --> G["846290e<br/>feature-optimization-efficiency2<br/>OCR workers + Tesseract batch"]
-    G --> H["95e538a<br/>feature-optimization-efficiency2<br/>detection scale + cache improvements"]
-    H --> I["637325f<br/>feature-optimization-efficiency2<br/>scanline ROI"]
-    I --> J["a2c4935<br/>feature-optimization-efficiency2<br/>hover target + region modes"]
-    J --> K["ebbe24a<br/>tag ver2.1<br/>merged optimization set"]
+    D -->|No| E["OverlayTrackManager.replace_with_observations()"]
+    D -->|Yes| F["Predict boxes from pipeline motion or realtime tracking"]
+    F --> G["OverlayTrackManager.update_from_pipeline()"]
+    G --> H{"tracking_mode"}
 
-    K --> L["28b5202<br/>feature-optimization-efficiency3<br/>full-frame OCR tracking + merge"]
-    L --> M["db63a8a<br/>feature-optimization-efficiency3<br/>hover full-frame OCR"]
-    M --> N["6768a53<br/>feature-optimization-efficiency3<br/>multiline subtitle detection/filter"]
-    N --> O["35737c7<br/>feature-optimization-efficiency3<br/>longer text blocks + wider ROI"]
-    O --> P["852565d<br/>origin/main<br/>merge PR #19"]
+    H -->|legacy| I["Motion offset + local template tracking"]
+    H -->|anchor| J["Visual anchor template matching"]
+
+    E --> K{"subtitle_render_mode"}
+    I --> K
+    J --> K
+
+    K -->|bubble| L["_expanded_bubble_rect() + _font_for_text()"]
+    K -->|clean_patch| M["clean_patch_for_box() from source frame"]
+    M --> N["OpenCV mask/inpaint or soft background patch"]
+    L --> O["Paint overlay"]
+    N --> O
 ```
 
-## 8. Suggested Benchmark Matrix
+เมื่อเปิด visual tracking, `OverlayTrackingWorker` จะ capture grayscale frame ที่ลด resolution แล้วส่ง `TrackingFrame` ให้ overlay เพื่อ track กล่องระหว่าง frame หลัก
 
-ใช้ video/log เดียวกัน แล้ว checkout commit ตามนี้เพื่อเทียบ FPS, median frame time, OCR submitted/reused และจำนวน boxes
+## 7. Recording และ Runtime Debug
 
-| Benchmark | Checkout commit | Focus |
-| --- | --- | --- |
-| Baseline V2.0 | `fc03faa` | ก่อน queue/cache/scanline/hover |
-| Async OCR V1 | `2351918` | วัดผล queued OCR + OCR cache |
-| RapidOCR + translation backend | `590419e` | วัด detector/backend ใหม่ |
-| OCR workers | `846290e` | วัดผล batch + worker count |
-| Detection scale/cache | `95e538a` | วัด FPS เมื่อลด detection scale |
-| Scanline ROI | `637325f` | วัด full-screen video/game แบบแบ่ง bands |
-| Hover ROI | `a2c4935` | วัด latency เมื่อ OCR เฉพาะจุดที่ hover |
-| Full-frame OCR | `28b5202` | วัด RapidOCR full-frame OCR ไม่ผ่าน crop OCR |
-| Hover full-frame OCR | `db63a8a` | วัด ROI + full-frame OCR backend |
-| Current optimized | `35737c7` | วัด logic ล่าสุดบน feature branch |
-| Current main | `852565d` | วัดหลัง merge เข้า main |
+```mermaid
+flowchart TD
+    A["MainWindow._handle_frame(analysis)"] --> B["Update previews"]
+    A --> C{"Recording active?"}
+    C -->|No| D["Skip disk writes"]
+    C -->|Yes| E["RecordingSession.write_frame()"]
+    E --> F["annotated_preview.mp4"]
+    E --> G["segmentation_preview.mp4"]
+    E --> H["translated_preview.mp4"]
+    E --> I["session_log.jsonl"]
+    I --> J["fps, status, ocr_runtime, timings, motion, boxes"]
 
-## 9. Output Fields ที่ควรเก็บใน session log
+    A --> K{"runtime_debug_enabled?"}
+    K -->|Yes| L["Format slowest stage from runtime_timings_ms"]
+    K -->|No| M["Runtime debug Off"]
+```
 
-ถ้าจะเอาไปเทียบแบบในภาพ ควรดูอย่างน้อย:
+Fields ที่ควรดูใน log:
 
 - `fps`
 - `runtime_timings_ms.total`
 - `runtime_timings_ms.scale_frame`
-- `runtime_timings_ms.*detection*`
+- `runtime_timings_ms.opencv_detection` หรือ `runtime_timings_ms.deep_detection`
+- `runtime_timings_ms.hover_detection`
+- `runtime_timings_ms.scanline_detection`
 - `runtime_timings_ms.ocr_annotation`
 - `runtime_timings_ms.full_frame_ocr`
 - `runtime_timings_ms.hover_full_frame_ocr`
 - `runtime_timings_ms.translation`
-- `boxes.length`
-- status text ที่มี `submitted`, `reused`, `read`
+- `detected_boxes`
+- `content_motion_confidence`
 
-ถ้ามี log สองไฟล์จากคนละ commit ให้เทียบด้วย median frame time ก่อน average FPS เพราะ realtime pipeline มี spike จาก OCR/translation queue เป็นช่วง ๆ
+## 8. Build / Setup Provider Flow
+
+```mermaid
+flowchart TD
+    A["build_screenlens_exe.bat"] --> B["scripts/build_windows.ps1 -Clean"]
+    B --> C["Resolve or create .venv"]
+    C --> D["scripts/setup_windows.ps1"]
+    D --> E["Install project dependencies"]
+    E --> F["Install EasyOCR"]
+    F --> G["Install rapidocr>=3.0.0"]
+    G --> H{"TorchRuntime"}
+    H -->|cpu| I["Uninstall onnxruntime-gpu"]
+    H -->|gpu| J["Uninstall onnxruntime"]
+    I --> K["Force reinstall onnxruntime CPU"]
+    J --> L["Force reinstall onnxruntime-gpu"]
+    K --> M["Install Torch CPU"]
+    L --> N["Install Torch CUDA"]
+    M --> O["Install PaddleOCR"]
+    N --> O
+    O --> P["Sync Tesseract vendor"]
+    P --> Q["Download Argos en-th/th-en models"]
+    Q --> R["Torch diagnostics"]
+    R --> S["ONNX Runtime diagnostics"]
+    S --> T["PyInstaller onedir build"]
+```
+
+จุดสำคัญของ `5f1cf9c`: RapidOCR ถูกติดตั้งก่อน แล้วจึง force reinstall ONNX Runtime provider ที่เลือก เพื่อกัน dependency resolver ดึง provider ผิดตัวกลับมา
+
+## 9. Optimization Evolution Timeline
+
+```mermaid
+flowchart TD
+    A["4282d9e<br/>OCR + translation + overlay support"] --> B["2c9dc68<br/>recent translation reuse"]
+    B --> C["3e3ac1e<br/>selectable text detectors"]
+    C --> D["fc03faa<br/>tag ver2.0"]
+
+    D --> E["2351918<br/>queued OCR + OCR cache"]
+    E --> F["590419e<br/>RapidOCR detector + queued translation"]
+    F --> G["846290e<br/>OCR workers + Tesseract batch"]
+    G --> H["95e538a<br/>detection scale + motion cache"]
+    H --> I["637325f<br/>scanline ROI"]
+    I --> J["a2c4935<br/>hover ROI"]
+    J --> K["ebbe24a<br/>tag ver2.1"]
+
+    K --> L["28b5202<br/>full-frame OCR tracking"]
+    L --> M["db63a8a<br/>hover full-frame OCR"]
+    M --> N["6768a53<br/>multiline subtitle filtering"]
+    N --> O["35737c7<br/>longer blocks + wider ROI"]
+    O --> P["852565d<br/>main optimized merge"]
+    P --> Q["889f7c<br/>drop old capture frames"]
+    Q --> R["e0ec945<br/>full-frame output stability"]
+    R --> S["3e2dc96<br/>full-frame validation modes"]
+    S --> T["175fbd2<br/>compact overlay bubble"]
+    T --> U["2650e9a<br/>bubble expansion tuning"]
+    U --> V["5f1cf9c<br/>RapidOCR/ONNX setup flow"]
+```
+
+## 10. Suggested Benchmark Matrix
+
+| Benchmark | Checkout commit | Focus |
+| --- | --- | --- |
+| Baseline V2.0 | `fc03faa` | ก่อน queue/cache/scanline/hover |
+| Async OCR V1 | `2351918` | queued OCR + OCR cache |
+| RapidOCR + translation backend | `590419e` | RapidOCR detector, Argos/Google queued translation |
+| OCR workers | `846290e` | batch + worker count |
+| Detection scale/cache | `95e538a` | FPS เมื่อปรับ detection scale |
+| Scanline ROI | `637325f` | vertical band slicing |
+| Hover ROI | `a2c4935` | OCR เฉพาะ cursor region |
+| Full-frame OCR | `28b5202` | RapidOCR full-frame det+rec |
+| Hover full-frame OCR | `db63a8a` | ROI + full-frame backend |
+| Feature 3 optimized | `35737c7` | subtitle/hover block logic |
+| Main optimized merge | `852565d` | หลัง merge เข้า main |
+| Full-frame stability | `e0ec945` | output limit/stability |
+| Validation modes | `3e2dc96` | `fast` vs `balanced` vs `strict` |
+| Overlay compact bubble | `175fbd2` | compact text bubble behavior |
+| Overlay expanded bubble | `2650e9a` | long translated text fitting |
+| Current setup/build | `5f1cf9c` | ONNX Runtime CPU/GPU provider install flow |
+
+สำหรับ realtime pipeline ควรเทียบ median frame time และ percentile spike คู่กับ average FPS เพราะ OCR/translation queue ทำให้บาง frame เร็วมาก แต่บาง frame spike ตอน backend ทำงานจริง
