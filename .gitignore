@@ -11,3 +11,8 @@ dist/
 .download/
 *.egg-info/
 recordings/
+
+# Local/generated presentation artifacts
+/tmp/
+/PRESENTATION.md
+/ScreenLens-Detection-Presentation.pptx
