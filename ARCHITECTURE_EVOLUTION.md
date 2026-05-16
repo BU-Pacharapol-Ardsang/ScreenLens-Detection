@@ -16,28 +16,38 @@
 | Hover ROI | `a2c4935` | จำกัด OCR เฉพาะพื้นที่ cursor hover |
 | Full-frame OCR | `28b5202` | RapidOCR full-frame detection+recognition ใน backend เดียว |
 | Hover full-frame OCR | `db63a8a` | เอา full-frame OCR ไปใช้เฉพาะ hover ROI |
-| Current optimized | `35737c7` / `852565d` | เพิ่ม multiline/long subtitle logic, current main merge แล้ว |
+| Main optimized merge | `35737c7` / `852565d` | เพิ่ม multiline/long subtitle logic และ merge เข้า main แล้ว |
+| Latest-frame drop refinement | `889f7c` | ทำ capture queue ให้ drop frame เก่าเพื่อลด latency ค้างสะสมชัดเจนขึ้น |
+| Full-frame stability/output limit | `e0ec945` | เพิ่ม stability และ limit output สำหรับ full-frame OCR |
+| Full-frame validation modes | `3e2dc96` | เพิ่ม validation mode `fast` / `balanced` / `strict` ใน pipeline และ UI |
+| Overlay bubble tuning | `175fbd2` / `2650e9a` | เพิ่ม compact/expanded bubble, font fitting และไม่ shrink ต่ำกว่า anchor rect |
+| Current feature-4 | `feature-optimization-efficency-4` / `5f1cf9c` | ปรับ build/setup ให้ติดตั้ง RapidOCR แยกจาก ONNX Runtime และ force reinstall provider ที่เลือก |
 
 ## Architecture Layers ที่ใช้ร่วมกัน
 
 ```text
 UI/MainWindow
   -> ProcessingWorker(QThread)
-    -> Capture thread / LatestFrameQueue
+    -> Capture thread / LatestFrameQueue(maxsize=1, drop old frames)
     -> TextDetectionPipeline
       -> Text detector path
       -> OCR backend path
       -> Translation backend path
-    -> FrameAnalysis
-  -> TranslationOverlay / Preview / Recording
+    -> FrameAnalysis(source/preview boxes/timings/motion)
+  -> TranslationOverlay
+    -> OverlayTrackManager / optional OverlayTrackingWorker
+    -> Bubble overlay or CleanPatch subtitle renderer
+  -> Preview panels / RecordingSession / Windows hotkeys
 ```
 
-คำว่า parallel ในโปรเจกต์นี้มี 4 ระดับ:
+คำว่า parallel ในโปรเจกต์นี้มีหลายระดับ:
 
 1. UI กับ processing แยกกันด้วย `QThread`
-2. Capture กับ process แยกกันด้วย capture thread + queue ขนาด 1 ตั้งแต่ V2.0
-3. OCR/translation มี worker queue ใน optimization branch
-4. ตัว model บางตัวใช้ GPU/ONNX/CUDA หรือ thread ภายใน backend เช่น EasyOCR/PyTorch, RapidOCR/ONNX Runtime, Tesseract thread pool
+2. Capture กับ process แยกกันด้วย capture thread + queue ขนาด 1 และ queue จะทิ้ง frame เก่าเมื่อ process ไม่ทัน
+3. OCR crop path มี `QueuedOCRBackend` และ worker หลายตัวได้ตาม `SCREENLENS_OCR_WORKERS`
+4. Translation มี `QueuedTranslationBackend` แยก worker และ cache ตาม route ภาษา
+5. Overlay tracking มี worker แยกสำหรับ capture grayscale frame ความละเอียดลดลงเพื่อ track overlay ระหว่าง frame หลัก
+6. ตัว model บางตัวใช้ GPU/ONNX/CUDA หรือ thread ภายใน backend เช่น EasyOCR/PyTorch, RapidOCR/ONNX Runtime, Tesseract thread pool
 
 ## V1.0 Baseline
 
@@ -579,6 +589,97 @@ current OpenCV path มี filter เพิ่มจาก baseline:
 - Capture: latest-frame capture thread
 - UI: Qt main thread แยกจาก processing worker
 
+## Current HEAD: Feature Optimization Efficiency 4
+
+Git:
+
+- branch: `feature-optimization-efficency-4`
+- current HEAD: `5f1cf9c`
+- important recent commits:
+  - `889f7c`: capture queue drops older frames more explicitly
+  - `e0ec945`: full-frame OCR stability/output limiting
+  - `3e2dc96`: full-frame OCR validation modes in pipeline/UI
+  - `175fbd2` and `2650e9a`: overlay bubble sizing/compact behavior
+  - `5f1cf9c`: setup/build separates RapidOCR install from ONNX Runtime provider reinstall
+
+### Runtime Pipeline ปัจจุบัน
+
+`TextDetectionPipeline.process()` ตอนนี้มี flow หลักดังนี้:
+
+```text
+source frame
+  -> scale by effective detection_scale/upscale_factor
+  -> enhance grayscale
+  -> choose one detection/OCR path:
+       1) hover + full-frame OCR
+       2) full-frame OCR
+       3) hover ROI + crop OCR
+       4) scanline ROI + crop OCR
+       5) full-frame detector + crop OCR
+  -> source OCR grayscale
+  -> crop path only: stabilize boxes + optional motion filter + queued OCR
+  -> estimate frame motion offset
+  -> translation reuse / strict block translation / line translation
+  -> remember OCR + translation cache
+  -> build annotated preview, segmentation preview, source frame and timings
+  -> FrameAnalysis
+```
+
+decision สำคัญ:
+
+- ถ้า OCR backend `supports_full_frame()` และ `translation_region_mode == "hover"` จะเข้า `_annotate_hover_with_full_frame_ocr()`
+- ถ้า OCR backend `supports_full_frame()` แต่ไม่ใช่ hover จะเข้า `_annotate_with_full_frame_ocr()`
+- ถ้าไม่ใช่ full-frame OCR และเป็น hover จะเข้า `_hover_detection_pass()` แล้วค่อย crop OCR
+- ถ้าเปิด `scanline_roi_enabled` จะเข้า `_scanline_detection_pass()`
+- default คือ `_text_detection_pass()` ซึ่งเลือก OpenCV หรือ deep text detector ตาม `text_detector_mode`
+
+### Full-frame OCR Validation
+
+เพิ่ม `full_frame_ocr_validation_mode` ใน `PipelineSettings` และ UI:
+
+- `fast`: รับ raw full-frame OCR result หลัง filter พื้นฐาน เหมาะกับวัด speed/recall
+- `balanced`: default, ตัด UI noise/ข้อความสั้น/ความมั่นใจต่ำ โดยไม่ต้องสร้าง validation mask เพิ่ม
+- `strict`: ใช้ OpenCV text mask + line mask ช่วยตรวจว่า OCR box มี visual support พอ เหมาะกับลด false positive
+
+ผล status ของ pipeline จะแสดง mode เช่น `validation balanced` และ runtime debug จะมี stage `full_frame_ocr` หรือ `hover_full_frame_ocr`
+
+### Overlay / Subtitle Rendering
+
+overlay ปัจจุบันมี 2 render modes:
+
+- `bubble`: วาดกล่องแปลทับตำแหน่งข้อความเดิม โดย `_expanded_bubble_rect()` ขยาย bubble สำหรับข้อความยาว, จำกัดไม่ให้เกิน viewport และ `_font_for_text()` ลด font จนพอดีกล่อง
+- `clean_patch`: ใช้ `subtitle_cleaner.clean_patch_for_box()` สร้าง patch จาก source frame เพื่อลบ subtitle เดิมด้วย mask/inpaint หรือ soft background patch แล้ววาดข้อความใหม่
+
+overlay tracking มี 2 mode:
+
+- `legacy`: ใช้ motion offset จาก pipeline และ local template tracking ระหว่าง frame
+- `anchor`: สร้าง visual anchor รอบข้อความ แล้วใช้ template matching กับ frame จาก `OverlayTrackingWorker`
+
+`TranslationOverlay` ใช้ `OverlayTrackManager` เพื่อ associate กล่องใหม่กับ track เดิมด้วย text similarity, IoU และ center proximity และพยายาม exclude overlay window จาก capture ผ่าน `windows_capture_exclusion.py`
+
+### Recording / Runtime Debug
+
+`RecordingSession` บันทึก:
+
+- `annotated_preview.mp4`
+- `segmentation_preview.mp4`
+- `translated_preview.mp4`
+- `session_log.jsonl`
+
+log ต่อ frame มี `runtime_timings_ms`, FPS, OCR runtime, motion offset และรายการ boxes จึงใช้ benchmark pipeline path ได้ตรงกว่าการดู FPS อย่างเดียว
+
+### Build / Runtime Provider
+
+`scripts/setup_windows.ps1` ปัจจุบัน:
+
+- เลือก Torch runtime แบบ `auto` / `cpu` / `gpu`
+- ติดตั้ง `rapidocr>=3.0.0` ก่อน
+- uninstall ONNX Runtime package ที่ขัดกัน (`onnxruntime` หรือ `onnxruntime-gpu`)
+- force reinstall ONNX Runtime provider ที่ตรงกับ runtime ที่เลือก
+- ตรวจ diagnostics ของทั้ง Torch และ ONNX Runtime provider หลังติดตั้ง
+
+การแยก RapidOCR กับ ONNX Runtime แบบนี้ลดปัญหา dependency resolver เปลี่ยน provider กลับผิดตัวระหว่าง setup/build
+
 ## Technology Summary by Backend
 
 | Backend | เทคโนโลยี | CPU/GPU | Parallel / batch |
@@ -590,6 +691,9 @@ current OpenCV path มี filter เพิ่มจาก baseline:
 | RapidOCR full OCR | RapidOCR det+rec + ONNX Runtime | CPU หรือ NVIDIA CUDA | recognition batch ภายใน (`rec_batch_num=8`) |
 | Argos translation | Argos + CTranslate2 | CPU by default, CUDA possible if env/device supported | `translate_batch(max_batch_size=32)` |
 | Google translation | deep-translator HTTP | network | budgeted request loop, no local model |
+| Overlay tracking | OpenCV phase correlation/template matching | CPU | optional `OverlayTrackingWorker` แยกจาก processing worker |
+| Subtitle clean patch | OpenCV mask + inpaint/blur background | CPU | ทำเฉพาะ boxes ที่จะแสดง clean patch |
+| Recording | OpenCV `VideoWriter` + JSONL | CPU/disk I/O | เขียน 3 preview streams ต่อ frame |
 
 ## Benchmark Notes
 
@@ -604,5 +708,9 @@ current OpenCV path มี filter เพิ่มจาก baseline:
 - `28b5202` เทียบ RapidOCR full-frame OCR
 - `db63a8a` เทียบ hover + RapidOCR full-frame OCR
 - `35737c7` หรือ `852565d` เทียบ current optimized
+- `e0ec945` เทียบ full-frame OCR output limit/stability
+- `3e2dc96` เทียบ validation mode `fast` / `balanced` / `strict`
+- `175fbd2` และ `2650e9a` เทียบ overlay bubble sizing/compact rendering
+- `5f1cf9c` เทียบ setup/build ONNX Runtime provider flow โดยเฉพาะ GPU/CPU provider diagnostics
 
 ควรเก็บทั้ง average FPS และ median frame time เพราะ queue/cache ทำให้บาง frame เร็วมาก แต่บาง frame spike ตอน backend ทำ OCR/translation จริง

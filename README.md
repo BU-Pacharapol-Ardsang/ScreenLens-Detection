@@ -1,6 +1,6 @@
 # ScreenLens-Detection
 
-`ScreenLens-Detection` is a Python + Qt desktop application for realtime screen-text detection. The current scaffold captures a monitor, detects text regions with a selectable OpenCV or optional deep detector, optionally performs OCR with EasyOCR or Tesseract, and visualizes the results in a desktop UI.
+`ScreenLens-Detection` is a Python + Qt desktop application for realtime screen-text detection, OCR, translation, overlay rendering, and recording. It captures a monitor, detects text with OpenCV or optional deep detectors, runs crop OCR or RapidOCR full-frame OCR, translates text with Argos or Google Translate, and visualizes results in the desktop UI or an on-screen overlay.
 
 ## Why this fits the project brief
 
@@ -21,21 +21,28 @@ Suggested project title for presentations:
 The current implementation uses this flow:
 
 1. Capture a monitor in realtime with `mss`
-2. Convert the frame to grayscale and enhance local contrast with `CLAHE`
-3. Build a dual-polarity mask to detect both dark text on light backgrounds and light text on dark backgrounds
-4. Segment likely text regions with the selected text detector, or use a native full-frame OCR backend
-5. Run OCR on each detected region when using a crop OCR backend
-6. Draw detection boxes and stream the results to the Qt UI
+2. Keep only the newest captured frame in the worker queue to avoid accumulated latency
+3. Scale the frame, enhance grayscale contrast, and select one of the runtime paths: full-frame OCR, hover full-frame OCR, hover ROI crop OCR, scanline ROI crop OCR, or full-frame detector crop OCR
+4. For crop OCR, stabilize boxes, optionally filter motion, and use the queued OCR backend/cache
+5. For full-frame OCR, filter, merge, validate, stabilize, and limit RapidOCR frame results
+6. Reuse/cache translations, optionally translate strict text blocks, and build `FrameAnalysis`
+7. Stream results to previews, overlay, recording, and runtime debug UI
 
 ## Features
 
 - Realtime monitor capture
 - Segmentation preview for demonstrations
-- Selectable text detector: classic OpenCV morphology, optional PaddleOCR DBNet, or optional EasyOCR CRAFT
+- Selectable text detector: classic OpenCV morphology, optional RapidOCR ONNX DBNet, PaddleOCR DBNet, or EasyOCR CRAFT
 - Optional OCR with `EasyOCR`, `RapidOCR`, or `pytesseract`
+- RapidOCR full-frame OCR validation modes: `Fast`, `Balanced`, and `Strict`
 - Selectable translation backend: `Argos Translate (Offline)`, `Google Translate (Online)`, or disabled
-- Adjustable capture interval, scale factor, contour area, and OCR language
-- Clean Python package structure for future translation/overlay features
+- Hover region and scanline ROI modes for reducing detector/OCR work
+- Strict block translation for paragraph/subtitle-style text
+- Bubble overlay and experimental clean patch subtitle rendering
+- Overlay tracking with legacy motion or visual anchor lock
+- Recording to annotated/segmentation/translated MP4 streams plus JSONL session logs
+- Runtime debug timings per pipeline stage
+- Adjustable capture interval, scale factor, contour area, OCR backend/device, detector, translation mode, preview, and overlay settings
 
 ## Requirements
 
@@ -102,12 +109,14 @@ pip install -e ".[ocr_rapid_gpu]"
 ```
 
 Do not install `onnxruntime` and `onnxruntime-gpu` into the same environment at the same time. The Windows setup script handles this automatically when `-TorchRuntime gpu` is used.
+The current setup flow installs `rapidocr>=3.0.0` first, then force-reinstalls the selected ONNX Runtime provider so the CPU/GPU provider does not get silently replaced by dependency resolution.
 
 ### Optional deep text detectors
 
 The UI includes a `Text detector` dropdown:
 
 - `Classic OpenCV (Morphology)` uses the original contour-based detector and remains the default.
+- `RapidOCR ONNX DBNet (Optional)` uses RapidOCR text detection with ONNX Runtime CPU/CUDA.
 - `PaddleOCR DBNet (Optional)` uses PaddleOCR detection when `paddleocr` and `paddlepaddle` are installed.
 - `EasyOCR CRAFT (Optional)` reuses EasyOCR's CRAFT detector when `easyocr` is installed.
 
@@ -270,21 +279,41 @@ Notes:
 ```text
 src/screenlens_detection/
   capture.py
+  cursor.py
+  languages.py
+  launcher.py
   main.py
   models.py
+  motion.py
   ocr.py
+  onnxruntime_utils.py
+  overlay.py
+  overlay_tracker.py
+  overlay_tracks.py
   pipeline.py
+  recording.py
+  runtime.py
+  subtitle_cleaner.py
   text_detectors.py
+  translation.py
+  windows_capture_exclusion.py
+  windows_hotkeys.py
   worker.py
   ui/main_window.py
 tests/
   test_pipeline.py
+  test_ocr.py
+  test_translation.py
+  test_text_detectors.py
+  test_overlay.py
+  test_recording.py
+  test_subtitle_cleaner.py
 ```
 
 ## Next extension ideas
 
-- Translation layer after OCR
 - Click-and-drag region selection instead of full-monitor capture
-- OCR consensus across multiple stable frames
-- Overlay translated text directly over the source frame
-- Result export for documentation and presentation demos
+- Preset profiles for subtitles, games, documents, and web pages
+- OCR quality metrics and confidence visualization
+- Export detected/translated text to subtitle, CSV, or report formats
+- Benchmark dashboard for comparing OpenCV, RapidOCR, PaddleOCR, EasyOCR, and Tesseract paths
